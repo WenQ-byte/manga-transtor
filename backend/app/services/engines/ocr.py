@@ -42,8 +42,9 @@ class PaddleOCREngine(BaseOCR):
     def _create_ocr(self, lang: str):
         """创建 PaddleOCR 实例
 
-        关键：禁用文档方向矫正与文档矫正（会干扰漫画竖排文字检测），
-        但保留文本行方向分类（横排文字识别需要）。
+        关键：
+        - 禁用文档方向矫正与文档矫正（会干扰漫画竖排文字检测）
+        - 保留文本行方向分类（横排文字识别需要）
         """
         return self._PaddleOCR(
             lang=lang,
