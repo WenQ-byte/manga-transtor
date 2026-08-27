@@ -1,0 +1,21 @@
+services:
+  manga-translator:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: manga-translator
+    ports:
+      - "8000:8000"
+    environment:
+      - MANGA_DATA_DIR=/data
+      - MANGA_MAX_UPLOAD_MB=10
+      # 可选：配置翻译后端
+      # - MANGA_TRANSLATOR_BACKEND=deepl
+      # - MANGA_DEEPL_AUTH_KEY=your-key
+      # - MANGA_OPENAI_API_KEY=your-key
+    volumes:
+      - manga_data:/data
+    restart: unless-stopped
+
+volumes:
+  manga_data:
