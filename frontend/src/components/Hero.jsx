@@ -31,22 +31,29 @@ export default function Hero() {
       </motion.p>
 
       <h1
-        className="mx-auto"
+        className="mx-auto flex flex-col items-center"
         style={{
           fontSize: 'clamp(2.5rem, 9vw, 6.5rem)',
           fontWeight: 800,
-          lineHeight: 1.1,
+          lineHeight: 1.15,
           letterSpacing: '-0.02em',
-          whiteSpace: 'nowrap',
         }}
       >
         <ShinyText
-          text="跨越语言 读懂每一格"
-          color="#e5e5e5"
+          text="跨越语言"
+          color="#6b7280"
           shineColor="#ffffff"
           speed={3}
           spread={120}
-          delay={1}
+          delay={1.5}
+        />
+        <ShinyText
+          text="读懂每一格"
+          color="#6b7280"
+          shineColor="#ffffff"
+          speed={3}
+          spread={120}
+          delay={1.5}
         />
       </h1>
     </motion.div>
