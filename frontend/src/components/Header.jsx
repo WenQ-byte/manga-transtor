@@ -3,10 +3,16 @@ import { Languages, BookMarked } from 'lucide-react'
 
 function BrandMark() {
   return (
-    <span className="relative flex h-9 w-9 items-center justify-center rounded-[10px] bg-gradient-to-br from-accent to-accent-strong shadow-[0_0_20px_-4px_rgba(34,211,238,0.5)]">
-      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-        <path d="M4 5.5A2.5 2.5 0 0 1 6.5 3h11A2.5 2.5 0 0 1 20 5.5v8a2.5 2.5 0 0 1-2.5 2.5H9l-4 4v-4h-.5A2.5 2.5 0 0 1 4 13.5v-8z" fill="rgba(6,10,16,0.35)" />
-        <path d="M8 8h8M8 11.5h5" stroke="#061018" strokeWidth="1.8" strokeLinecap="round" />
+    <span className="relative flex h-9 w-9 items-center justify-center rounded-[11px] bg-surface-2 ring-1 ring-white/15 shadow-[0_0_20px_-6px_rgba(255,255,255,0.12)]">
+      <svg width="20" height="20" viewBox="0 0 32 32" fill="none" aria-hidden="true">
+        <g stroke="#ffffff" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+          <path d="M12.5 7 C10.8 7.2 10.2 8.8 10.5 10.5 C10.8 12 12.2 12.8 14 12.5" />
+          <path d="M19.5 7 C21.2 7.2 21.8 8.8 21.5 10.5 C21.2 12 19.8 12.8 18 12.5" />
+          <path d="M5.5 16.5 L26.5 16.5" />
+          <path d="M13.5 19 C11.8 21.5 11.2 24.5 13 26.8 C14.8 28.8 18 28.2 19.5 25.8" />
+          <path d="M18.5 19 C20.2 21.5 20.8 24.5 19 26.8 C17.2 28.8 14 28.2 12.5 25.8" />
+        </g>
+        <rect x="14.6" y="15.1" width="2.8" height="2.8" rx="0.6" fill="#ffffff" />
       </svg>
     </span>
   )

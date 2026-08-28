@@ -1,13 +1,5 @@
 import { motion } from 'framer-motion'
-import { ScanText, ArrowRightLeft, BookMarked } from 'lucide-react'
-import MaskedHeading from './MaskedHeading'
-import heroFill from '../assets/hero-fill.svg'
-
-const BADGES = [
-  { icon: ScanText, label: '保持原排版' },
-  { icon: ArrowRightLeft, label: '日语 / 英语 → 中文' },
-  { icon: BookMarked, label: '专有名词统一译法' },
-]
+import ShinyText from './ShinyText'
 
 const container = {
   hidden: {},
@@ -28,47 +20,35 @@ export default function Hero() {
       className="relative mx-auto max-w-3xl pt-16 pb-14 text-center"
     >
       <motion.p variants={item} className="eyebrow mb-6">
-        Comic Translation System
+        <ShinyText
+          text="Comic Translation System"
+          color="#6b7280"
+          shineColor="#ffffff"
+          speed={3}
+          spread={120}
+          delay={1.5}
+        />
       </motion.p>
 
-      <MaskedHeading
-        text="跨越语言 读懂每一格"
-        tag="h1"
-        src={heroFill}
-        align="center"
-        weight={600}
-        tracking={-0.01}
-        lineHeight={1.12}
-        textScale={0.125}
-        fillScale={1.22}
-        parallax={22}
-        drift={16}
-        brightness={1.05}
-        saturation={1.15}
-        reveal="rise"
-        duration={1.15}
-        stagger={0.1}
-        trigger="view"
-      />
-
-      <motion.p variants={item} className="mx-auto mt-8 max-w-xl text-[17px] leading-relaxed text-ink-400">
-        上传漫画图片，智能识别气泡文字并翻译，在保留原始排版与画面细节的同时，输出地道译文。
-      </motion.p>
-
-      <motion.div variants={item} className="mt-10 flex flex-wrap items-center justify-center gap-3">
-        {BADGES.map((b) => {
-          const Icon = b.icon
-          return (
-            <span
-              key={b.label}
-              className="flex items-center gap-2 rounded-full border border-line bg-surface/70 px-4 py-2 text-[13px] text-ink-200 backdrop-blur"
-            >
-              <Icon size={15} className="text-accent" />
-              {b.label}
-            </span>
-          )
-        })}
-      </motion.div>
+      <h1
+        className="mx-auto"
+        style={{
+          fontSize: 'clamp(2.5rem, 9vw, 6.5rem)',
+          fontWeight: 800,
+          lineHeight: 1.1,
+          letterSpacing: '-0.02em',
+          whiteSpace: 'nowrap',
+        }}
+      >
+        <ShinyText
+          text="跨越语言 读懂每一格"
+          color="#e5e5e5"
+          shineColor="#ffffff"
+          speed={3}
+          spread={120}
+          delay={1}
+        />
+      </h1>
     </motion.div>
   )
 }

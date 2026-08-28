@@ -3,6 +3,8 @@ import { AnimatePresence, motion } from 'framer-motion'
 import { X, Loader2 } from 'lucide-react'
 import { createGlossary, updateGlossary } from '../api'
 import { useToast } from './Toast'
+import SpecularButton from './SpecularButton'
+import { SPECULAR_PRIMARY, SPECULAR_SECONDARY } from './specularPresets'
 
 export default function GlossaryModal({ open, item, onClose, onSaved }) {
   const notify = useToast()
@@ -146,20 +148,13 @@ export default function GlossaryModal({ open, item, onClose, onSaved }) {
             </div>
 
             <div className="flex justify-end gap-3 border-t border-line px-6 py-5">
-              <button
-                onClick={onClose}
-                className="rounded-lg border border-line px-5 py-2.5 text-sm text-ink-300 transition-colors hover:text-ink-100"
-              >
+              <SpecularButton {...SPECULAR_SECONDARY} onClick={onClose}>
                 取消
-              </button>
-              <button
-                onClick={save}
-                disabled={saving}
-                className="flex items-center gap-2 rounded-lg bg-gradient-to-r from-accent-strong to-accent px-5 py-2.5 text-sm font-medium text-bg transition-transform hover:scale-[1.03] disabled:opacity-60"
-              >
+              </SpecularButton>
+              <SpecularButton {...SPECULAR_PRIMARY} size="md" disabled={saving} onClick={save}>
                 {saving && <Loader2 size={15} className="animate-spin" />}
                 {saving ? '保存中…' : '保存'}
-              </button>
+              </SpecularButton>
             </div>
           </motion.div>
         </motion.div>

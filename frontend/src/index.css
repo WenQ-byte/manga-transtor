@@ -1,21 +1,21 @@
 @import "tailwindcss";
 
 @theme {
-  --color-bg: #060a10;
-  --color-surface: #0b1017;
-  --color-surface-2: #101722;
-  --color-line: rgba(148, 163, 184, 0.1);
-  --color-line-strong: rgba(148, 163, 184, 0.18);
+  --color-bg: #090909;
+  --color-surface: #101010;
+  --color-surface-2: #181818;
+  --color-line: rgba(255, 255, 255, 0.07);
+  --color-line-strong: rgba(255, 255, 255, 0.14);
 
-  --color-ink-100: #e8edf4;
-  --color-ink-200: #c6cedb;
-  --color-ink-400: #94a3b8;
-  --color-ink-500: #66717f;
-  --color-ink-600: #47505c;
+  --color-ink-100: #f5f5f5;
+  --color-ink-200: #d4d4d4;
+  --color-ink-400: #9ca3af;
+  --color-ink-500: #6b7280;
+  --color-ink-600: #4b5563;
 
-  --color-accent: #22d3ee;
-  --color-accent-strong: #0ea5e9;
-  --color-accent-dim: #0891b2;
+  --color-accent: #ffffff;
+  --color-accent-strong: #e5e5e5;
+  --color-accent-dim: #a3a3a3;
   --color-ok: #34d399;
   --color-danger: #f87171;
 
@@ -44,8 +44,8 @@
   }
 
   ::selection {
-    background: rgba(34, 211, 238, 0.25);
-    color: #e8edf4;
+    background: rgba(255, 255, 255, 0.18);
+    color: #ffffff;
   }
 
   ::-webkit-scrollbar {
@@ -56,12 +56,12 @@
     background: transparent;
   }
   ::-webkit-scrollbar-thumb {
-    background: #1a2332;
+    background: #262626;
     border-radius: 8px;
     border: 2px solid var(--color-bg);
   }
   ::-webkit-scrollbar-thumb:hover {
-    background: #27323f;
+    background: #363636;
   }
 }
 
@@ -88,7 +88,7 @@
   }
 
   .glow-text {
-    background: linear-gradient(120deg, #e8edf4 0%, #7dd3fc 55%, #22d3ee 100%);
+    background: linear-gradient(120deg, #ffffff 0%, #d4d4d4 55%, #a3a3a3 100%);
     -webkit-background-clip: text;
     background-clip: text;
     color: transparent;
@@ -96,14 +96,14 @@
 
   .ring-glow {
     box-shadow:
-      0 0 0 1px rgba(34, 211, 238, 0.35),
-      0 0 24px -6px rgba(34, 211, 238, 0.4);
+      0 0 0 1px rgba(255, 255, 255, 0.3),
+      0 0 24px -6px rgba(255, 255, 255, 0.15);
   }
 }
 
 @layer utilities {
   .grid-dots {
-    background-image: radial-gradient(circle, rgba(148, 163, 184, 0.08) 1px, transparent 1px);
+    background-image: radial-gradient(circle, rgba(255, 255, 255, 0.06) 1px, transparent 1px);
     background-size: 26px 26px;
   }
 
@@ -127,7 +127,7 @@
 
   .input-base:focus {
     outline: none;
-    border-color: rgba(34, 211, 238, 0.45);
-    box-shadow: 0 0 0 3px rgba(34, 211, 238, 0.12);
+    border-color: rgba(255, 255, 255, 0.35);
+    box-shadow: 0 0 0 3px rgba(255, 255, 255, 0.08);
   }
 }

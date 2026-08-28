@@ -57,6 +57,9 @@ class TranslationPipeline:
         self.inpainter = inpainter or get_engine("inpainter")
         self.renderer = renderer or get_engine("renderer")
         self.glossary = GlossaryService()
+        from app.services.engines.bubble import create_bubble_filter
+
+        self.bubble_filter = create_bubble_filter()
 
     def _report(self, cb: Optional[ProgressCallback], step_index: int, progress: int) -> None:
         if cb:
@@ -92,6 +95,11 @@ class TranslationPipeline:
             self._report(progress_cb, 1, 10)
             self.ocr.recognize(image_path, regions, source_lang)
             self._report(progress_cb, 1, 100)
+
+        # 1.5 过滤气泡外文字（丢弃涂鸦/噪声），无有效气泡时保留原样
+        regions = self.bubble_filter.filter(image_path, regions)
+        if not regions:
+            return PipelineResult(regions=[], duration_ms=int((time.monotonic() - start) * 1000))
 
         # 3. 翻译（应用专有名词词典）
         glossary = self.glossary.get_mapping(source_lang)

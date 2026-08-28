@@ -23,7 +23,8 @@ import {
   formatDuration,
 } from '../api'
 import { useToast } from './Toast'
-import CompareSlider from './CompareSlider'
+import SpecularButton from './SpecularButton'
+import { SPECULAR_PRIMARY, SPECULAR_SECONDARY } from './specularPresets'
 
 const STEPS = [
   { key: 'detect', label: '检测区域', weight: 0.15 },
@@ -288,12 +289,10 @@ export default function TranslatePanel() {
             </div>
 
             <div className="mt-9 flex justify-center">
-              <PrimaryButton
-                disabled={!file}
-                onClick={startTranslate}
-                icon={<Wand2 size={18} />}
-                label="开始翻译"
-              />
+              <SpecularButton {...SPECULAR_PRIMARY} disabled={!file} onClick={startTranslate}>
+                <Wand2 size={18} />
+                开始翻译
+              </SpecularButton>
             </div>
           </motion.div>
         )}
@@ -327,12 +326,9 @@ export default function TranslatePanel() {
             <Pipeline currentStep={currentStep} progress={progress} />
 
             <div className="mt-8 flex justify-center">
-              <button
-                onClick={cancelTask}
-                className="rounded-lg border border-line px-5 py-2.5 text-sm text-ink-400 transition-colors hover:border-danger/40 hover:text-danger"
-              >
+              <SpecularButton {...SPECULAR_SECONDARY} onClick={cancelTask}>
                 取消翻译
-              </button>
+              </SpecularButton>
             </div>
           </motion.div>
         )}
@@ -347,30 +343,37 @@ export default function TranslatePanel() {
                   {result.durationMs ? ` · 耗时 ${formatDuration(result.durationMs)}` : ''}
                 </p>
               </div>
-              <a
-                href={result.resultUrl}
-                download
-                className="group flex items-center gap-2 rounded-lg bg-gradient-to-r from-accent-strong to-accent px-5 py-2.5 text-sm font-medium text-bg shadow-[0_0_24px_-8px_rgba(34,211,238,0.7)] transition-transform hover:scale-[1.03]"
+              <SpecularButton
+                {...SPECULAR_PRIMARY}
+                size="md"
+                onClick={() => {
+                  const a = document.createElement('a')
+                  a.href = result.resultUrl
+                  a.download = ''
+                  document.body.appendChild(a)
+                  a.click()
+                  a.remove()
+                }}
               >
                 <Download size={16} />
                 下载图片
-              </a>
+              </SpecularButton>
             </div>
 
-            <CompareSlider before={result.originalUrl} after={result.resultUrl} />
-
-            <p className="mt-4 text-center font-mono text-[11px] uppercase tracking-[0.2em] text-ink-600">
-              拖动滑块对比原图与译文
-            </p>
+            <div className="relative flex w-full items-center justify-center overflow-hidden rounded-xl border border-line bg-surface-2">
+              <img
+                src={result.resultUrl}
+                alt="翻译结果"
+                className="w-full object-contain"
+                draggable={false}
+              />
+            </div>
 
             <div className="mt-6 flex justify-center">
-              <button
-                onClick={resetAll}
-                className="flex items-center gap-2 rounded-lg border border-line px-5 py-2.5 text-sm text-ink-200 transition-colors hover:border-accent/40 hover:text-accent"
-              >
+              <SpecularButton {...SPECULAR_SECONDARY} onClick={resetAll}>
                 <RotateCcw size={16} />
                 翻译下一张
-              </button>
+              </SpecularButton>
             </div>
           </motion.div>
         )}
@@ -386,20 +389,13 @@ export default function TranslatePanel() {
               <p className="mt-2 text-sm text-ink-500">建议：尝试更换更清晰、对比度更高的图片。</p>
             )}
             <div className="mt-8 flex justify-center gap-3">
-              <button
-                onClick={resetAll}
-                className="flex items-center gap-2 rounded-lg bg-gradient-to-r from-accent-strong to-accent px-5 py-2.5 text-sm font-medium text-bg transition-transform hover:scale-[1.03]"
-              >
+              <SpecularButton {...SPECULAR_PRIMARY} onClick={resetAll}>
                 <RefreshCw size={16} />
                 重新上传
-              </button>
-              <button
-                onClick={startTranslate}
-                disabled={!file}
-                className="rounded-lg border border-line px-5 py-2.5 text-sm text-ink-200 transition-colors hover:border-accent/40 hover:text-accent disabled:opacity-40"
-              >
+              </SpecularButton>
+              <SpecularButton {...SPECULAR_SECONDARY} disabled={!file} onClick={startTranslate}>
                 重试
-              </button>
+              </SpecularButton>
             </div>
           </motion.div>
         )}
@@ -490,25 +486,6 @@ function Dropzone({ file, previewUrl, isDragging, setIsDragging, onDrop, onSelec
   )
 }
 
-function PrimaryButton({ disabled, onClick, icon, label }) {
-  return (
-    <motion.button
-      whileHover={disabled ? undefined : { scale: 1.02 }}
-      whileTap={disabled ? undefined : { scale: 0.98 }}
-      onClick={onClick}
-      disabled={disabled}
-      className={`flex items-center gap-2.5 rounded-xl px-12 py-4 text-[15px] font-medium transition-all ${
-        disabled
-          ? 'cursor-not-allowed bg-surface-2 text-ink-600'
-          : 'bg-gradient-to-r from-accent-strong to-accent text-bg shadow-[0_8px_32px_-8px_rgba(34,211,238,0.6)] hover:shadow-[0_8px_40px_-6px_rgba(34,211,238,0.8)]'
-      }`}
-    >
-      {icon}
-      {label}
-    </motion.button>
-  )
-}
-
 function Pipeline({ currentStep, progress }) {
   return (
     <div className="mt-8">
@@ -532,7 +509,7 @@ function Pipeline({ currentStep, progress }) {
                 <motion.span
                   animate={
                     active
-                      ? { boxShadow: ['0 0 0 0 rgba(34,211,238,0.4)', '0 0 0 8px rgba(34,211,238,0)'] }
+                      ? { boxShadow: ['0 0 0 0 rgba(255,255,255,0.4)', '0 0 0 8px rgba(255,255,255,0)'] }
                       : {}
                   }
                   transition={{ duration: 1.6, repeat: active ? Infinity : 0, ease: 'easeOut' }}

@@ -4,6 +4,8 @@ import { Plus, Search, FileJson, FileDown, ArrowRight, Pencil, Trash2, BookMarke
 import { listGlossary, deleteGlossary, importGlossary } from '../api'
 import { useToast } from './Toast'
 import GlossaryModal from './GlossaryModal'
+import SpecularButton from './SpecularButton'
+import { SPECULAR_PRIMARY, SPECULAR_SECONDARY } from './specularPresets'
 
 const LANG = { ja: '日', en: '英', zh: '中' }
 
@@ -117,13 +119,10 @@ export default function GlossaryPanel({ onCountChange }) {
             为翻译添加统一译法，角色名、作品名等专有名词将保持一致。可手动录入或批量导入。
           </p>
         </div>
-        <button
-          onClick={() => openEditor()}
-          className="flex items-center gap-2 rounded-lg bg-gradient-to-r from-accent-strong to-accent px-5 py-2.5 text-sm font-medium text-bg shadow-[0_8px_28px_-10px_rgba(34,211,238,0.7)] transition-transform hover:scale-[1.03]"
-        >
+        <SpecularButton {...SPECULAR_PRIMARY} size="md" onClick={() => openEditor()}>
           <Plus size={17} />
           新增词条
-        </button>
+        </SpecularButton>
       </motion.div>
 
       <div className="card mb-5 flex flex-wrap items-center justify-between gap-4 p-4">
@@ -147,20 +146,14 @@ export default function GlossaryPanel({ onCountChange }) {
             className="hidden"
             onChange={onImportFile}
           />
-          <button
-            onClick={() => importRef.current?.click()}
-            className="flex items-center gap-2 rounded-lg border border-line px-4 py-2.5 text-sm text-ink-300 transition-colors hover:border-accent/40 hover:text-accent"
-          >
+          <SpecularButton {...SPECULAR_SECONDARY} size="sm" onClick={() => importRef.current?.click()}>
             <FileJson size={16} />
             导入 JSON
-          </button>
-          <button
-            onClick={downloadTemplate}
-            className="flex items-center gap-2 rounded-lg border border-line px-4 py-2.5 text-sm text-ink-300 transition-colors hover:border-accent/40 hover:text-accent"
-          >
+          </SpecularButton>
+          <SpecularButton {...SPECULAR_SECONDARY} size="sm" onClick={downloadTemplate}>
             <FileDown size={16} />
             模板
-          </button>
+          </SpecularButton>
         </div>
       </div>
 
