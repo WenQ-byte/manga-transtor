@@ -14,15 +14,7 @@
 
 ## 快速开始
 
-### 方式一：一键启动（Windows）
-
-```bat
-start.bat
-```
-
-脚本会自动创建虚拟环境、安装依赖、构建前端并启动服务。访问 http://127.0.0.1:8000
-
-### 方式二：手动启动
+### 方式一：手动启动
 
 ```bash
 # 1. 后端（基础依赖）
@@ -43,7 +35,7 @@ cd ..
 .venv\Scripts\python -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --app-dir backend
 ```
 
-### 方式三：Docker
+### 方式二：Docker
 
 ```bash
 docker compose up -d --build
