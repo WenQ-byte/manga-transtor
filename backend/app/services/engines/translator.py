@@ -1,10 +1,11 @@
 """翻译引擎：支持多种后端 + 自动降级回退链
 
 后端优先级（可配置 translator_backend）：
-  1. google     - translate.googleapis.com（多数地区可用，质量好）
-  2. mymemory   - api.mymemory.translated.net（备用免费接口）
-  3. deepl      - 需要 MANGA_DEEPL_AUTH_KEY
-  4. openai     - 需要 MANGA_OPENAI_API_KEY
+  1. deepseek  - 深度求索 API（漫画口语最自然，需要 MANGA_DEEPSEEK_API_KEY）
+  2. google    - translate.googleapis.com（免费，质量一般）
+  3. mymemory  - api.mymemory.translated.net（备用免费接口）
+  4. deepl     - 需要 MANGA_DEEPL_AUTH_KEY（口语翻译较差）
+  5. openai    - 需要 MANGA_OPENAI_API_KEY
 
 任意后端失败时自动回退到下一个可用后端，全部失败则返回原文
 （专有名词词典替换始终生效）。
@@ -197,6 +198,52 @@ class DeepLTranslator(BaseRemoteTranslator):
         return result
 
 
+class DeepSeekTranslator(BaseRemoteTranslator):
+    """DeepSeek API 翻译（需要 MANGA_DEEPSEEK_API_KEY）
+
+    使用 deepseek-chat（或 deepseek-v3），对漫画口语/网络用语理解力优于 DeepL。
+    """
+
+    name = "deepseek"
+
+    def __init__(self):
+        self.settings = get_settings()
+
+    def _system_prompt(self, source: LangCode, target: LangCode) -> str:
+        lang_names = {"ja": "日语", "en": "英语", "zh": "中文"}
+        return (
+            f"你是专业的漫画翻译。将以下{lang_names.get(source, source)}文本翻译成{lang_names.get(target, target)}。"
+            "要求：1) 自然流畅，符合漫画对话口吻（口语化、接地气）；"
+            "2) 保留人名、专有名词的统一译法；"
+            "3) 语气词、感叹词用中文常用表达（如「嗯」「诶」「诶嘿」）；"
+            "4) 只输出译文本身，不要任何解释或引号。"
+        )
+
+    def translate_one(self, text: str, source: LangCode, target: LangCode) -> str:
+        if not text.strip() or KEEP_PATTERN.match(text):
+            return text
+        base = self.settings.deepseek_base_url or "https://api.deepseek.com"
+        model = self.settings.deepseek_model or "deepseek-chat"
+        try:
+            resp = httpx.post(
+                f"{base}/chat/completions",
+                headers={"Authorization": f"Bearer {self.settings.deepseek_api_key}"},
+                json={
+                    "model": model,
+                    "messages": [
+                        {"role": "system", "content": self._system_prompt(source, target)},
+                        {"role": "user", "content": text},
+                    ],
+                    "temperature": 0.3,
+                },
+                timeout=30,
+            )
+            resp.raise_for_status()
+            return resp.json()["choices"][0]["message"]["content"].strip()
+        except Exception:
+            return ""
+
+
 class OpenAITranslator(BaseRemoteTranslator):
     """OpenAI 兼容接口翻译（需要 MANGA_OPENAI_API_KEY）"""
 
@@ -255,7 +302,9 @@ class SmartTranslator(BaseTranslator):
         preferred = s.translator_backend
 
         # 配置的后端优先
-        if preferred == "deepl" and s.deepl_auth_key:
+        if preferred == "deepseek" and s.deepseek_api_key:
+            self._backends.append(DeepSeekTranslator())
+        elif preferred == "deepl" and s.deepl_auth_key:
             self._backends.append(DeepLTranslator())
         elif preferred == "openai" and s.openai_api_key:
             self._backends.append(OpenAITranslator())
@@ -265,6 +314,8 @@ class SmartTranslator(BaseTranslator):
         self._backends.append(MyMemoryTranslator())
 
         # 有 key 的付费后端作为补充
+        if preferred != "deepseek" and s.deepseek_api_key:
+            self._backends.append(DeepSeekTranslator())
         if preferred != "deepl" and s.deepl_auth_key:
             self._backends.append(DeepLTranslator())
         if preferred != "openai" and s.openai_api_key:

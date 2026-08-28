@@ -55,12 +55,14 @@ docker compose up -d --build
 | `MANGA_OPENAI_API_KEY` | OpenAI 兼容接口 Key（可选） | 空 |
 | `MANGA_MAX_UPLOAD_MB` | 单张图片大小上限 | `10` |
 
+> **DeepL**：需同时设置 `MANGA_TRANSLATOR_BACKEND=deepl` 与 `MANGA_DEEPL_AUTH_KEY`（免费版 Key 以 `:fx` 结尾，走 `api-free.deepl.com`）。只设后端不配 Key 时，翻译会自动降级到 Google。
+>
 > 翻译器内置自动降级链：配置后端 → Google → MyMemory → 仅词典替换，保证网络不佳时也能运行。
 
 ## 架构
 
 ```
-frontend/          # Vue3 + Vite 前端（中文 UI）
+frontend/          # React + Vite + Tailwind 前端（中文 UI）
 backend/
   app/
     api/           # REST API（翻译 / 词典 / 文件）
@@ -72,7 +74,7 @@ backend/
         inpainter.py    # 图像修复
         renderer.py     # 渲染排版
     storage/       # SQLite + 文件存储
-docs/prds/         # PRD / 竞品分析 / 功能矩阵
+docs/             # PRD / 竞品分析 / 功能矩阵
 ```
 
 ## 翻译流水线

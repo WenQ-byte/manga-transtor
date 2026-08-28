@@ -134,6 +134,10 @@ class PaddleOCREngine(BaseOCR):
                         det["box"] = [
                             [W - 1 - p[1], p[0]] for p in det["box"]
                         ]
+                    if det.get("poly"):
+                        det["poly"] = [
+                            [W - 1 - p[1], p[0]] for p in det["poly"]
+                        ]
                     det["vertical"] = True
                 detections += rot_dets
             except Exception:
@@ -196,16 +200,19 @@ class PaddleOCREngine(BaseOCR):
                 if not text or not str(text).strip():
                     continue
                 box = None
+                poly_pts = None
                 if polys and i < len(polys):
                     poly = polys[i]
                     if poly is not None and len(poly) >= 4:
-                        pts = [[float(p[0]), float(p[1])] for p in poly[:4]]
-                        box = pts
+                        # 保留完整多边形点（可能 bbox 不止4点）
+                        poly_pts = [[float(p[0]), float(p[1])] for p in poly]
+                        box = [[float(p[0]), float(p[1])] for p in poly[:4]]
                 detections.append(
                     {
                         "text": str(text).strip(),
                         "score": float(scores[i]) if scores and i < len(scores) else 0.0,
                         "box": box,
+                        "poly": poly_pts,
                     }
                 )
         return detections
@@ -217,7 +224,7 @@ class PaddleOCREngine(BaseOCR):
             for det in detections:
                 box = det["box"] or [[0, 0], [1, 0], [1, 1], [0, 1]]
                 regions.append(
-                    TextRegion(box=box, text=det["text"], confidence=det["score"])
+                    TextRegion(box=box, text=det["text"], confidence=det["score"], poly=det.get("poly"))
                 )
             return
 
@@ -244,9 +251,11 @@ class PaddleOCREngine(BaseOCR):
                     regions[best_idx].confidence = det["score"]
                     if det["box"]:
                         regions[best_idx].box = det["box"]
+                    if det.get("poly"):
+                        regions[best_idx].poly = det["poly"]
                 else:
                     regions.append(
-                        TextRegion(box=det["box"], text=det["text"], confidence=det["score"])
+                        TextRegion(box=det["box"], text=det["text"], confidence=det["score"], poly=det.get("poly"))
                     )
             else:
                 # 无坐标，按顺序分配

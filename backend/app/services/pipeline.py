@@ -29,6 +29,8 @@ class TextRegion:
     text: str = ""  # OCR结果
     translated: str = ""  # 翻译结果
     confidence: float = 0.0
+    poly: Optional[list[list[float]]] = None  # OCR原始检测多边形点的完整列表（可选）
+    mask: Optional[object] = None  # 预计算的笔画掩膜（numpy数组，由 mask.build_full_mask 填写）
 
     @property
     def bounds(self) -> tuple[int, int, int, int]:

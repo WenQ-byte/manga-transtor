@@ -1,8 +1,7 @@
 """图像修复引擎：擦除检测区域的文字
 
-方案：漫画气泡内通常为纯色（白/浅色），文字为深色笔画。
-采样气泡背景色，精确检测文字笔画（与背景差异大的像素），
-用背景色填充，避免 cv2.inpaint 混合周围像素产生的污渍。
+CV 无模型方案（方案A）：精确笔画掩膜（Otsu+poly）+ 局部行背景填充 + 边界 TELEA 羽化。
+优于旧版：不再是全区域单一中位数色平涂，且边界无硬接缝。
 """
 from __future__ import annotations
 
@@ -13,73 +12,62 @@ import numpy as np
 from PIL import Image
 
 from app.services.engines.base import BaseInpainter
+from app.services.engines.mask import build_full_mask
 from app.services.pipeline import TextRegion
 
 
 class CVInpainter(BaseInpainter):
-    """基于背景色填充的文字擦除（无模型，轻量）"""
+    """无模型修复：精确掩膜 + 行背景重建 + TELEA 边界羽化"""
 
     name = "cv"
 
     def inpaint(self, image_path: Path, regions: list[TextRegion]) -> Path:
-        img = Image.open(image_path).convert("RGB")
-        arr = np.array(img).astype(np.int16)
-        gray = np.array(img.convert("L")).astype(np.int16)
-        h, w = gray.shape
+        import cv2
 
-        try:
-            import cv2
-        except ImportError:
-            cv2 = None
+        img = np.array(Image.open(image_path).convert("RGB")).astype(np.uint8)
+        # 生成整图掩膜（缓存到 region.mask）
+        mask = build_full_mask(img, regions)
+        if not mask.any():
+            return self._save_temp(img)
 
-        result = arr.copy()
+        result = img.copy()
+        # 1. 局部行背景填充掩膜内部（保留气泡渐变）
+        body = cv2.erode(mask, np.ones((3, 3), np.uint8), iterations=1)
+        self._fill_with_row_bg(result, body)
+        # 2. 边界环 TELEA 羽化（补抗锯齿残影，消除硬边）
+        ring = cv2.bitwise_and(mask, cv2.bitwise_not(body))
+        if ring.any():
+            repaired = cv2.inpaint(result, ring, 2, cv2.INPAINT_TELEA)
+            result[ring > 0] = repaired[ring > 0]
 
-        for region in regions:
-            x0, y0, x1, y1 = region.bounds
-            # 向内收缩一点，避免包含气泡边框
-            pad = 3
-            x0 = max(0, x0 + pad)
-            y0 = max(0, y0 + pad)
-            x1 = min(w, x1 - pad)
-            y1 = min(h, y1 - pad)
-            if x1 <= x0 or y1 <= y0:
+        return self._save_temp(result)
+
+    def _fill_with_row_bg(self, img: np.ndarray, body_mask: np.ndarray) -> None:
+        """对 body_mask 像素按行重采样背景（左右条带中位数）"""
+        rows = np.where(body_mask.any(axis=1))[0]
+        if rows.size == 0:
+            return
+        cols = np.where(body_mask.any(axis=0))[0]
+        x0, x1 = int(cols.min()), int(cols.max())
+        edge = 4  # 边缘采样带宽
+        for y in rows:
+            xs = body_mask[y]
+            if not xs.any():
                 continue
-
-            # 背景色 = 区域边缘采样（气泡内部颜色）
-            bg = self._sample_edge_color(arr, x0, y0, x1, y1)
-            bg_gray = int(np.mean(bg))
-
-            # 文字掩膜 = 与背景灰度差异大的像素
-            region_gray = gray[y0:y1, x0:x1]
-            diff = np.abs(region_gray - bg_gray)
-            text_mask = diff > 45
-
-            if text_mask.size and text_mask.sum() > 0:
-                if cv2 is not None:
-                    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-                    text_mask = cv2.dilate(text_mask.astype(np.uint8), kernel, iterations=1).astype(bool)
-                # 用背景色填充文字
-                result[y0:y1, x0:x1][text_mask] = bg
-
-        return self._save_temp(result.astype(np.uint8))
-
-    def _sample_edge_color(self, arr, x0, y0, x1, y1):
-        """采样区域边缘的背景色（中位数）"""
-        h, w = arr.shape[:2]
-        samples = []
-        if y0 > 0:
-            samples.append(arr[y0 : y0 + 2, x0:x1].reshape(-1, 3))
-        if y1 < h:
-            samples.append(arr[y1 - 2 : y1, x0:x1].reshape(-1, 3))
-        if x0 > 0:
-            samples.append(arr[y0:y1, x0 : x0 + 2].reshape(-1, 3))
-        if x1 < w:
-            samples.append(arr[y0:y1, x1 - 2 : x1].reshape(-1, 3))
-        if samples:
-            all_px = np.concatenate(samples, axis=0)
-            return np.median(all_px, axis=0)
-        # 无边缘可采样，默认白色
-        return np.array([255, 255, 255], dtype=np.int16)
+            left_x0 = max(0, x0 - edge)
+            left = img[y, left_x0:x0].reshape(-1, 3)
+            right = img[y, (x1 + 1):min(img.shape[1], x1 + 1 + edge)].reshape(-1, 3)
+            samples = []
+            if left.size:
+                samples.append(left)
+            if right.size:
+                samples.append(right)
+            if not samples:
+                continue
+            src = np.concatenate(samples, axis=0)
+            color = np.median(src, axis=0).astype(np.uint8)
+            indices = np.where(xs)[0]
+            img[y, indices] = color
 
     def _save_temp(self, arr: np.ndarray) -> Path:
         tmp = tempfile.mkdtemp(prefix="manga_inpaint_")
@@ -89,4 +77,16 @@ class CVInpainter(BaseInpainter):
 
 
 def create_inpainter() -> BaseInpainter:
+    """按配置选择修复引擎：lama（神经网络）优先，失败回退 cv（无模型）"""
+    from app.config import get_settings
+
+    if get_settings().inpainter_backend == "lama":
+        try:
+            from app.services.engines.lama import create_lama_inpainter
+
+            engine = create_lama_inpainter()
+            if engine is not None:
+                return engine
+        except Exception:  # noqa: BLE001
+            pass
     return CVInpainter()

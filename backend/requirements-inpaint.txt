@@ -1,0 +1,4 @@
+# LaMa 神经修复依赖（可选，启用 MANGA_INPAINTER_BACKEND=lama）
+# 安装：pip install -r requirements-inpaint.txt
+# CPU 版本足够；如需 GPU 请按 https://pytorch.org 对应 CUDA wheel 安装 torch
+torch>=2.2

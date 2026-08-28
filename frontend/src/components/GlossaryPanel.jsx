@@ -40,10 +40,10 @@ export default function GlossaryPanel({ onCountChange }) {
     loadList()
   }, [])
 
-  async function loadList() {
+  async function loadList(term) {
     setLoading(true)
     try {
-      const data = await listGlossary({ search })
+      const data = await listGlossary({ search: term === undefined ? search : term })
       setItems(data.items)
       setTotal(data.total)
       onCountChange?.(data.total)
@@ -57,7 +57,7 @@ export default function GlossaryPanel({ onCountChange }) {
   function onSearchChange(value) {
     setSearch(value)
     clearTimeout(searchTimer.current)
-    searchTimer.current = setTimeout(loadList, 250)
+    searchTimer.current = setTimeout(() => loadList(value), 250)
   }
 
   function openEditor(item = null) {

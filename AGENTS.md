@@ -37,7 +37,7 @@
 - **OCR（PaddleOCR 3.x）**：用 `ocr.predict()` 而非旧版 `.ocr()`；结果字段是 `rec_texts` / `rec_scores` / `rec_polys`。创建实例的 4 个参数不能删：`enable_mkldnn=False`、`use_doc_orientation_classify=False`、`use_doc_unwarping=False`、`use_textline_orientation=True`，否则漫画竖排文字误检。竖排靠把原图旋转 90° 再检测、坐标映射回原图（`ocr.py:_detect_all`）。
 - **翻译**：Google 免费接口必须用 `client=dict-chrome-ex`（`gtx` 会被限流 429）。回退链 google → mymemory → 仅词典替换（`translator.py:SmartTranslator`）。
 - **渲染字体**：Windows 用 `C:/Windows/Fonts/msyh.ttc`，候选列表在 `renderer.py:FONT_CANDIDATES`；横排字号基准取检测框高度中位数（`_unified_height`），竖排逐字垂直渲染。
-- **图像修复**：inpainter 用背景色填充文字笔画，不是 cv2.inpaint（会留灰痕）。
+- **图像修复**：双引擎。默认 `cv`（无模型）：`mask.py` 用 OCR 多边形（`region.poly`）+ Otsu 自适应阈值生成精确笔画掩膜（缓存到 `region.mask`），`inpainter.py` 对掩膜按行重采左右条带背景填充、边界环用 `cv2.INPAINT_TELEA` 羽化。可选 `lama`（神经网络，效果是 manga-image-translator 质量级）：需在虚拟环境装 `backend/requirements-inpaint.txt`（torch），权重自动搜 `backend/data/models/lama_large_512px.ckpt` 或本机 manga-image-translator 路径；配置 `MANGA_INPAINTER_BACKEND` / `MANGA_LAMA_MODEL_PATH` / `MANGA_LAMA_INPAINT_SIZE` / `MANGA_INPAINT_DEVICE`。LaMa 模型结构 vendor 在 `lama_model.py`（仅推理所需 FFC/LamaFourier，训练用判别器/MPE 已省略）。
 
 ## 约定
 

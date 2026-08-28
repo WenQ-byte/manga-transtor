@@ -32,12 +32,24 @@ class Settings(BaseSettings):
     ocr_langs: str = "ja,en,ch"
 
     # 翻译API（可选）
-    translator_backend: str = "google"  # google | deepl | openai
+    translator_backend: str = "google"  # google | deepseek | deepl | openai
     deepl_auth_key: str = ""
+    deepseek_api_key: str = ""
+    deepseek_model: str = "deepseek-chat"
+    deepseek_base_url: str = "https://api.deepseek.com"
     openai_api_key: str = ""
     openai_base_url: str = "https://api.openai.com/v1"
     openai_model: str = "gpt-4o-mini"
     google_translate_base: str = "https://translate.googleapis.com/translate_a/single"
+
+    # 图像修复引擎: cv（无模型，轻量） | lama（神经网络，需 torch + 权重）
+    inpainter_backend: str = "cv"
+    # LaMa 权重路径（lama_large_512px.ckpt）；空则自动搜索 项目data/models/ 与本机 manga-image-translator 路径
+    lama_model_path: str = ""
+    # LaMa 推理缩放上限（最长边像素；CPU 建议 1024，越大越慢）
+    lama_inpaint_size: int = 1024
+    # 修复推理设备: cpu | cuda（cuda 不可用时自动回退 cpu）
+    inpaint_device: str = "cpu"
 
     class Config:
         env_prefix = "MANGA_"
