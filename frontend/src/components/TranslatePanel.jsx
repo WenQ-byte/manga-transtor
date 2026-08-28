@@ -24,6 +24,7 @@ import {
 } from '../api'
 import { useToast } from './Toast'
 import SpecularButton from './SpecularButton'
+import GlassSurface from './GlassSurface'
 import { SPECULAR_PRIMARY, SPECULAR_SECONDARY } from './specularPresets'
 
 const STEPS = [
@@ -63,11 +64,23 @@ function LangSelect({ id, label, value, options, onChange }) {
         {label}
       </span>
       <div className="relative">
+        <GlassSurface
+          width="100%"
+          height="100%"
+          borderRadius={10}
+          borderWidth={0.07}
+          brightness={55}
+          opacity={0.9}
+          blur={12}
+          backgroundOpacity={0.06}
+          saturation={1.3}
+          className="absolute inset-0"
+        />
         <select
           id={id}
           value={value}
           onChange={(e) => onChange(e.target.value)}
-          className="input-base appearance-none px-4 py-3 pr-10 font-medium"
+          className="relative z-10 w-full appearance-none bg-transparent px-4 py-3 pr-10 font-medium text-ink-100 outline-none"
         >
           {options.map((o) => (
             <option key={o.value} value={o.value} className="bg-surface-2">
@@ -77,7 +90,7 @@ function LangSelect({ id, label, value, options, onChange }) {
         </select>
         <ChevronDown
           size={16}
-          className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-ink-500"
+          className="pointer-events-none absolute right-3 top-1/2 z-10 -translate-y-1/2 text-ink-500"
         />
       </div>
     </label>
@@ -237,7 +250,7 @@ export default function TranslatePanel() {
   const isBlurHint = (errorMessage || '').includes('模糊')
 
   return (
-    <div className="card relative mx-auto max-w-[760px] p-8 md:p-10">
+    <div className="card relative mx-auto max-w-[760px] bg-surface/40 p-8 md:p-10 backdrop-blur-sm">
       <AnimatePresence mode="wait">
         {phase === 'idle' && (
           <motion.div key="idle" {...panelMotion}>
@@ -419,9 +432,7 @@ function Dropzone({ file, previewUrl, isDragging, setIsDragging, onDrop, onSelec
   return (
     <div
       className={`relative cursor-pointer overflow-hidden rounded-xl border-2 border-dashed transition-all duration-200 ${
-        isDragging
-          ? 'border-accent bg-accent/[0.06] ring-glow'
-          : 'border-line-strong bg-surface-2/40 hover:border-accent/40 hover:bg-surface-2/70'
+        isDragging ? 'border-accent ring-glow' : 'border-line-strong hover:border-accent/40'
       }`}
       onDragOver={(e) => {
         e.preventDefault()
@@ -450,38 +461,51 @@ function Dropzone({ file, previewUrl, isDragging, setIsDragging, onDrop, onSelec
         onChange={onSelect}
       />
 
-      {!file ? (
-        <div className="flex flex-col items-center justify-center px-6 py-14 text-center">
-          <motion.div
-            animate={isDragging ? { y: -6, scale: 1.05 } : { y: 0, scale: 1 }}
-            className="mb-4 flex h-14 w-14 items-center justify-center rounded-2xl border border-line bg-surface text-accent"
-          >
-            <UploadCloud size={26} />
-          </motion.div>
-          <p className="text-[15px] font-medium text-ink-100">点击上传，或拖拽图片到此处</p>
-          <p className="mt-2 text-[13px] text-ink-500">支持 JPG / PNG / WebP / BMP · 单张不超过 10MB</p>
-        </div>
-      ) : (
-        <div className="flex items-center gap-5 px-6 py-6">
-          <div className="h-20 w-20 shrink-0 overflow-hidden rounded-lg border border-line bg-surface-2">
-            <img src={previewUrl} alt="待翻译图片预览" className="h-full w-full object-cover" />
+      <GlassSurface
+        width="100%"
+        height="100%"
+        borderRadius={12}
+        borderWidth={0.07}
+        brightness={55}
+        opacity={0.9}
+        blur={12}
+        backgroundOpacity={0.06}
+        saturation={1.3}
+        displace={3}
+      >
+        {!file ? (
+          <div className="flex flex-col items-center justify-center px-6 py-14 text-center">
+            <motion.div
+              animate={isDragging ? { y: -6, scale: 1.05 } : { y: 0, scale: 1 }}
+              className="mb-4 flex h-14 w-14 items-center justify-center rounded-2xl border border-line bg-surface text-accent"
+            >
+              <UploadCloud size={26} />
+            </motion.div>
+            <p className="text-[15px] font-medium text-ink-100">点击上传，或拖拽图片到此处</p>
+            <p className="mt-2 text-[13px] text-ink-500">支持 JPG / PNG / WebP / BMP · 单张不超过 10MB</p>
           </div>
-          <div className="min-w-0 flex-1 text-left">
-            <p className="truncate text-[15px] font-medium text-ink-100">{file.name}</p>
-            <p className="mt-1 text-[13px] text-ink-500">{formatBytes(file.size)}</p>
+        ) : (
+          <div className="flex items-center gap-5 px-6 py-6">
+            <div className="h-20 w-20 shrink-0 overflow-hidden rounded-lg border border-line bg-surface-2">
+              <img src={previewUrl} alt="待翻译图片预览" className="h-full w-full object-cover" />
+            </div>
+            <div className="min-w-0 flex-1 text-left">
+              <p className="truncate text-[15px] font-medium text-ink-100">{file.name}</p>
+              <p className="mt-1 text-[13px] text-ink-500">{formatBytes(file.size)}</p>
+            </div>
+            <button
+              onClick={(e) => {
+                e.stopPropagation()
+                onClear()
+              }}
+              className="flex h-9 w-9 items-center justify-center rounded-lg text-ink-500 transition-colors hover:bg-surface hover:text-danger"
+              aria-label="移除图片"
+            >
+              <X size={18} />
+            </button>
           </div>
-          <button
-            onClick={(e) => {
-              e.stopPropagation()
-              onClear()
-            }}
-            className="flex h-9 w-9 items-center justify-center rounded-lg text-ink-500 transition-colors hover:bg-surface hover:text-danger"
-            aria-label="移除图片"
-          >
-            <X size={18} />
-          </button>
-        </div>
-      )}
+        )}
+      </GlassSurface>
     </div>
   )
 }
