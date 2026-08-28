@@ -49,50 +49,21 @@ class BubbleFilter:
         return kept if kept else regions
 
     def _in_bubble(self, bgr, bounds, img_w, img_h) -> bool:
+        """检查文字区域是否在气泡内
+
+        宽松策略：文字框内有足够白色背景 → 视为气泡内（保留）。
+        严格过滤交给 OCR 置信度（pipeline 里 confidence >= 0.5）。
+        """
         x0, y0, x1, y1 = [int(v) for v in bounds]
-        pad = 5
-        sx0, sy0 = max(0, x0 - pad), max(0, y0 - pad)
-        sx1, sy1 = min(img_w, x1 + pad), min(img_h, y1 + pad)
-        if sx1 <= sx0 or sy1 <= sy0:
+        h, w = bgr.shape[:2]
+        if x1 <= x0 or y1 <= y0:
             return True
 
-        h, w = bgr.shape[:2]
-        tol = FLOOD_TOL
-        flags = 8 | cv2.FLOODFILL_MASK_ONLY | (255 << 8)
-        # 候选种子：外扩框四角 + 四边中点（都在文本框外，属于周围底色）
-        seeds = [
-            (sx0, sy0),
-            (sx1 - 1, sy0),
-            (sx0, sy1 - 1),
-            (sx1 - 1, sy1 - 1),
-            ((sx0 + sx1) // 2, sy0),
-            ((sx0 + sx1) // 2, sy1 - 1),
-            (sx0, (sy0 + sy1) // 2),
-            (sx1 - 1, (sy0 + sy1) // 2),
-        ]
-        img_area = img_w * img_h
-        for seed in seeds:
-            sx, sy = seed
-            if not (0 <= sx < w and 0 <= sy < h):
-                continue
-            try:
-                mask = np.zeros((h + 2, w + 2), np.uint8)
-                cv2.floodFill(bgr, mask, seed, 0, (tol, tol, tol), (tol, tol, tol), flags)
-            except Exception:  # noqa: BLE001
-                continue
-            filled = mask[1:-1, 1:-1]
-            ys, xs = np.where(filled > 0)
-            if xs.size == 0:
-                continue
-            fx0 = int(xs.min())
-            fy0 = int(ys.min())
-            fx1 = int(xs.max()) + 1
-            fy1 = int(ys.max()) + 1
-            contains = fx0 <= x0 and fy0 <= y0 and fx1 >= x1 and fy1 >= y1
-            bounded = (fx1 - fx0) * (fy1 - fy0) < img_area * MAX_FILL_RATIO
-            if contains and bounded:
-                return True
-        return False
+        # 文字框内白色像素占比 > 30% → 有气泡背景 → 保留
+        patch = bgr[y0:y1, x0:x1]
+        gray = cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY)
+        white_ratio = float(np.mean(gray > 200))
+        return white_ratio > 0.30
 
 
 def create_bubble_filter() -> BubbleFilter:
