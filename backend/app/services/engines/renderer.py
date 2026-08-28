@@ -102,23 +102,42 @@ class PILRenderer(BaseRenderer):
         return buf.getvalue()
 
     def _group_by_bubble(self, bgr, regions, img_w, img_h):
-        """将同一气泡内的 region 分组，返回 [(bubble_bbox, [regions])]"""
+        """将同一气泡内的 region 分组，返回 [(bubble_bbox, [regions])]
+
+        用重叠率（交集 / 较小框面积）而非 IoU：同一气泡内相邻竖排列
+        的检测框常部分重叠但 IoU 偏低，重叠率能正确合并它们。
+        """
         groups: list[list] = []
         for region in regions:
             text = (region.translated or "").strip()
             if not text:
                 continue
             bb = self._detect_bubble(bgr, region.bounds, img_w, img_h)
-            merged = False
-            for g in groups:
-                if self._iou(bb, g[0]) > 0.4:
-                    g[0] = self._union(bb, g[0])
-                    g[1].append(region)
-                    merged = True
-                    break
-            if not merged:
+            best_idx, best_ov = -1, 0.0
+            for i, g in enumerate(groups):
+                ov = self._overlap_ratio(bb, g[0])
+                if ov > best_ov:
+                    best_ov, best_idx = ov, i
+            if best_idx >= 0 and best_ov > 0.15:
+                groups[best_idx][0] = self._union(bb, groups[best_idx][0])
+                groups[best_idx][1].append(region)
+            else:
                 groups.append([bb, [region]])
         return groups
+
+    @staticmethod
+    def _overlap_ratio(a, b) -> float:
+        """交集面积 / 较小框面积，衡量两框重叠程度（对相邻列更敏感）"""
+        ax0, ay0, ax1, ay1 = a
+        bx0, by0, bx1, by1 = b
+        iw = max(0, min(ax1, bx1) - max(ax0, bx0))
+        ih = max(0, min(ay1, by1) - max(ay0, by0))
+        inter = iw * ih
+        if inter <= 0:
+            return 0.0
+        area_a = (ax1 - ax0) * (ay1 - ay0)
+        area_b = (bx1 - bx0) * (by1 - by0)
+        return inter / max(1, min(area_a, area_b))
 
     def _detect_bubble(self, bgr, bounds, img_w, img_h):
         """通过泛洪填充找到文本框所属气泡的真实边界"""
@@ -171,9 +190,16 @@ class PILRenderer(BaseRenderer):
                     best_area = area
                     best = (bx0, by0, bx1, by1)
             if best is not None:
+                # 退化保护：检测到的气泡面积小于文本框本身 → 不可信，用兜底扩展
+                if (best[2] - best[0]) * (best[3] - best[1]) < (x1 - x0) * (y1 - y0) * 0.5:
+                    return self._fallback_box(x0, y0, x1, y1, img_w, img_h)
                 return best
 
         # 兜底：文本框向外扩展
+        return self._fallback_box(x0, y0, x1, y1, img_w, img_h)
+
+    @staticmethod
+    def _fallback_box(x0, y0, x1, y1, img_w, img_h):
         pad_x = int((x1 - x0) * 0.35)
         pad_y = int((y1 - y0) * 0.35)
         return (
@@ -238,7 +264,7 @@ class PILRenderer(BaseRenderer):
         )
 
     def _render_vertical_bubble(self, draw, regions, bx0, by0, bw, bh, min_font_size):
-        """竖排气泡：按列从右到左排列，字号统一"""
+        """竖排气泡：按列从右到左排列，字号统一（且不超过列宽，避免列间重叠）"""
         columns = sorted(regions, key=lambda r: -r.bounds[0])
         texts = [t for t in ((r.translated or "").strip() for r in columns) if t]
         if not texts:
@@ -248,14 +274,15 @@ class PILRenderer(BaseRenderer):
         avail_h = bh * (1 - 2 * PAD_RATIO)
         col_w = avail_w / n
         longest = max(len(t) for t in texts)
-        font_size = int(min(max(min_font_size, col_w), avail_h / max(1, longest * VERTICAL_CHAR_RATIO)))
-        font_size = max(min_font_size, font_size)
+        # 字号受列宽（防重叠）与高度共同约束，允许小于 min_font_size 以保证不重叠
+        font_size = int(min(col_w, avail_h / max(1, longest * VERTICAL_CHAR_RATIO)))
+        font_size = max(1, font_size)
 
         font = self._get_font(font_size)
         sw = max(1, int(font_size * STROKE_RATIO))
         char_h = int(font_size * VERTICAL_CHAR_RATIO)
         right_pad = PAD_RATIO * bw
-        x_center = bx0 + bw - right_pad - font_size / 2
+        x_center = bx0 + bw - right_pad - col_w / 2
         for t in texts:
             total_h = len(t) * char_h
             ty = by0 + bh / 2 - total_h / 2
