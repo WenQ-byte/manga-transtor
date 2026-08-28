@@ -4,6 +4,7 @@
 
 ## 运行 / 测试命令
 
+- 一键启动（推荐）：双击 `start.bat`，或 `.venv\Scripts\python.exe start.py`，交互菜单选后端/前端/前后端。`start.py` 是中文菜单 + subprocess 启动；`start.bat` 仅纯 ASCII 外壳（避免 bat 中文编码问题）。
 - 手动启动后端（必须加 `--app-dir backend`，模块是 `app.main:app`）：
   ```
   .venv\Scripts\python.exe -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --app-dir backend
