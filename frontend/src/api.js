@@ -1,4 +1,3 @@
-// API 客户端
 const BASE = '/api'
 
 async function request(path, options = {}) {
@@ -76,7 +75,6 @@ export function importGlossary(jsonText) {
   })
 }
 
-// 工具函数
 export function formatBytes(bytes) {
   if (!bytes) return '0 B'
   const units = ['B', 'KB', 'MB', 'GB']

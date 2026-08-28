@@ -1,10 +1,9 @@
 # AGENTS.md
 
-漫画多语言智能翻译系统（日语/英语 → 中文）。FastAPI 后端 + Vue3/Vite 前端 + PaddleOCR。
+漫画多语言智能翻译系统（日语/英语 → 中文）。FastAPI 后端 + React/Vite 前端（Tailwind v4 + Framer Motion + Lucide） + PaddleOCR。
 
 ## 运行 / 测试命令
 
-- 一键启动（Windows）：`start.bat`（建 venv、装依赖、构建前端、起服务）。服务在 http://127.0.0.1:8000，API 文档 `/docs`。
 - 手动启动后端（必须加 `--app-dir backend`，模块是 `app.main:app`）：
   ```
   .venv\Scripts\python.exe -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --app-dir backend
