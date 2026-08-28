@@ -255,7 +255,7 @@ class PILRenderer(BaseRenderer):
         sw = max(1, int(font_size * STROKE_RATIO))
         char_h = int(font_size * VERTICAL_CHAR_RATIO)
         right_pad = PAD_RATIO * bw
-        x_center = bx1 - right_pad - font_size / 2
+        x_center = bx0 + bw - right_pad - font_size / 2
         for t in texts:
             total_h = len(t) * char_h
             ty = by0 + bh / 2 - total_h / 2

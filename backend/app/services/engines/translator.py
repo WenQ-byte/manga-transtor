@@ -137,6 +137,7 @@ class DeepLTranslator(BaseRemoteTranslator):
 
     name = "deepl"
     endpoint = "https://api-free.deepl.com/v2/translate"
+    batch = True
 
     def __init__(self):
         self.settings = get_settings()
@@ -162,6 +163,38 @@ class DeepLTranslator(BaseRemoteTranslator):
             return ""
         except Exception:
             return ""
+
+    def translate_batch(self, texts, source: LangCode, target: LangCode):
+        """一次 API 调用批量翻译（DeepL 支持数组输入），空文本/拟声词保留原样"""
+        result = list(texts)
+        indices: list[int] = []
+        payload_texts: list[str] = []
+        for i, t in enumerate(texts):
+            if not t.strip() or KEEP_PATTERN.match(t):
+                continue
+            indices.append(i)
+            payload_texts.append(t)
+        if not payload_texts:
+            return result
+        target_deepl = "ZH" if target == "zh" else target.upper()
+        payload = {"text": payload_texts, "target_lang": target_deepl}
+        if source != target:
+            payload["source_lang"] = source.upper()
+        try:
+            resp = httpx.post(
+                self.endpoint,
+                json=payload,
+                headers={"Authorization": f"DeepL-Auth-Key {self.settings.deepl_auth_key}"},
+                timeout=25,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            for j, item in enumerate(data.get("translations") or []):
+                if j < len(indices) and item.get("text"):
+                    result[indices[j]] = item["text"]
+        except Exception:
+            pass
+        return result
 
 
 class OpenAITranslator(BaseRemoteTranslator):
@@ -237,6 +270,16 @@ class SmartTranslator(BaseTranslator):
         if preferred != "openai" and s.openai_api_key:
             self._backends.append(OpenAITranslator())
 
+    @staticmethod
+    def _apply_glossary(text: str, glossary) -> str:
+        """应用词典：整词匹配替换，避免误替换词的一部分"""
+        if not glossary:
+            return text
+        for k, v in glossary.items():
+            if k:
+                text = re.sub(r"(?<!\w)" + re.escape(k) + r"(?!\w)", v, text)
+        return text
+
     def translate_batch(self, texts, source_lang, target_lang, glossary=None, progress_cb=None):
         # 找出第一个可用的后端（发送探针，结果缓存）
         if self._available is None:
@@ -246,20 +289,21 @@ class SmartTranslator(BaseTranslator):
             # 全部失败：仅应用词典
             return self._apply_glossary_only(texts, glossary)
 
-        # 使用选定后端翻译，但保留错误时的回退
+        srcs = [self._apply_glossary(t, glossary) for t in texts]
+
+        # 支持批量 API 的后端（DeepL）一次性发送，减少请求数
+        if getattr(backend, "batch", False):
+            out = backend.translate_batch(srcs, source_lang, target_lang)
+            if progress_cb:
+                progress_cb(1.0)
+            return out
+
+        # 其余后端逐条翻译，保留错误时的回退
         out = []
-        total = len(texts)
-        failed = 0
-        for i, t in enumerate(texts):
-            src = t
-            if glossary:
-                for k, v in glossary.items():
-                    if k and k in src:
-                        src = src.replace(k, v)
+        total = len(srcs)
+        for i, src in enumerate(srcs):
             result = self._translate_with_fallback(src, source_lang, target_lang, backend)
             out.append(result)
-            if not result:
-                failed += 1
             if progress_cb and total:
                 progress_cb((i + 1) / total)
         return out
@@ -289,15 +333,7 @@ class SmartTranslator(BaseTranslator):
         return None
 
     def _apply_glossary_only(self, texts, glossary):
-        out = []
-        for t in texts:
-            src = t
-            if glossary:
-                for k, v in glossary.items():
-                    if k and k in src:
-                        src = src.replace(k, v)
-            out.append(src)
-        return out
+        return [self._apply_glossary(t, glossary) for t in texts]
 
 
 def create_translator() -> BaseTranslator:

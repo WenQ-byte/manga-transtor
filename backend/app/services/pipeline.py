@@ -96,6 +96,9 @@ class TranslationPipeline:
             self.ocr.recognize(image_path, regions, source_lang)
             self._report(progress_cb, 1, 100)
 
+        # 1.4 过滤低置信度识别与空文本（噪声）
+        regions = [r for r in regions if r.confidence >= 0.5 and r.text.strip()]
+
         # 1.5 过滤气泡外文字（丢弃涂鸦/噪声），无有效气泡时保留原样
         regions = self.bubble_filter.filter(image_path, regions)
         if not regions:
