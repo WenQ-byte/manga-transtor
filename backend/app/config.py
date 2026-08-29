@@ -30,7 +30,7 @@ class Settings(BaseSettings):
     default_target_lang: str = "CHS"
     # OCR 支持语言
     ocr_langs: str = "ja,en,ch"
-    # OCR 引擎: mit48（默认，manga-image-translator 48px 自训模型） | paddle（PaddleOCR，回退）
+    # OCR 引擎: mit48（默认，manga-image-translator 48px 自训模型） | paddle（PaddleOCR，回退） | mangaocr | mit48+mangaocr
     ocr_backend: str = "mit48"
     # 文本检测引擎: cv（OpenCV 启发式） | paddle（PaddleOCR 自带检测） | manga（MIT DBNet/ctd）
     # 空字符串 = 自动：OCR 用 mit48 时选 manga，否则 cv
@@ -49,6 +49,10 @@ class Settings(BaseSettings):
     mit_box_threshold: float = 0.7
     mit_unclip_ratio: float = 2.2
     mit_ocr_prob: float = 0.2
+    # 识别优化：字号小于该值(px)的文本行先放大 2x 再识别（增强小字/风格化字体召回）
+    mit_ocr_upscale: int = 16
+    # 混合模式 mit48+mangaocr 的切换阈值：48px 概率低于该值时改用 manga-ocr 补识别
+    mit_ocr_mix_threshold: float = 0.7
     # 气泡过滤: auto（MIT 检测时关闭白占比启发式） | on | off
     bubble_filter: str = "auto"
     # MIT 掩膜级气泡去噪（1-50，数值越小越激进；0=关闭）

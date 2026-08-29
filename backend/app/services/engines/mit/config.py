@@ -22,6 +22,11 @@ class OcrParams:
     ignore_bubble: int = 0
     text_height: int = 48
     max_chunk_size: int = 16
+    upscale_min_font: int = 16
+
+@dataclass
+class MixedOcrParams:
+    mix_threshold: float = 0.7
 
 
 def resolve_device(device: str) -> str:
@@ -51,4 +56,13 @@ def detector_params() -> DetectorParams:
 
 def ocr_params() -> OcrParams:
     s = get_settings()
-    return OcrParams(prob=s.mit_ocr_prob, ignore_bubble=s.mit_ignore_bubble)
+    return OcrParams(
+        prob=s.mit_ocr_prob,
+        ignore_bubble=s.mit_ignore_bubble,
+        upscale_min_font=s.mit_ocr_upscale,
+    )
+
+
+def mixed_ocr_params() -> MixedOcrParams:
+    s = get_settings()
+    return MixedOcrParams(mix_threshold=s.mit_ocr_mix_threshold)

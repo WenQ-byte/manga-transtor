@@ -402,11 +402,12 @@ class Mit48Ocr:
     _MODEL_REL = "ocr/ocr_ar_48px.ckpt"
     _DICT_REL = "ocr/alphabet-all-v7.txt"
 
-    def __init__(self, device: str = "cpu", text_height: int = 48, max_chunk_size: int = 16):
+    def __init__(self, device: str = "cpu", text_height: int = 48, max_chunk_size: int = 16, upscale_min_font: int = 16):
         self.device = "cuda" if device.startswith("cuda") else device
         self._use_gpu = self.device != "cpu"
         self.text_height = text_height
         self.max_chunk_size = max_chunk_size
+        self.upscale_min_font = upscale_min_font
         dict_path = ensure_downloaded(self._DICT_REL)
         with open(dict_path, "r", encoding="utf-8") as fp:
             self.dictionary = [s[:-1] for s in fp.readlines()]
@@ -418,9 +419,30 @@ class Mit48Ocr:
         if self._use_gpu:
             self.model = self.model.to(self.device)
 
+    def _region_image(self, image: np.ndarray, q: Quadrilateral) -> np.ndarray:
+        """取某 quad 的透视矫正裁剪；小字先在原图放大 2x 再矫正（保真度更高）"""
+        if self.upscale_min_font > 0 and q.font_size > 0 and q.font_size < self.upscale_min_font:
+            import cv2 as _cv2
+
+            x0, y0, w, h = [int(v) for v in q.aabb.xywh]
+            pad = 4
+            im_h, im_w = image.shape[:2]
+            cx0, cy0 = max(0, x0 - pad), max(0, y0 - pad)
+            cx1, cy1 = min(im_w, x0 + w + pad), min(im_h, y0 + h + pad)
+            if cx1 - cx0 < 4 or cy1 - cy0 < 4:
+                return q.get_transformed_region(image, q.direction, self.text_height)
+            crop = image[cy0:cy1, cx0:cx1]
+            crop = _cv2.resize(crop, ((cx1 - cx0) * 2, (cy1 - cy0) * 2), interpolation=_cv2.INTER_CUBIC)
+            from .quadrilateral import Quadrilateral as _Q
+
+            local_pts = (np.asarray(q.pts, dtype=float) - np.array([cx0, cy0])) * 2.0
+            q2 = _Q(local_pts, q.text, q.prob)
+            return q2.get_transformed_region(crop, q.direction, self.text_height)
+        return q.get_transformed_region(image, q.direction, self.text_height)
+
     def recognize(self, image: np.ndarray, textlines: List[Quadrilateral], prob_threshold: float = 0.2) -> None:
         """对每个 quad 透视矫正裁剪识别，回填 text/prob/fg/bg"""
-        region_imgs = [q.get_transformed_region(image, q.direction, self.text_height) for q in textlines]
+        region_imgs = [self._region_image(image, q) for q in textlines]
         perm = list(range(len(region_imgs)))
         for indices in chunks(perm, self.max_chunk_size):
             N = len(indices)

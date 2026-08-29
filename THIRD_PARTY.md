@@ -12,6 +12,7 @@
 | `dbnet.py` / `dbnet_utils.py` / `craft_utils.py` / `imgproc.py` / `rearrange.py` / `resnet34.py` | `detection/default*.py`、`detection/default_utils/*`、`utils/generic.py`（`det_rearrange_forward`/`square_pad_resize`） | 默认 DBNet+ResNet34 文本行检测；`resnet34.py` 为按 torchvision 命名规则自实现，权重名一致 |
 | `ctd.py` + `ctd_utils/` | `detection/ctd.py`、`detection/ctd_utils/*` | ComicTextDetector（YOLOv5-s backbone + UNet 掩膜头 + DBNet 行头） |
 | `ocr_48px.py` / `xpos.py` | `ocr/model_48px.py`、`ocr/xpos_relative_position.py` | 48px 识别（ConvNeXt + RoFormer/XPOS + beam search） |
+| `mocr.py` | 可选：manga-ocr（`kha-white/manga-ocr-base`，HF，Apache-2.0） | 风格化字体补充识别（`MANGA_OCR_BACKEND=mangaocr`/`mit48+mangaocr`） |
 | `quadrilateral.py` / `generic2.py` | `utils/generic.py`（Quadrilateral/sort_pnts 等）、`utils/generic2.py` | 几何工具 |
 | `bubble.py` | `utils/bubble.py` | `is_ignore` 气泡/拟声词判别 |
 

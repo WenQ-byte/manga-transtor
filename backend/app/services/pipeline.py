@@ -35,6 +35,11 @@ class TextRegion:
     fg_color: Optional[tuple[int, int, int]] = None  # 字符前景色（MIT 48px OCR 预测）
     bg_color: Optional[tuple[int, int, int]] = None  # 字符背景色（MIT 48px OCR 预测）
 
+    # 气泡级分组（pipeline 按气泡分组翻译后回填）
+    group_index: Optional[int] = None  # 同一气泡的 region 共享
+    group_bounds: Optional[tuple[int, int, int, int]] = None  # 气泡包围盒 (x0,y0,x1,y1)
+    group_translated: str = ""  # 整块气泡译文（renderer 优先用此排版）
+
     # 内部：MIT 检测器附加的 Quadrilateral、OCR 附加的内部状态
     _quad: Optional[object] = field(default=None, repr=False, compare=False)
 
@@ -81,6 +86,19 @@ class TranslationPipeline:
         if cb:
             cb(PIPELINE_STEPS[step_index][0], progress)
 
+    def _group_regions(self, image_path: Path, regions: list[TextRegion]) -> list[dict]:
+        """按气泡泛洪填充把 region 分组（组内按阅读顺序），并回填 group_index/group_bounds"""
+        from PIL import Image
+
+        import numpy as np
+
+        from app.services.engines.bubble import group_regions_by_bubble
+
+        img = np.array(Image.open(image_path).convert("RGB"))
+        bgr = img[:, :, ::-1].copy()
+        h, w = bgr.shape[:2]
+        return group_regions_by_bubble(bgr, regions, w, h)
+
     def translate_image(
         self,
         image_path: Path,
@@ -123,15 +141,25 @@ class TranslationPipeline:
         if not regions:
             return PipelineResult(regions=[], duration_ms=int((time.monotonic() - start) * 1000))
 
-        # 3. 翻译（应用专有名词词典）
+        # 3. 按气泡分组 → 整块翻译（一个气泡一次请求，更地道），再尽力拆回每行
         glossary = self.glossary.get_mapping(source_lang)
         self._report(progress_cb, 2, 5)
-        texts = [r.text for r in regions]
-        translated = self.translator.translate_batch(
-            texts, source_lang, target_lang, glossary=glossary, progress_cb=lambda p: self._report(progress_cb, 2, 5 + int(p * 0.95))
+        groups = self._group_regions(image_path, regions)
+        group_texts = ["\n".join(r.text for r in g["regions"]) for g in groups]
+        translated_blocks = self.translator.translate_batch(
+            group_texts,
+            source_lang,
+            target_lang,
+            glossary=glossary,
+            progress_cb=lambda p: self._report(progress_cb, 2, 5 + int(p * 0.95)),
         )
-        for region, text in zip(regions, translated):
-            region.translated = text
+        for g, block in zip(groups, translated_blocks):
+            block = block or ""
+            lines = block.split("\n")
+            last = lines[-1] if lines else ""
+            for i, r in enumerate(g["regions"]):
+                r.group_translated = block
+                r.translated = lines[i] if i < len(lines) else last
         self._report(progress_cb, 2, 100)
 
         # 4. 图像修复（擦除原文）

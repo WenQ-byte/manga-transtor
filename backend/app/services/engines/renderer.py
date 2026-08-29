@@ -94,21 +94,51 @@ class PILRenderer(BaseRenderer):
             bw, bh = bx1 - bx0, by1 - by0
             if bw <= 0 or bh <= 0:
                 continue
+            block = self._group_block_text(group_regions)
             if bh > bw * 1.5:
-                self._render_vertical_bubble(draw, group_regions, bx0, by0, bw, bh, min_font_size)
+                if block:
+                    self._render_vertical_bubble_block(draw, block, bx0, by0, bw, bh, min_font_size)
+                else:
+                    self._render_vertical_bubble(draw, group_regions, bx0, by0, bw, bh, min_font_size)
             else:
-                self._render_horizontal_bubble(draw, group_regions, bx0, by0, bw, bh, min_font_size)
+                self._render_horizontal_bubble(draw, group_regions, bx0, by0, bw, bh, min_font_size, block=block)
 
         buf = io.BytesIO()
         img.save(buf, format="PNG")
         return buf.getvalue()
 
+    @staticmethod
+    def _group_block_text(group_regions: list[TextRegion]) -> str | None:
+        """返回气泡分组对应的整块译文（pipeline 按气泡整块翻译的结果）"""
+        for r in group_regions:
+            if r.group_translated and r.group_translated.strip():
+                return r.group_translated
+        return None
+
     def _group_by_bubble(self, bgr, regions, img_w, img_h):
         """将同一气泡内的 region 分组，返回 [(bubble_bbox, [regions])]
 
-        用重叠率（交集 / 较小框面积）而非 IoU：同一气泡内相邻竖排列
-        的检测框常部分重叠但 IoU 偏低，重叠率能正确合并它们。
+        pipeline 已按气泡分组（region.group_index 非空）时直接复用分组，
+        气泡框取 group_bounds；否则用泛洪填充推气泡后按重叠率合并。
         """
+        if any(r.group_index is not None for r in regions):
+            groups_by_idx: dict[int, list] = {}
+            for region in regions:
+                text = (region.group_translated or "").strip() or (region.translated or "").strip()
+                if not text:
+                    continue
+                gi = region.group_index if region.group_index is not None else -1
+                groups_by_idx.setdefault(gi, []).append(region)
+            result = []
+            for gi, gs in groups_by_idx.items():
+                bounds_list = [r.group_bounds for r in gs if r.group_bounds] or [r.bounds for r in gs]
+                bx0 = min(b[0] for b in bounds_list)
+                by0 = min(b[1] for b in bounds_list)
+                bx1 = max(b[2] for b in bounds_list)
+                by1 = max(b[3] for b in bounds_list)
+                result.append(((bx0, by0, bx1, by1), gs))
+            return result
+
         groups: list[list] = []
         for region in regions:
             text = (region.translated or "").strip()
@@ -229,10 +259,10 @@ class PILRenderer(BaseRenderer):
     def _union(a, b):
         return (min(a[0], b[0]), min(a[1], b[1]), max(a[2], b[2]), max(a[3], b[3]))
 
-    def _render_horizontal_bubble(self, draw, regions, bx0, by0, bw, bh, min_font_size):
-        """横排气泡：多行合并，统一字号填满气泡"""
+    def _render_horizontal_bubble(self, draw, regions, bx0, by0, bw, bh, min_font_size, block=None):
+        """横排气泡：整块文本（或各 region 合并）二分字号填满气泡"""
         lines = sorted(regions, key=lambda r: (r.bounds[1], r.bounds[0]))
-        text = "\n".join((r.translated or "").strip() for r in lines)
+        text = block if block is not None else "\n".join((r.translated or "").strip() for r in lines)
         avail_w = bw * (1 - 2 * PAD_RATIO)
         avail_h = bh * (1 - 2 * PAD_RATIO)
         max_font = max(min_font_size, int(bh * MAX_FONT_RATIO))
@@ -310,6 +340,73 @@ class PILRenderer(BaseRenderer):
                 )
                 ty += char_h
             x_center -= col_gap
+
+    def _render_vertical_bubble_block(self, draw, text, bx0, by0, bw, bh, min_font_size):
+        """竖排气泡整块重排：整块译文按气泡框尺寸拆分为多列（右→左），对称居中
+
+        - 每个逻辑行（\\n）独立成列，超长行自动折到新列
+        - 字号受列宽（防列间重叠）与高度（每列字数*字距 ≤ 可用高）双约束
+        """
+        lines = [ln for ln in text.split("\n") if ln]
+        if not lines:
+            return
+        pad_x = PAD_RATIO * bw
+        pad_y = PAD_RATIO * bh
+        avail_w = bw - 2 * pad_x
+        avail_h = bh - 2 * pad_y
+        if avail_w <= 0 or avail_h <= 0:
+            return
+
+        font_size = self._vertical_optimal_font(lines, avail_w, avail_h, min_font_size)
+        if font_size <= 0:
+            return
+        font = self._get_font(font_size)
+        sw = max(1, int(font_size * STROKE_RATIO))
+        char_h = int(font_size * VERTICAL_CHAR_RATIO)
+        chars_per_col = max(1, int(avail_h // char_h))
+
+        columns: list[str] = []
+        for ln in lines:
+            for i in range(0, len(ln), chars_per_col):
+                columns.append(ln[i : i + chars_per_col])
+        n = len(columns)
+        col_gap = avail_w / max(1, n)
+        right_pad = pad_x + col_gap / 2
+        x_center = bx0 + bw - right_pad
+        cent_y = by0 + avail_h / 2 + pad_y
+        for col_idx, col in enumerate(columns):
+            cx = x_center - col_idx * col_gap
+            total_h = len(col) * char_h
+            ty = cent_y - total_h / 2
+            tx = cx - font_size / 2
+            for ch in col:
+                draw.text(
+                    (tx, ty),
+                    ch,
+                    font=font,
+                    fill=(0, 0, 0),
+                    stroke_width=sw,
+                    stroke_fill=(255, 255, 255),
+                )
+                ty += char_h
+
+    def _vertical_optimal_font(self, lines, avail_w, avail_h, min_font_size) -> int:
+        """竖排整块：返回能满足「字距·列数 ≤ 可用宽」「列字数·字距 ≤ 可用高」的最大字号"""
+        chars_total = sum(len(ln) for ln in lines)
+        _max = max(self._MIN_FONT_LIMIT, int(avail_h / max(1, chars_total) * VERTICAL_CHAR_RATIO), min_font_size)
+        max_font = max(min_font_size, min(int(avail_w * VERTICAL_COL_USE_RATIO), _max))
+        best = 0
+        for font in range(max_font, min_font_size - 1, -1):
+            char_h = int(font * VERTICAL_CHAR_RATIO)
+            chars_per_col = max(1, int(avail_h // char_h))
+            n_cols = sum(max(1, -(-len(ln) // chars_per_col)) for ln in lines)
+            col_gap = avail_w / max(1, n_cols)
+            if font <= col_gap * VERTICAL_COL_USE_RATIO:
+                best = font
+                break
+        return best if best >= min_font_size else max(min_font_size, best)
+
+    _MIN_FONT_LIMIT = 8
 
     def _find_max_font_in(self, draw, text, max_w, max_h, max_size, min_size):
         """二分查找 [min_size, max_size] 内能放进 (max_w, max_h) 的最大字号"""

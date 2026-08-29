@@ -18,6 +18,8 @@ from app.services.pipeline import TextRegion
 FLOOD_TOL = 40
 # 填充面积超过整图该比例视为泄漏（非气泡）
 MAX_FILL_RATIO = 0.5
+# 气泡相对文本框的最大放大倍数（防止无边框气泡泄漏到整张图）
+BUBBLE_GROW_RATIO = 6.0
 
 try:
     import cv2
@@ -68,3 +70,130 @@ class BubbleFilter:
 
 def create_bubble_filter() -> BubbleFilter:
     return BubbleFilter()
+
+
+def detect_bubble(bgr, bounds, img_w, img_h, flood_tol=FLOOD_TOL, grow_ratio=BUBBLE_GROW_RATIO):
+    """通过泛洪填充找到文本框所属气泡的真实边界（与 renderer 同算法）"""
+    x0, y0, x1, y1 = [int(v) for v in bounds]
+    x0 = max(0, min(x0, img_w - 1))
+    x1 = max(0, min(x1, img_w - 1))
+    y0 = max(0, min(y0, img_h - 1))
+    y1 = max(0, min(y1, img_h - 1))
+    if x1 <= x0 or y1 <= y0:
+        return (x0, y0, x1, y1)
+
+    max_bw = max((x1 - x0) * grow_ratio, img_w * 0.85)
+    max_bh = max((y1 - y0) * grow_ratio, img_h * 0.85)
+
+    if cv2 is not None:
+        h, w = bgr.shape[:2]
+        flags = 8 | cv2.FLOODFILL_MASK_ONLY | (255 << 8)
+        seeds = [
+            ((x0 + x1) // 2, (y0 + y1) // 2),
+            (x0 + 2, y0 + 2),
+            (x1 - 2, y0 + 2),
+            (x0 + 2, y1 - 2),
+            (x1 - 2, y1 - 2),
+        ]
+        best = None
+        best_area = -1
+        for seed in seeds:
+            sx, sy = seed
+            if not (0 <= sx < w and 0 <= sy < h):
+                continue
+            try:
+                mask = np.zeros((h + 2, w + 2), np.uint8)
+                cv2.floodFill(bgr, mask, seed, 0, (flood_tol, flood_tol, flood_tol), (flood_tol, flood_tol, flood_tol), flags)
+            except Exception:  # noqa: BLE001
+                continue
+            filled = mask[1:-1, 1:-1]
+            ys, xs = np.where(filled > 0)
+            if xs.size == 0:
+                continue
+            bx0 = int(xs.min())
+            by0 = int(ys.min())
+            bx1 = int(xs.max()) + 1
+            by1 = int(ys.max()) + 1
+            if (bx1 - bx0) > max_bw or (by1 - by0) > max_bh:
+                continue
+            area = (bx1 - bx0) * (by1 - by0)
+            if area > best_area:
+                best_area = area
+                best = (bx0, by0, bx1, by1)
+        if best is not None:
+            if (best[2] - best[0]) * (best[3] - best[1]) < (x1 - x0) * (y1 - y0) * 0.5:
+                return _fallback_box(x0, y0, x1, y1, img_w, img_h)
+            return best
+
+    return _fallback_box(x0, y0, x1, y1, img_w, img_h)
+
+
+def _fallback_box(x0, y0, x1, y1, img_w, img_h, pad_xr=0.35, pad_yr=0.35):
+    pad_x = int((x1 - x0) * pad_xr)
+    pad_y = int((y1 - y0) * pad_yr)
+    return (
+        max(0, x0 - pad_x),
+        max(0, y0 - pad_y),
+        min(img_w, x1 + pad_x),
+        min(img_h, y1 + pad_y),
+    )
+
+
+def _union(a, b):
+    return (min(a[0], b[0]), min(a[1], b[1]), max(a[2], b[2]), max(a[3], b[3]))
+
+
+def _overlap_ratio(a, b) -> float:
+    """交集面积 / 较小框面积"""
+    ax0, ay0, ax1, ay1 = a
+    bx0, by0, bx1, by1 = b
+    iw = max(0, min(ax1, bx1) - max(ax0, bx0))
+    ih = max(0, min(ay1, by1) - max(ay0, by0))
+    inter = iw * ih
+    if inter <= 0:
+        return 0.0
+    area_a = (ax1 - ax0) * (ay1 - ay0)
+    area_b = (bx1 - bx0) * (by1 - by0)
+    return inter / max(1, min(area_a, area_b))
+
+
+def group_regions_by_bubble(bgr, regions: list[TextRegion], img_w, img_h, overlap=0.15) -> list[dict]:
+    """把同气泡的 region 分到一组，组内按阅读顺序排序（横排 y→x，竖排 右→左）
+
+    返回 [{bbox, regions}]；同时回填 region.group_bounds（组包围盒）。
+    """
+    groups: list[dict] = []
+    for region in regions:
+        bb = detect_bubble(bgr, region.bounds, img_w, img_h)
+        best_idx, best_ov = -1, 0.0
+        for i, g in enumerate(groups):
+            ov = _overlap_ratio(bb, g["bbox"])
+            if ov > best_ov:
+                best_ov, best_idx = ov, i
+        if best_idx >= 0 and best_ov > overlap:
+            groups[best_idx]["bbox"] = _union(bb, groups[best_idx]["bbox"])
+            groups[best_idx]["regions"].append(region)
+        else:
+            groups.append({"bbox": bb, "regions": [region]})
+
+    out = []
+    for g in groups:
+        regions = g["regions"]
+        dirs = [r.direction for r in regions if r.direction]
+        vertical = (dirs.count("v") > dirs.count("h")) if dirs else (g["bbox"][3] - g["bbox"][1] > (g["bbox"][2] - g["bbox"][0]))
+        if vertical:
+            regions_sorted = sorted(
+                regions,
+                key=lambda r: (-((r.bounds[0] + r.bounds[2]) / 2), r.bounds[1]),
+            )
+        else:
+            regions_sorted = sorted(
+                regions,
+                key=lambda r: (r.bounds[1], r.bounds[0]),
+            )
+        bbox = g["bbox"]
+        for i, r in enumerate(regions_sorted):
+            r.group_index = len(out)
+            r.group_bounds = bbox
+        out.append({"bbox": bbox, "regions": regions_sorted})
+    return out

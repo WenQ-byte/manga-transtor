@@ -27,7 +27,7 @@
 
 ## 配置
 
-- pydantic-settings，环境变量前缀 `MANGA_`，读 `.env`（见 `backend/app/config.py`）。如 `MANGA_PIPELINE_MODE`（real/demo）、`MANGA_TRANSLATOR_BACKEND`（deepseek/google/deepl/openai/mymemory）、`MANGA_MAX_UPLOAD_MB`、`MANGA_INPAINTER_BACKEND`（cv/lama）、`MANGA_OCR_BACKEND`（mit48/paddle）、`MANGA_DETECTOR_BACKEND`（空/cv/manga）、`MANGA_MIT_DETECTOR`（default/ctd）、`MANGA_MIT_MODEL_DIR`/`MANGA_MIT_FALLBACK_DIR`、`MANGA_MIT_DEVICE`（cpu/cuda/mps/auto）、`MANGA_BUBBLE_FILTER`（auto/on/off）。
+- pydantic-settings，环境变量前缀 `MANGA_`，读 `.env`（见 `backend/app/config.py`）。如 `MANGA_PIPELINE_MODE`（real/demo）、`MANGA_TRANSLATOR_BACKEND`（deepseek/google/deepl/openai/mymemory）、`MANGA_MAX_UPLOAD_MB`、`MANGA_INPAINTER_BACKEND`（cv/lama）、`MANGA_OCR_BACKEND`（mit48/mangaocr/mit48+mangaocr/paddle）、`MANGA_DETECTOR_BACKEND`（空/cv/manga）、`MANGA_MIT_DETECTOR`（default/ctd）、`MANGA_MIT_MODEL_DIR`/`MANGA_MIT_FALLBACK_DIR`、`MANGA_MIT_DEVICE`（cpu/cuda/mps/auto）、`MANGA_MIT_OCR_UPSCALE`/`MANGA_MIT_OCR_MIX_THRESHOLD`、`MANGA_BUBBLE_FILTER`（auto/on/off）。
 - `.env` 已 gitignore；`.env.example` 展示全部可配项。DeepL 免费版 auth key 以 `:fx` 结尾。
 
 ## 架构要点（非文件名能看出的）
@@ -43,10 +43,11 @@
 代码在 `backend/app/services/engines/mit/`（裁剪为仅推理），引擎包装在 `engines/detector.py:MangaDetector` 与 `engines/ocr.py:MIT48OCREngine`。**MIT 是默认检测/OCR**（`MANGA_OCR_BACKEND` 默认 `mit48` → detector 自动 `manga`；MIT 加载失败或权重缺失时引擎工厂回退 PaddleOCR/CV）。**建议 2112+ 显存或纯 CPU**；模型权重在 `backend/data/models/mit/`（gitignore，不提交），可用 `MANGA_MIT_MODEL_DIR` 指向已下载的 MIT 仓库 `models/`。
 
 - **检测**：`mit_detector=default` 用自实现 ResNet34 + DBNet（`mit/resnet34.py` 替代 torchvision 的 resnet34，避免版本匹配问题，权重名一致）；`ctd` 用 `mit/ctd.py` + `ctd_utils/`（YOLOv5-s backbone + UNet 文本掩膜头 + DBNet 行头；GPU 用 `.pt`，CPU 用 `.pt.onnx` + cv2.dnn；YOLO 块/语言检测输出已弃用，照搬 MIT 行为只消费 mask+lines）。
-- **识别**：`mit/ocr_48px.py`（ConvNeXt 骨干 + RoFormer/XPOS + beam search，`infer_beam_batch_tensor`），`mit/xpos.py`。逐字符预测前景/背景色，回填 `TextRegion.fg_color/bg_color`。
+- **识别**：`mit/ocr_48px.py`（ConvNeXt 骨干 + RoFormer/XPOS + beam search，`infer_beam_batch_tensor`），`mit/xpos.py`。逐字符预测前景/背景色，回填 `TextRegion.fg_color/bg_color`。可选 `mangaocr`/`mit48+mangaocr`（`mit/mocr.py`，HF `kha-white/manga-ocr-base`，风格化字体更强但无置信度，混合模式按 `MANGA_MIT_OCR_MIX_THRESHOLD` 兜底）。小字（字号 < `MANGA_MIT_OCR_UPSCALE`）先 2x 放大再识别（`Mit48Ocr._region_image`）。
+- **翻译分组**：pipeline 翻译前用 `bubble.py:group_regions_by_bubble` 按气泡泛洪分组，整块 `\n` 拼接一次翻译（更地道），整块译文存 `region.group_translated` 并尽力按行拆回 `region.translated`。
 - **方向**：`Quadrilateral.direction`（横/竖）由 `sort_pnts` 判定，回填 `TextRegion.direction`；渲染仍按气泡宽高比决定横竖排（renderer 未消费 direction，留作后续）。
 - **掩膜**：检测阶段直接把 raw_mask 裁剪成 0/255 patch 存入 `region.mask`（`{bbox, patch}`），`mask.py:build_full_mask` 已改为**缓存优先**（否则会覆盖 MIT 预填充）。`MANGA_MIT_IGNORE_BUBBLE`（1-50）开启时，非气泡区域（拟声词等）不生成掩膜、原文保留。
-- **管线配合**：MIT 检测器的每个 textline 即一个 region（不停靠 textline_merge，因为 renderer 按 region 分组渲染多行/多列气泡）；`MANGA_BUBBLE_FILTER` 默认 auto，MIT 模式自动关闭白占比气泡过滤（对彩色/深色气泡误删）。
+- **管线配合**：MIT 检测器的每个 textline 即一个 region（不停靠 textline_merge，因为 renderer 按 region 分组渲染多行/多列气泡）；`MANGA_BUBBLE_FILTER` 默认 auto，MIT 模式自动关闭白占比气泡过滤（对彩色/深色气泡误删）。翻译按气泡整块进行（见上），渲染优先用 `group_translated` 整块排版（横排二分字号填满、竖排整块分列重排）。
 
 ## 易踩的坑（改动引擎时注意）
 

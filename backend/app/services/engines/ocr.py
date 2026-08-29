@@ -437,14 +437,151 @@ class MIT48OCREngine(BaseOCR):
 
 
 def create_ocr_engine_router() -> BaseOCR:
-    """按 ocr_backend 配置路由：mit48 优先，缺失回退 create_ocr_engine()"""
+    """按 ocr_backend 配置路由：mit48/mangaocr/mit48+mangaocr 优先，缺失回退 create_ocr_engine()"""
     settings = get_settings()
-    if settings.ocr_backend == "mit48":
+    backend = settings.ocr_backend
+    table = {
+        "mit48": MIT48OCREngine,
+        "mangaocr": MangaOCREngine,
+        "mit48+mangaocr": MixedOCREngine,
+    }
+    if backend in table:
         try:
-            engine = MIT48OCREngine()
+            engine = table[backend]()
             if engine.available:
                 return engine
-            print(f"[ocr] mit48 不可用，回退 PaddleOCR: {engine._load_error}")
+            print(f"[ocr] {backend} 不可用，回退 PaddleOCR: {engine._load_error}")
         except Exception as e:  # noqa: BLE001
-            print(f"[ocr] mit48 加载异常，回退 PaddleOCR: {e}")
+            print(f"[ocr] {backend} 加载异常，回退 PaddleOCR: {e}")
     return create_ocr_engine()
+
+
+def _quads_from_regions(regions: list[TextRegion]) -> list:
+    """为 region 建立/复用 MIT Quadrilateral"""
+    from app.services.engines.mit.quadrilateral import Quadrilateral
+
+    quads = []
+    for r in regions:
+        q = r._quad
+        if q is None:
+            q = Quadrilateral(np.asarray(r.box, dtype=float).reshape(4, 2), r.text, r.confidence)
+            r._quad = q
+        quads.append(q)
+    return quads
+
+
+class MangaOCREngine(BaseOCR):
+    """manga-ocr（kha-white/manga-ocr-base）识别引擎（日漫风格化字体召回强，无置信度）"""
+
+    name = "mangaocr"
+
+    supports_detection = False
+
+    def __init__(self):
+        self.settings = get_settings()
+        self._impl = None
+        self._load_error = ""
+        self._load()
+
+    @property
+    def available(self) -> bool:
+        return self._impl is not None and self._impl.available
+
+    def _load(self):
+        from app.services.engines.mit.mocr import MangaOcrWrapper
+
+        self._impl = MangaOcrWrapper()
+        if not self._impl.available:
+            self._load_error = self._impl._error
+
+    def recognize(
+        self,
+        image_path: Path,
+        regions: list[TextRegion],
+        source_lang: str = "ja",
+    ) -> None:
+        if self._impl is None:
+            for r in regions:
+                r.confidence = 0.0
+            return
+        try:
+            img = np.array(Image.open(image_path).convert("RGB"))
+            quads = _quads_from_regions(regions)
+            self._impl.recognize(img, quads)
+            for r, q in zip(regions, quads):
+                pts = np.asarray(q.pts).round().astype(int)
+                r.box = [[int(pts[i][0]), int(pts[i][1])] for i in range(4)]
+                r.poly = [[float(pts[i][0]), float(pts[i][1])] for i in range(4)]
+                r.direction = q.direction
+                r.text = q.text or ""
+                r.confidence = float(q.prob)
+        except Exception as e:  # noqa: BLE001
+            print(f"[mangaocr] OCR 推理失败: {e}")
+            for r in regions:
+                r.confidence = 0.0
+
+
+class MixedOCREngine(BaseOCR):
+    """mit48 + manga-ocr 混合：先跑 48px，概率低于阈值（或未识别出）的行改用 manga-ocr 补识别"""
+
+    name = "mit48+mangaocr"
+
+    supports_detection = False
+
+    def __init__(self):
+        self.settings = get_settings()
+        self._mit48 = None
+        self._mocr = None
+        self._load_error = ""
+        self._load()
+
+    @property
+    def available(self) -> bool:
+        return self._mit48 is not None and self._mocr is not None and self._mocr.available
+
+    def _load(self):
+        from app.services.engines.mit.config import mixed_ocr_params, ocr_params, resolve_device
+        from app.services.engines.mit.mocr import MangaOcrWrapper
+        from app.services.engines.mit.ocr_48px import Mit48Ocr
+
+        p = ocr_params()
+        m = mixed_ocr_params()
+        self._mit48 = Mit48Ocr(device=resolve_device(self.settings.mit_device))
+        self._mocr = MangaOcrWrapper()
+        self._prob = p.prob
+        self._mix_threshold = m.mix_threshold
+        if not self._mocr.available:
+            raise RuntimeError(self._mocr._error)
+
+    def recognize(
+        self,
+        image_path: Path,
+        regions: list[TextRegion],
+        source_lang: str = "ja",
+    ) -> None:
+        if self._mit48 is None:
+            for r in regions:
+                r.confidence = 0.0
+            return
+        try:
+            img = np.array(Image.open(image_path).convert("RGB"))
+            quads = _quads_from_regions(regions)
+            self._mit48.recognize(img, quads, prob_threshold=getattr(self, "_prob", 0.2))
+            # 48px 概率低或未识别出的行 → 用 manga-ocr 补识别
+            low = [q for q in quads if (not (q.text or "").strip()) or q.prob < self._mix_threshold]
+            if low:
+                self._mocr.recognize(img, low)
+            for r, q in zip(regions, quads):
+                pts = np.asarray(q.pts).round().astype(int)
+                r.box = [[int(pts[i][0]), int(pts[i][1])] for i in range(4)]
+                r.poly = [[float(pts[i][0]), float(pts[i][1])] for i in range(4)]
+                r.direction = q.direction
+                r.text = q.text or ""
+                r.confidence = float(q.prob)
+                if q.text:
+                    r.fg_color = (int(q.fg_r), int(q.fg_g), int(q.fg_b))
+                    r.bg_color = (int(q.bg_r), int(q.bg_g), int(q.bg_b))
+        except Exception as e:  # noqa: BLE001
+            print(f"[mit48+mangaocr] OCR 推理失败: {e}")
+            for r in regions:
+                r.confidence = 0.0

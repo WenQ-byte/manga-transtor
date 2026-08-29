@@ -7,3 +7,5 @@ py3langid
 pyclipper
 shapely
 networkx
+# manga-ocr（可选）：MANGA_OCR_BACKEND=mangaocr / mit48+mangaocr 时使用（HF 模型 kha-white/manga-ocr-base）
+manga-ocr

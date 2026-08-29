@@ -118,6 +118,103 @@ class TestMitEngines(unittest.TestCase):
         self.image = make_test_image(Path(self.tmp) / "test.png")
 
 
+class TestBubbleGrouping(unittest.TestCase):
+    """气泡分组：同一气泡的 region 合成一组，并按阅读顺序排列"""
+
+    def _make_scene(self):
+        img = Image.new("RGB", (400, 260), "white")
+        d = ImageDraw.Draw(img)
+        # 两个独立气泡
+        d.ellipse([20, 20, 190, 130], outline="black", width=3)
+        d.ellipse([230, 20, 390, 130], outline="black", width=3)
+        d.rectangle([50, 40, 170, 55], fill="black")
+        d.rectangle([50, 75, 170, 90], fill="black")
+        d.rectangle([260, 40, 370, 55], fill="black")
+        d.rectangle([260, 75, 370, 90], fill="black")
+        return img
+
+    def test_two_bubbles_grouped(self):
+        from app.services.engines.bubble import group_regions_by_bubble
+        from app.services.pipeline import TextRegion
+
+        img = self._make_scene()
+        arr = np.array(img)
+        bgr = arr[:, :, ::-1].copy()
+        regions = [
+            TextRegion(box=[[50, 40], [170, 40], [170, 55], [50, 55]]),
+            TextRegion(box=[[50, 75], [170, 75], [170, 90], [50, 90]]),
+            TextRegion(box=[[260, 40], [370, 40], [370, 55], [260, 55]]),
+            TextRegion(box=[[260, 75], [370, 75], [370, 90], [260, 90]]),
+        ]
+        groups = group_regions_by_bubble(bgr, regions, 400, 260)
+        self.assertEqual(len(groups), 2)
+        for g in groups:
+            self.assertEqual(len(g["regions"]), 2)
+            for r in g["regions"]:
+                self.assertIsNotNone(r.group_index)
+                self.assertIsNotNone(r.group_bounds)
+        self.assertEqual({g["regions"][0].bounds[0] for g in groups}, {50, 260})
+
+
+class TestBubbleBlockRender(unittest.TestCase):
+    """整块气泡译文排版：横排块/竖排块渲染不报错且保留尺寸"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        cleaned = Path(self.tmp) / "cleaned.png"
+        img = Image.new("RGB", (300, 300), "white")
+        ImageDraw.Draw(img).rectangle([20, 20, 280, 150], outline="black", width=2)
+        img.save(cleaned)
+        self.cleaned = cleaned
+
+    def _render(self, regions):
+        import io
+
+        from app.services.engines import get_engine
+
+        renderer = get_engine("renderer")
+        out = renderer.render(self.cleaned, regions, target_lang="zh")
+        parsed = Image.open(io.BytesIO(out))
+        self.assertEqual(parsed.size, (300, 300))
+        return out
+
+    def test_horizontal_block(self):
+        from app.services.pipeline import TextRegion
+
+        r = TextRegion(box=[[40, 40], [260, 40], [260, 70], [40, 70]])
+        r.group_index = 0
+        r.group_bounds = (20, 20, 280, 150)
+        r.group_translated = "第一行\n第二行"
+        r.direction = "h"
+        self._render([r])
+
+    def test_vertical_block(self):
+        from app.services.pipeline import TextRegion
+
+        r = TextRegion(box=[[100, 30], [140, 30], [140, 260], [100, 260]])
+        r.group_index = 0
+        r.group_bounds = (60, 20, 240, 280)
+        r.group_translated = "这是一段比较长的中文译文需要进行竖排分列重排"
+        r.direction = "v"
+        self._render([r])
+
+
+def _import_ok() -> bool:
+    import importlib.util
+
+    return importlib.util.find_spec("manga_ocr") is not None
+
+
+class TestMangaOcrEngine(unittest.TestCase):
+    """manga-ocr 引擎冒烟：未安装时跳过"""
+
+    @unittest.skipUnless(_import_ok(), "manga-ocr 未安装，跳过")
+    def test_engine_importable(self):
+        from app.services.engines.ocr import MangaOCREngine
+
+        self.assertEqual(MangaOCREngine.name, "mangaocr")
+
+
 class TestGlossary(unittest.TestCase):
     def setUp(self):
         self.service = GlossaryService()
