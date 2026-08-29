@@ -124,9 +124,14 @@ def bubble_with_mask(bgr, bounds, img_w, img_h, flood_tol=FLOOD_TOL, grow_ratio=
             if area > best_area:
                 best_area = area
                 best = (bx0, by0, bx1, by1)
-                best_mask = filled.astype(np.uint8) * 255
+                # 注意 uint8 溢出：255*255 会回绕成 1，必须先转 bool 再放大到 0/255
+                best_mask = (filled > 0).astype(np.uint8) * 255
         if best is not None:
-            if (best[2] - best[0]) * (best[3] - best[1]) < (x1 - x0) * (y1 - y0) * 0.5:
+            area = (best[2] - best[0]) * (best[3] - best[1])
+            # 填充过小（没填到文本区）或过大（泄漏到面板间隙/相邻气泡）都不可信
+            if area < (x1 - x0) * (y1 - y0) * 0.5:
+                return _fallback_box(x0, y0, x1, y1, img_w, img_h), None
+            if best_mask is not None and int((best_mask > 0).sum()) > (x1 - x0) * (y1 - y0) * 8:
                 return _fallback_box(x0, y0, x1, y1, img_w, img_h), None
             return best, best_mask
 
@@ -297,6 +302,17 @@ def _contains(a, b) -> bool:
     return a[0] <= b[0] and a[1] <= b[1] and a[2] >= b[2] and a[3] >= b[3]
 
 
+def _proximity_overlap(a, b) -> bool:
+    """两框各自按短边 20% 外扩后是否重叠/包含（同气泡列间、行间的近邻兜底）"""
+    def expand(box):
+        x0, y0, x1, y1 = box
+        pad = 0.2 * max(1, min(x1 - x0, y1 - y0))
+        return (x0 - pad, y0 - pad, x1 + pad, y1 + pad)
+
+    ea, eb = expand(a), expand(b)
+    return _overlap_ratio(ea, eb) > 0.15 or _contains(ea, eb) or _contains(eb, ea)
+
+
 def _merge_overlap_groups(groups, overlap=0.15):
     changed = True
     while changed:
@@ -306,7 +322,12 @@ def _merge_overlap_groups(groups, overlap=0.15):
             j = i + 1
             while j < len(groups):
                 a, b = groups[i]["bbox"], groups[j]["bbox"]
-                if _overlap_ratio(a, b) > overlap or _contains(a, b) or _contains(b, a):
+                if (
+                    _overlap_ratio(a, b) > overlap
+                    or _contains(a, b)
+                    or _contains(b, a)
+                    or _proximity_overlap(a, b)
+                ):
                     groups[i]["bbox"] = _union(a, b)
                     groups[i]["regions"].extend(groups[j]["regions"])
                     groups.pop(j)

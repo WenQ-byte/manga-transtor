@@ -350,16 +350,19 @@ class TestPunctuationMerge(unittest.TestCase):
 
 
 class TestRendererDirection(unittest.TestCase):
-    def test_wide_bubble_stays_horizontal_even_with_vertical_direction(self):
+    def test_direction_overrides_bubble_shape(self):
         from app.services.engines.renderer import PILRenderer
         from app.services.pipeline import TextRegion
 
-        # 矮宽气泡即使单 region 方向为 v 也保持横排（避免被方向误判强制竖排）
+        # 方向优先：竖排文字即使位于矮宽/圆形气泡也保持竖排（用户实测横排为 bug）
         r = TextRegion(box=[[10, 10], [200, 10], [200, 40], [10, 40]], direction="v")
-        self.assertFalse(PILRenderer._use_vertical([r], bw=190, bh=30))
-        # 形状强竖（高>>宽）则无条件竖排
+        self.assertTrue(PILRenderer._use_vertical([r], bw=190, bh=30))
+        # 形状强竖（高>>宽）同样竖排
         r2 = TextRegion(box=[[10, 10], [40, 10], [40, 200], [10, 200]], direction="v")
         self.assertTrue(PILRenderer._use_vertical([r2], bw=30, bh=190))
+        # 横排方向即使在竖长气泡也保持横排
+        r3 = TextRegion(box=[[10, 10], [40, 10], [40, 200], [10, 200]], direction="h")
+        self.assertFalse(PILRenderer._use_vertical([r3], bw=30, bh=190))
 
     def test_no_direction_falls_back_to_aspect(self):
         from app.services.engines.renderer import PILRenderer

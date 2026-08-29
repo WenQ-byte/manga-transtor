@@ -156,26 +156,57 @@ class PILRenderer(BaseRenderer):
         return buf.getvalue()
 
     def _bubble_geometry(self, bgr, group_regions: list[TextRegion], img_w, img_h):
-        """在修复后图像上重推该组的气泡：返回 (bbox, mask|None)"""
+        """在修复后图像上重推该组的气泡：返回 (bbox, mask|None)
+
+        泛洪结果须通过可信度校验：掩膜必须覆盖本组全部擦除笔画区（原文位置必须在
+        新气泡内）、面积不得远超文本框（防泄漏到面板间隙/相邻气泡）。不合格时锚定
+        文本框外扩矩形（mask=None → 渲染端按矩形裁剪），保证文字不跑位不丢失。
+        """
         from app.services.engines.bubble import bubble_with_mask
 
         x0 = min(r.bounds[0] for r in group_regions)
         y0 = min(r.bounds[1] for r in group_regions)
         x1 = max(r.bounds[2] for r in group_regions)
         y1 = max(r.bounds[3] for r in group_regions)
-        return bubble_with_mask(bgr, (x0, y0, x1, y1), img_w, img_h)
+
+        def anchored():
+            return self._fallback_box(x0, y0, x1, y1, img_w, img_h), None
+
+        bb, mask = bubble_with_mask(bgr, (x0, y0, x1, y1), img_w, img_h)
+        if mask is None or not mask.any():
+            return anchored()
+        tb_area = max(1, (x1 - x0) * (y1 - y0))
+        if int((mask > 0).sum()) > tb_area * 6:
+            return anchored()
+        for r in group_regions:
+            m = r.mask
+            if not m or "patch" not in m or "bbox" not in m:
+                continue
+            px0, py0, px1, py1 = m["bbox"]
+            patch = m["patch"] > 0
+            if not patch.any():
+                continue
+            sub = mask[py0:py1, px0:px1]
+            if sub.shape != patch.shape:
+                return anchored()
+            covered = float((sub > 0)[patch].sum()) / float(patch.sum())
+            if covered < 0.85:
+                return anchored()
+        return bb, mask
 
     @staticmethod
     def _use_vertical(group_regions, bw, bh, min_ratio=None) -> bool:
         dirs = [r.direction for r in group_regions if r.direction]
         v = dirs.count("v")
         h = dirs.count("h")
-        # 强竖形状（高远大于宽）无条件竖排
-        if bh > bw * 1.6:
+        # 方向优先：检测器给出的文字方向最可靠（圆形气泡竖排文字不能靠形状判定）
+        if v > h:
             return True
-        # 形状略高 + 方向以竖排为主 才竖排（避免矮气泡被方向误判强制竖排）
+        if h > v:
+            return False
+        # 无方向信息时按形状：高明显大于宽 → 竖排
         ratio = min_ratio if min_ratio is not None else 1.2
-        return bh > bw * ratio and v > h
+        return bh > bw * ratio
 
     @staticmethod
     def _text_colors(group_regions) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
