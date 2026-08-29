@@ -13,8 +13,8 @@ from app.services.glossary_service import GlossaryService
 PIPELINE_STEPS = [
     ("detect", "检测文本区域"),
     ("ocr", "识别文字"),
-    ("translate", "翻译"),
     ("inpaint", "修复图像"),
+    ("translate", "翻译"),
     ("render", "渲染译文"),
 ]
 
@@ -42,6 +42,7 @@ class TextRegion:
 
     # 内部：MIT 检测器附加的 Quadrilateral、OCR 附加的内部状态
     _quad: Optional[object] = field(default=None, repr=False, compare=False)
+    _no_erase: bool = field(default=False, repr=False, compare=False)  # mit_ignore_bubble 判定时跳过擦除
 
     @property
     def bounds(self) -> tuple[int, int, int, int]:
@@ -145,30 +146,33 @@ class TranslationPipeline:
         if not regions:
             return PipelineResult(regions=[], duration_ms=int((time.monotonic() - start) * 1000))
 
-        # 3. 按气泡分组 → 整块翻译（一个气泡一次请求，更地道），再尽力拆回每行
+        # 3. 图像修复（擦除原文）—— 提前到翻译前，使气泡分组可在干净图上进行
+        self._report(progress_cb, 2, 10)
+        cleaned = self.inpainter.inpaint(image_path, regions)
+        self._report(progress_cb, 2, 100)
+
+        # 4. 按气泡分组（干净图上泛洪，笔画已擦除 → 分组可靠）→ 整块翻译
         glossary = self.glossary.get_mapping(source_lang)
-        self._report(progress_cb, 2, 5)
-        groups = self._group_regions(image_path, regions)
+        self._report(progress_cb, 3, 5)
+        groups = self._group_regions(cleaned, regions)
         group_texts = ["\n".join(r.text for r in g["regions"]) for g in groups]
         translated_blocks = self.translator.translate_batch(
             group_texts,
             source_lang,
             target_lang,
             glossary=glossary,
-            progress_cb=lambda p: self._report(progress_cb, 2, 5 + int(p * 0.95)),
+            progress_cb=lambda p: self._report(progress_cb, 3, 5 + int(p * 0.95)),
         )
         for g, block in zip(groups, translated_blocks):
             block = block or ""
+            if not block.strip():
+                # 翻译失败/空结果：回退原文整块，避免文字消失
+                block = "\n".join(r.text for r in g["regions"])
             lines = block.split("\n")
             last = lines[-1] if lines else ""
             for i, r in enumerate(g["regions"]):
                 r.group_translated = block
                 r.translated = lines[i] if i < len(lines) else last
-        self._report(progress_cb, 2, 100)
-
-        # 4. 图像修复（擦除原文）
-        self._report(progress_cb, 3, 10)
-        cleaned = self.inpainter.inpaint(image_path, regions)
         self._report(progress_cb, 3, 100)
 
         # 5. 渲染译文

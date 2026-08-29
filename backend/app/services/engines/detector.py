@@ -233,6 +233,7 @@ class MangaDetector(BaseDetector):
 
             region_img = image[y0:y1, x0:x1]
             if is_ignore(region_img, ignore_bubble):
+                region._no_erase = True
                 return None
         patch = (patch > 127).astype(np.uint8) * 255
         # 覆盖抗锯齿边缘

@@ -98,6 +98,8 @@ class PILRenderer(BaseRenderer):
         clip_mask = np.zeros((img_h, img_w), np.uint8)
 
         for _bubble, group_regions in groups:
+            pre_alpha = np.array(overlay.getchannel("A")).copy()
+
             bb, mask = self._bubble_geometry(bgr, group_regions, img_w, img_h)
             if bb is None:
                 continue
@@ -121,13 +123,26 @@ class PILRenderer(BaseRenderer):
                     odraw, group_regions, bx0, by0, bw, bh, min_font_size, block=block, fill=fill, stroke=stroke
                 )
 
+            # 本组实际绘制的文字像素（本组新增 alpha）
+            post_alpha = np.array(overlay.getchannel("A"))
+            drawn = (post_alpha > 0) & (pre_alpha == 0)
+            group_clip = np.zeros((img_h, img_w), np.uint8)
+
             if mask is not None:
-                clip_mask = np.maximum(clip_mask, mask)
+                # 掩膜可用但若覆盖率过低（泛洪泄漏/不可信），回退矩形裁剪以防文字消失
+                coverage = 0.0
+                if drawn.any():
+                    coverage = float((drawn & (mask > 0)).sum()) / float(drawn.sum())
+                if coverage >= 0.5:
+                    group_clip = mask
+                else:
+                    group_clip[by0:by1, bx0:bx1] = 255
             else:
                 cx0, cy0 = max(0, bx0), max(0, by0)
                 cx1, cy1 = min(img_w, bx1), min(img_h, by1)
                 if cx1 > cx0 and cy1 > cy0:
-                    clip_mask[cy0:cy1, cx0:cx1] = 255
+                    group_clip[cy0:cy1, cx0:cx1] = 255
+            clip_mask = np.maximum(clip_mask, group_clip)
 
         # 仅保留「有文字且位于气泡内」的像素
         text_alpha = np.array(overlay.getchannel("A"))
@@ -459,7 +474,7 @@ class PILRenderer(BaseRenderer):
     ):
         """竖排气泡整块重排：整块译文按气泡框拆分为多列，整组对称居中、顶部对齐
 
-        - 逻辑行（\\n）软分列：能独立成列则独立，超长行才续列
+        - 列用均衡切分：各列长度相似（target = ceil(总字数/列数)），整行优先入列
         - 字号上界 = min(可用宽*比率, 最长行高度约束)，向下搜索至「列数×列距 ≤ 可用宽」
         - 列组水平居中，各列顶部对齐
         """
@@ -474,18 +489,12 @@ class PILRenderer(BaseRenderer):
         if avail_w <= 0 or avail_h <= 0:
             return
 
-        font_size = self._vertical_optimal_font(lines, avail_w, avail_h, min_font_size)
-        if font_size <= 0:
+        font_size, columns, char_h = self._vertical_layout(lines, avail_w, avail_h, min_font_size)
+        if font_size <= 0 or not columns:
             return
         font = self._get_font(font_size)
         sw = max(1, int(font_size * STROKE_RATIO))
-        char_h = int(font_size * VERTICAL_CHAR_RATIO)
-        chars_per_col = max(1, int(avail_h // char_h))
 
-        columns: list[str] = []
-        for ln in lines:
-            for i in range(0, len(ln), chars_per_col):
-                columns.append(ln[i : i + chars_per_col])
         n = len(columns)
         col_gap = avail_w / max(1, n)
         total_w = n * col_gap
@@ -507,25 +516,64 @@ class PILRenderer(BaseRenderer):
                 )
                 ty += char_h
 
-    def _vertical_optimal_font(self, lines, avail_w, avail_h, min_font_size) -> int:
-        """竖排整块：从合理上界向下找最大字号，使「列数·列距 ≤ 可用宽」且每列高度可容纳"""
-        max_line_len = max(len(ln) for ln in lines) or 1
-        # 上界：单列宽约束 + 最长逻辑行一列内放下（避免短文本字号暴涨 → 单字一列塌方）
-        upper = int(
-            min(
-                avail_w * VERTICAL_COL_USE_RATIO,
-                avail_h / max(1.0, max_line_len * VERTICAL_CHAR_RATIO),
-            )
-        )
+    def _vertical_layout(self, lines, avail_w, avail_h, min_font_size) -> tuple[int, list[str], int]:
+        """竖排布局：返回 (font_size, balanced_columns, char_h)；无解时 (0, [], 0)
+
+        字号上界由「列宽」约束（均衡切列会把长行拆入多列，高度约束在平衡后按列校验）。
+        """
+        if not lines:
+            return 0, [], 0
+        total = sum(len(ln) for ln in lines)
+        upper = int(avail_w * VERTICAL_COL_USE_RATIO)
         upper = max(min_font_size, upper)
-        for font in range(upper, min_font_size - 1, -1):
-            char_h = int(font * VERTICAL_CHAR_RATIO)
-            chars_per_col = max(1, int(avail_h // char_h))
-            n_cols = sum(max(1, -(-len(ln) // chars_per_col)) for ln in lines)
-            col_gap = avail_w / max(1, n_cols)
-            if font <= col_gap * VERTICAL_COL_USE_RATIO:
-                return font
-        return max(1, min_font_size)
+        font = upper
+        while font >= min_font_size:
+            char_h = max(1, int(font * VERTICAL_CHAR_RATIO))
+            cols = self._balance_columns(lines, total, avail_h, char_h)
+            if cols is None:
+                font -= 1
+                continue
+            # 每列高度校验 + 列数宽度校验
+            max_col_len = max(len(c) for c in cols)
+            if max_col_len * char_h <= avail_h and font <= (avail_w / len(cols)) * VERTICAL_COL_USE_RATIO:
+                return font, cols, char_h
+            font -= 1
+        # 兜底：最小字号下能放下的均衡列
+        char_h = max(1, int(min_font_size * VERTICAL_CHAR_RATIO))
+        cols = self._balance_columns(lines, total, avail_h, char_h)
+        if cols and max(len(c) for c in cols) * char_h <= avail_h:
+            return min_font_size, cols, char_h
+        return 0, [], 0
+
+    def _balance_columns(self, lines, total, avail_h, char_h) -> list[str] | None:
+        """均衡切列：target = ceil(总字数/列数)，整行优先入列、超长行按 target 软断
+
+        返回列列表；若任意列超出可用高度返回 None。
+        """
+        avail_cols = max(1, int(avail_h // char_h))
+        n = max(1, -(-total // avail_cols))
+        target = -(-total // n)
+        # target 不能超过 avail_cols，否则该字号放不下
+        if target > avail_cols:
+            return None
+        cols: list[str] = []
+        cur = ""
+        for ln in lines:
+            remaining = ln
+            while remaining:
+                if cur and len(cur) >= target:
+                    cols.append(cur)
+                    cur = ""
+                space = target - len(cur)
+                take = min(space, len(remaining))
+                cur += remaining[:take]
+                remaining = remaining[take:]
+            if len(cur) >= target * 0.6:
+                cols.append(cur)
+                cur = ""
+        if cur:
+            cols.append(cur)
+        return cols
 
     def _find_max_font_in(self, draw, text, max_w, max_h, max_size, min_size):
         """二分查找 [min_size, max_size] 内能放进 (max_w, max_h) 的最大字号"""
@@ -560,7 +608,33 @@ class PILRenderer(BaseRenderer):
         return result
 
     def _wrap_text(self, text: str, font: ImageFont.FreeTypeFont, max_width: int) -> list[str]:
-        """按宽度逐字符换行（适合中文/日文）"""
+        """按宽度均衡换行（适合中文/日文）：每行长度相近，末行不过短"""
+        # 先宽贪心求最少行数
+        greedy = self._greedy_wrap(text, font, max_width)
+        if len(greedy) <= 1:
+            return greedy
+        total = sum(_text_length(font, ln) for ln in greedy)
+        target = total / len(greedy)
+        # 按目标宽度断行：达到目标宽度即换行，超限则硬断
+        lines = []
+        current = ""
+        for ch in text:
+            if current and _text_length(font, current) >= target:
+                lines.append(current)
+                current = ""
+            current += ch
+            if _text_length(font, current) > max_width and len(current) > 1:
+                lines.append(current[:-1])
+                current = current[-1]
+        if current:
+            lines.append(current)
+        if not lines:
+            lines = [text]
+        return lines
+
+    @staticmethod
+    def _greedy_wrap(text: str, font: ImageFont.FreeTypeFont, max_width: int) -> list[str]:
+        """宽贪心换行：每行尽量填满"""
         lines = []
         current = ""
         for ch in text:

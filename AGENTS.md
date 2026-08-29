@@ -33,10 +33,12 @@
 ## 架构要点（非文件名能看出的）
 
 - 应用代码在 `backend/app`（不是 `backend`），运行/测试都要保证 `backend` 在 `sys.path`。
-- 流水线编排在 `services/pipeline.py`，顺序 detect → ocr → translate → inpaint → render。引擎可插拔，统一通过 `services/engines/factory.py` 的 `get_engine(type)` 获取（lru_cache 缓存）。
-- OCR 引擎自带检测（`supports_detection=True`，如 PaddleOCR）时，`pipeline.py` 跳过独立 detector，直接用 OCR 检测+识别。
-- **默认组合**：`MANGA_OCR_BACKEND=mit48+mangaocr`（默认）→ `supports_detection=False`，走 `detector=MangaDetector(ctd) → 混合识别` 流程；显式设 `MANGA_OCR_BACKEND=paddle` 才回到 PaddleOCR 一体化检测+识别。
+- 流水线编排在 `services/pipeline.py`，顺序 detect → ocr → **inpaint → translate** → render（修复提前：同一气泡的分组泛洪在擦除后的干净图上进行，分组必准；翻译整块进行）。引擎可插拔，统一通过 `services/engines/factory.py` 的 `get_engine(type)` 获取（lru_cache 缓存）。
+- OCR 引擎自带检测（`supports_detection=True`）时，`pipeline.py` 跳过独立 detector，直接用 OCR 检测+识别。
 - OCR 结果按 `confidence >= 0.5` 且非空文本过滤噪声（`pipeline.py` 中 `regions = [r for r in regions if r.confidence >= 0.5 and r.text.strip()]`）。
+- **掩膜整块化**：`mask.py` 优先按文本多边形整块填充（`fillPoly` + 膨胀，零残留），无 poly 才回退 Otsu 笔画；结果覆盖 MIT 检测器预填充的紧致神经掩膜（后者偏紧会残留）。`mit_ignore_bubble` 判定的 region 打 `_no_erase` 标记跳过擦除。
+- 渲染防丢字：`renderer.py` 逐组统计「文字像素 ∩ 气泡掩膜」覆盖率，<50% 回退矩形裁剪（防泛洪掩膜不可信时整段文字被裁掉）。
+- 排版均衡：竖排整块 `_balance_columns` 均衡切列（列长差 ≤1）、横排 `_wrap_text` 均衡断行。
 
 ## MIT 引擎（移植自 manga-image-translator，GPL-3.0）
 

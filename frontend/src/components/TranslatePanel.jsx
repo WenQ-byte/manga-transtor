@@ -30,8 +30,8 @@ import { SPECULAR_PRIMARY, SPECULAR_SECONDARY } from './specularPresets'
 const STEPS = [
   { key: 'detect', label: '检测区域', weight: 0.15 },
   { key: 'ocr', label: '识别文字', weight: 0.25 },
-  { key: 'translate', label: '翻译', weight: 0.3 },
   { key: 'inpaint', label: '修复图像', weight: 0.15 },
+  { key: 'translate', label: '翻译', weight: 0.3 },
   { key: 'render', label: '渲染译文', weight: 0.15 },
 ]
 

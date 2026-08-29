@@ -17,11 +17,18 @@ from app.services.pipeline import TextRegion
 
 
 def build_full_mask(img: np.ndarray, regions: list[TextRegion], pad: int = 2) -> np.ndarray:
-    """整图 0/255 笔画掩膜（LaMa 用），缓存 region.mask；已缓存（如 MIT 检测器预填充）的直接复用"""
+    """整图 0/255 文本掩膜（LaMa/CV 修复用），缓存结果到 region.mask
+
+    默认整块擦除：优先文本多边形填充（poly），无 poly 才用 Otsu 笔画；结果覆盖
+    MIT 检测器预填充的紧致笔画掩膜（后者偏紧会残留）。显式标记 _no_erase 的 region
+    （mit_ignore_bubble 判定为拟声词等非气泡）跳过不擦除。
+    """
     h, w = img.shape[:2]
     mask = np.zeros((h, w), dtype=np.uint8)
     for region in regions:
-        res = region_patch(img, region, pad=pad)
+        if getattr(region, "_no_erase", False):
+            continue
+        res = build_region_mask(img, region, pad=pad)
         if res is None:
             continue
         x0, y0, x1, y1, patch = res
@@ -40,18 +47,17 @@ def region_patch(img: np.ndarray, region: TextRegion, pad: int = 2) -> Optional[
 
 
 def build_region_mask(img: np.ndarray, region: TextRegion, pad: int = 2) -> Optional[tuple[int, int, int, int, np.ndarray]]:
-    """单 region 的笔画掩膜 patch，坐标为 bbox（缩进 pad 像素）
+    """单 region 的掩膜 patch，坐标为 bbox（缩进 pad 像素）
 
     img: RGB np.ndarray (H,W,3)
     返回 (x0,y0,x1,y1,patch 0/255 uint8) 或 None
+
+    策略：有 poly 时整块填充文本多边形并膨胀（文本区域整体擦除，零残留，
+    背景由修复引擎重建）；无 poly 时用 Otsu 笔画候选（保守，仅亮/暗笔画）。
     """
     import cv2
 
     h, w = img.shape[:2]
-    if img.ndim == 3:
-        gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-    else:
-        gray = img
 
     # bbox：优先用 poly（OCR 原始多边形），否则用 box
     pts = region.poly if region.poly else region.box
@@ -70,33 +76,33 @@ def build_region_mask(img: np.ndarray, region: TextRegion, pad: int = 2) -> Opti
     if x1 - x0 < 6 or y1 - y0 < 6:
         return None
 
+    poly_filled = _fill_poly(region, x0, y0, x1, y1)
+    if poly_filled is not None:
+        # 整块擦除：文本多边形内部全部是掩膜 + 膨胀覆盖抗锯齿边缘
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+        cand = cv2.dilate(poly_filled, kernel, iterations=1)
+        return (x0, y0, x1, y1, cand)
+
+    # 无 poly 兜底：Otsu 笔画候选（仅 box），并剔除疑似气泡边框的大连通组件
+    if img.ndim == 3:
+        gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+    else:
+        gray = img
     patch_gray = gray[y0:y1, x0:x1]
-
-    # poly 裁剪：仅在多边形内部寻找笔画（避免 pad 区域内混入边框/画面）
-    poly_mask = _poly_mask(region, x0, y0, x1, y1, pad)
-
     cand = _stroke_candidates(patch_gray)
     if cand is None or not cand.any():
         return None
-
-    if poly_mask is not None:
-        cand = np.where(poly_mask, cand, 0).astype(np.uint8)
-
-    # 仅 box 兜底（无 poly）时剔除疑似气泡边框的大连通组件
-    if poly_mask is None:
-        cand = _drop_border_components(cand)
+    cand = _drop_border_components(cand)
     if not cand.any():
         return None
-
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
     cand = cv2.morphologyEx(cand, cv2.MORPH_CLOSE, kernel, iterations=1)
-    # 膨胀覆盖抗锯齿边缘
     cand = cv2.dilate(cand, kernel, iterations=1)
     return (x0, y0, x1, y1, cand)
 
 
-def _poly_mask(region: TextRegion, x0: int, y0: int, x1: int, y1: int, pad: int) -> Optional[np.ndarray]:
-    """region.poly 相对 bbox 的填充掩膜；无 poly 时返回 None（不裁剪）"""
+def _fill_poly(region: TextRegion, x0: int, y0: int, x1: int, y1: int) -> Optional[np.ndarray]:
+    """region.poly 相对 bbox 的整块填充掩膜；无 poly 或无交集时返回 None"""
     if not region.poly or len(region.poly) < 3:
         return None
     try:
@@ -108,7 +114,9 @@ def _poly_mask(region: TextRegion, x0: int, y0: int, x1: int, y1: int, pad: int)
         )
         mask = np.zeros((y1 - y0, x1 - x0), dtype=np.uint8)
         cv2.fillPoly(mask, [pts.reshape(-1, 1, 2)], 255)
-        return mask.astype(bool)
+        if not mask.any():
+            return None
+        return mask
     except Exception:  # noqa: BLE001
         return None
 
