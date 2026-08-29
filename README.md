@@ -6,7 +6,7 @@
 
 - 上传漫画图片（JPG / PNG / WebP / BMP，≤10MB）
 - 真实 OCR 文字识别，**默认 manga-image-translator 检测/OCR 引擎**（漫画专训模型，复杂漫画/艺术字/竖排/网点底识别更准；GPL-3.0，见 `THIRD_PARTY.md`），PaddleOCR 为可切回退（`MANGA_OCR_BACKEND=paddle`）
-- 检测器可选 DBNet / ComicTextDetector（`MANGA_MIT_DETECTOR=default|ctd`），置信度 ≥0.5 过滤噪声
+- 默认 **ctd 检测器**（ComicTextDetector，复杂页召回强；可切 DBNet `MANGA_MIT_DETECTOR=default`）+ **mit48+manga-ocr 混合识别**（最准），置信度 ≥0.5 过滤噪声
 - 翻译流水线：文本检测 → OCR → 翻译 → 图像修复 → 渲染
 - **按气泡整块翻译**：同气泡对话多行合并成一次翻译请求，译文更地道；渲染时按气泡框大小整体排版（竖排自动分列重排）
 - 可选 **manga-ocr 识别**（`MANGA_OCR_BACKEND=mangaocr`/`mit48+mangaocr`）与**小字放大**（`MANGA_MIT_OCR_UPSCALE`），增强风格化字体/小字召回

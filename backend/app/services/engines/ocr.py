@@ -437,7 +437,11 @@ class MIT48OCREngine(BaseOCR):
 
 
 def create_ocr_engine_router() -> BaseOCR:
-    """按 ocr_backend 配置路由：mit48/mangaocr/mit48+mangaocr 优先，缺失回退 create_ocr_engine()"""
+    """按 ocr_backend 配置路由
+
+    优先尝试配置的后端；mit 系列缺失（如混合缺 manga-ocr）时回退 mit48，
+    最后回退 PaddleOCR/demo。
+    """
     settings = get_settings()
     backend = settings.ocr_backend
     table = {
@@ -445,14 +449,19 @@ def create_ocr_engine_router() -> BaseOCR:
         "mangaocr": MangaOCREngine,
         "mit48+mangaocr": MixedOCREngine,
     }
-    if backend in table:
+    candidates = [backend]
+    if backend in table and backend != "mit48":
+        candidates.append("mit48")
+    for name in candidates:
+        if name not in table:
+            continue
         try:
-            engine = table[backend]()
+            engine = table[name]()
             if engine.available:
                 return engine
-            print(f"[ocr] {backend} 不可用，回退 PaddleOCR: {engine._load_error}")
+            print(f"[ocr] {name} 不可用: {engine._load_error}")
         except Exception as e:  # noqa: BLE001
-            print(f"[ocr] {backend} 加载异常，回退 PaddleOCR: {e}")
+            print(f"[ocr] {name} 加载异常: {e}")
     return create_ocr_engine()
 
 

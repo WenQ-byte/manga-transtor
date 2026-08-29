@@ -246,8 +246,9 @@ def create_detector_engine() -> BaseDetector:
     from app.config import get_settings
 
     settings = get_settings()
+    mit_backends = ("mit48", "mangaocr", "mit48+mangaocr")
     backend = settings.detector_backend or (
-        "manga" if settings.ocr_backend == "mit48" else "cv"
+        "manga" if settings.ocr_backend in mit_backends else "cv"
     )
     if backend == "manga":
         try:

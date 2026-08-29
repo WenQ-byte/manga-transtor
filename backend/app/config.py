@@ -30,13 +30,13 @@ class Settings(BaseSettings):
     default_target_lang: str = "CHS"
     # OCR 支持语言
     ocr_langs: str = "ja,en,ch"
-    # OCR 引擎: mit48（默认，manga-image-translator 48px 自训模型） | paddle（PaddleOCR，回退） | mangaocr | mit48+mangaocr
-    ocr_backend: str = "mit48"
-    # 文本检测引擎: cv（OpenCV 启发式） | paddle（PaddleOCR 自带检测） | manga（MIT DBNet/ctd）
-    # 空字符串 = 自动：OCR 用 mit48 时选 manga，否则 cv
+    # OCR 引擎（默认混合最准）: mit48+mangaocr（默认，48px + manga-ocr 补识别） | mit48 | mangaocr | paddle（回退）
+    ocr_backend: str = "mit48+mangaocr"
+    # 检测引擎: cv（OpenCV 启发式） | paddle（PaddleOCR 自带检测） | manga（MIT DBNet/ctd）
+    # 空字符串 = 自动：OCR 用 mit 系列时选 manga，否则 cv
     detector_backend: str = ""
-    # MIT 检测器类型: default（DBNet+ResNet34） | ctd（ComicTextDetector）
-    mit_detector: str = "default"
+    # MIT 检测器类型（默认 ctd，复杂漫画召回更强）: ctd（ComicTextDetector） | default（DBNet+ResNet34）
+    mit_detector: str = "ctd"
     # MIT 模型权重目录（默认项目 data/models/mit，可指向已下载的 MIT 仓库 models/）
     mit_model_dir: str = ""
     # 额外回退目录（可指向本机 manga-image-translator 的 models/），mit_model_dir 缺失时使用
