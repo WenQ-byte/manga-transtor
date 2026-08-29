@@ -1,4 +1,4 @@
-"""文本检测引擎：基于 OpenCV 的启发式检测（无需模型，轻量可运行）"""
+"""文本检测引擎: CV（OpenCV 启发式）+ Manga（移植自 manga-image-translator 的 DBNet/ctd）"""
 from __future__ import annotations
 
 from pathlib import Path
@@ -8,6 +8,11 @@ from PIL import Image
 
 from app.services.engines.base import BaseDetector
 from app.services.pipeline import TextRegion
+
+try:
+    import cv2
+except ImportError:  # noqa: BLE001
+    cv2 = None
 
 
 class CVDetector(BaseDetector):
@@ -140,3 +145,113 @@ class CVDetector(BaseDetector):
                 box = [[x0, y0], [x1, y0], [x1, y1], [x0, y1]]
                 regions.append(TextRegion(box=box, confidence=0.3))
         return regions
+
+
+class MangaDetector(BaseDetector):
+    """移植自 manga-image-translator 的漫画文本检测器
+
+    支持 default（DBNet+ResNet34）与 ctd（ComicTextDetector）。
+    输出 textline 4 点多边形 + 逐像素文本掩膜（存入 region.mask）。
+    """
+
+    name = "manga"
+
+    def __init__(self):
+        from app.services.engines.mit.config import detector_params
+
+        params = detector_params()
+        self._params = params
+        if params.detector == "ctd":
+            from app.services.engines.mit.ctd import CTDDetector
+
+            self._impl = CTDDetector(device=params.device)
+        else:
+            from app.services.engines.mit.dbnet import DefaultDetector
+
+            self._impl = DefaultDetector(device=params.device)
+
+    @property
+    def available(self) -> bool:
+        return True
+
+    def detect(self, image_path: Path) -> list[TextRegion]:
+        img = np.array(Image.open(image_path).convert("RGB"))
+        p = self._params
+        textlines, raw_mask = self._impl.detect(
+            img,
+            detect_size=p.detect_size,
+            text_threshold=p.text_threshold,
+            box_threshold=p.box_threshold,
+            unclip_ratio=p.unclip_ratio,
+        )
+
+        # 掩膜缩到原图尺寸（MIT 输出常为原图 2 倍）
+        full_mask = np.zeros((img.shape[0], img.shape[1]), dtype=np.uint8)
+        if raw_mask.size:
+            full_mask = np.asarray(
+                cv2.resize(raw_mask, (img.shape[1], img.shape[0]), interpolation=cv2.INTER_LINEAR)
+            ).astype(np.uint8)
+
+        regions: list[TextRegion] = []
+        for quad in textlines:
+            pts = np.asarray(quad.pts).round().astype(int)
+            box = [[int(pts[i][0]), int(pts[i][1])] for i in range(4)]
+            region = TextRegion(
+                box=box,
+                text="",
+                confidence=float(quad.prob),
+                poly=[[float(pts[i][0]), float(pts[i][1])] for i in range(4)],
+                direction=quad.direction,
+            )
+            region._quad = quad
+            region.mask = self._mask_patch(img, full_mask, region)
+            regions.append(region)
+        return regions
+
+    @staticmethod
+    def _mask_patch(image: np.ndarray, full_mask: np.ndarray, region: TextRegion, pad: int = 2):
+        """从神经文本掩膜中裁剪某 region 的 0/255 笔画 patch（兼容 build_full_mask 契约）
+
+        若启用 mit_ignore_bubble，且该区域判定为非气泡（拟声词/图片文字），返回 None 不生成掩膜（原文保留不擦除）。
+        """
+        import cv2
+
+        from app.config import get_settings
+
+        ignore_bubble = get_settings().mit_ignore_bubble
+        x0, y0, x1, y1 = region.bounds
+        h, w = full_mask.shape[:2]
+        x0, y0 = max(0, x0 - pad), max(0, y0 - pad)
+        x1, y1 = min(w, x1 + pad), min(h, y1 + pad)
+        if x1 - x0 < 4 or y1 - y0 < 4:
+            return None
+        patch = full_mask[y0:y1, x0:x1].astype(np.uint8)
+        if not patch.any():
+            return None
+        if ignore_bubble >= 1:
+            from app.services.engines.mit.bubble import is_ignore
+
+            region_img = image[y0:y1, x0:x1]
+            if is_ignore(region_img, ignore_bubble):
+                return None
+        patch = (patch > 127).astype(np.uint8) * 255
+        # 覆盖抗锯齿边缘
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        patch = cv2.dilate(patch, kernel, iterations=1)
+        return {"bbox": (x0, y0, x1, y1), "patch": patch}
+
+
+def create_detector_engine() -> BaseDetector:
+    """按配置选择检测器：manga（需 torch）优先，失败回退 cv"""
+    from app.config import get_settings
+
+    settings = get_settings()
+    backend = settings.detector_backend or (
+        "manga" if settings.ocr_backend == "mit48" else "cv"
+    )
+    if backend == "manga":
+        try:
+            return MangaDetector()
+        except Exception as e:  # noqa: BLE001
+            print(f"[manga] 检测器加载失败，回退 CV: {e}")
+    return CVDetector()

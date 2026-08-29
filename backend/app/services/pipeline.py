@@ -31,6 +31,12 @@ class TextRegion:
     confidence: float = 0.0
     poly: Optional[list[list[float]]] = None  # OCR原始检测多边形点的完整列表（可选）
     mask: Optional[object] = None  # 预计算的笔画掩膜（numpy数组，由 mask.build_full_mask 填写）
+    direction: Optional[str] = None  # 横/竖排: "h" | "v"（MIT 检测器给出）
+    fg_color: Optional[tuple[int, int, int]] = None  # 字符前景色（MIT 48px OCR 预测）
+    bg_color: Optional[tuple[int, int, int]] = None  # 字符背景色（MIT 48px OCR 预测）
+
+    # 内部：MIT 检测器附加的 Quadrilateral、OCR 附加的内部状态
+    _quad: Optional[object] = field(default=None, repr=False, compare=False)
 
     @property
     def bounds(self) -> tuple[int, int, int, int]:
@@ -52,6 +58,7 @@ class TranslationPipeline:
     """翻译流水线编排器，各步骤通过引擎实现，可插拔"""
 
     def __init__(self, *, detector=None, ocr=None, translator=None, inpainter=None, renderer=None):
+        from app.config import get_settings
         from app.services.engines import get_engine
         self.detector = detector or get_engine("detector")
         self.ocr = ocr or get_engine("ocr")
@@ -62,6 +69,13 @@ class TranslationPipeline:
         from app.services.engines.bubble import create_bubble_filter
 
         self.bubble_filter = create_bubble_filter()
+        bf = get_settings().bubble_filter
+        if bf == "off":
+            self._bubble_on = False
+        elif bf == "on":
+            self._bubble_on = True
+        else:  # auto
+            self._bubble_on = getattr(self.detector, "name", "") != "manga"
 
     def _report(self, cb: Optional[ProgressCallback], step_index: int, progress: int) -> None:
         if cb:
@@ -102,7 +116,10 @@ class TranslationPipeline:
         regions = [r for r in regions if r.confidence >= 0.5 and r.text.strip()]
 
         # 1.5 过滤气泡外文字（丢弃涂鸦/噪声），无有效气泡时保留原样
-        regions = self.bubble_filter.filter(image_path, regions)
+        # MIT 检测引擎自带漫画文本先验，且白占比启发式对彩色/深色气泡误删，跳过
+        bf = getattr(self, "_bubble_on", True)
+        if bf:
+            regions = self.bubble_filter.filter(image_path, regions)
         if not regions:
             return PipelineResult(regions=[], duration_ms=int((time.monotonic() - start) * 1000))
 

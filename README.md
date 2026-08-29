@@ -5,16 +5,32 @@
 ## 功能
 
 - 上传漫画图片（JPG / PNG / WebP / BMP，≤10MB）
-- 真实 OCR 文字识别（PaddleOCR，支持日/英/中）
+- 真实 OCR 文字识别（PaddleOCR，支持日/英/中，置信度 ≥0.5 过滤噪声）
+- 可选 **manga-image-translator 检测/OCR 引擎**（`MANGA_OCR_BACKEND=mit48` + `MANGA_MIT_DETECTOR=default|ctd`）：漫画专训模型，复杂漫画（艺术字/竖排/网点底）识别显著更准（GPL-3.0，见 `THIRD_PARTY.md`）
 - 翻译流水线：文本检测 → OCR → 翻译 → 图像修复 → 渲染
-- 保持原气泡位置与尺寸，自动排版中文译文
+- 横排 / 竖排自适应排版：气泡感知渲染（整气泡检测 → 合并 → 字号填满），竖排按列从右到左并整组居中
 - 分步进度条实时反馈（检测/识别/翻译/修复/渲染）
 - 网页预览 + 下载翻译结果
-- 专有名词管理：内置词库 + 图形化录入 + JSON 批量导入
+- 专有名词管理：内置词库 + 图形化录入 + JSON 批量导入（整词匹配）
+- 玻璃拟态前端质感（GlassSurface / SpecularButton / ParticleText 等组件）
 
 ## 快速开始
 
-### 方式一：手动启动
+### 方式一：一键启动（推荐）
+
+安装依赖后，双击 `start.bat`（或运行 `.venv\Scripts\python.exe start.py`），按交互菜单选择启动后端 / 前端 / 前后端：
+
+```bash
+# 安装依赖
+pip install -r backend/requirements.txt          # 核心
+pip install -r backend/requirements-ai.txt       # 真实 OCR（PaddleOCR）
+pip install -r backend/requirements-inpaint.txt  # LaMa 神经修复（可选，效果更好）
+cd frontend && npm install
+```
+
+随后打开 `start.bat` 选择 `[1]` 启动后端，访问 http://localhost:8000；选择 `[3]` 同时启动前后端（Vite 开发模式 http://localhost:5173）。
+
+### 方式二：手动启动
 
 ```bash
 # 1. 后端（基础依赖）
@@ -38,7 +54,9 @@ cd ..
 .venv\Scripts\python -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --app-dir backend
 ```
 
-### 方式二：Docker
+> 注：`--app-dir backend` 必须保留（模块是 `app.main:app`）。
+
+### 方式三：Docker
 
 ```bash
 docker compose up -d --build
@@ -53,11 +71,11 @@ docker compose up -d --build
 | 环境变量 | 说明 | 默认 |
 |----------|------|------|
 | `MANGA_PIPELINE_MODE` | 流水线模式：`real`（真实OCR）/ `demo`（无需模型） | `real` |
-| `MANGA_TRANSLATOR_BACKEND` | 翻译后端：`deepseek` / `google` / `mymemory` / `deepl` / `openai` | `deepseek` |
+| `MANGA_TRANSLATOR_BACKEND` | 翻译后端：`deepseek` / `google` / `deepl` / `openai` / `mymemory` | `deepseek` |
 | `MANGA_DEEPSEEK_API_KEY` | DeepSeek API Key（推荐，漫画口语翻译最自然） | 空 |
 | `MANGA_DEEPSEEK_MODEL` | DeepSeek 模型 | `deepseek-chat` |
 | `MANGA_DEEPSEEK_BASE_URL` | DeepSeek API 地址 | `https://api.deepseek.com` |
-| `MANGA_DEEPL_AUTH_KEY` | DeepL API Key（可选，口语翻译较差） | 空 |
+| `MANGA_DEEPL_AUTH_KEY` | DeepL API Key（可选，支持批量请求） | 空 |
 | `MANGA_OPENAI_API_KEY` | OpenAI 兼容接口 Key（可选） | 空 |
 | `MANGA_INPAINTER_BACKEND` | 修复引擎：`lama`（神经网络）/ `cv`（无模型） | `cv` |
 | `MANGA_LAMA_MODEL_PATH` | LaMa 权重路径（空则自动搜索） | 空 |
@@ -65,40 +83,44 @@ docker compose up -d --build
 | `MANGA_INPAINT_DEVICE` | 修复设备：`cpu` / `cuda` | `cpu` |
 | `MANGA_MAX_UPLOAD_MB` | 单张图片大小上限 | `10` |
 
-> **翻译后端推荐**：DeepSeek（`deepseek-chat`）对漫画口语/语气词理解力最佳，需设置 `MANGA_DEEPSEEK_API_KEY`。免费后端（Google / MyMemory）作为 fallback，质量一般。
+> **翻译后端推荐**：DeepSeek（`deepseek-chat`）对漫画口语/语气词理解力最佳，需设置 `MANGA_DEEPSEEK_API_KEY`。免费后端（Google / MyMemory）作为 fallback，质量一般。Google 需使用 `dict-chrome-ex` 接口避免限流；DeepL 支持批量请求，一次调用翻译全部文本。默认回退链：Google → MyMemory → 仅词典替换。
 >
 > **图像修复**：`cv` 无依赖但效果有限（适合白底气泡）；`lama` 需安装 `torch`（CPU 版约 200MB），效果对齐 manga-image-translator。
 
 ## 架构
 
 ```
-frontend/          # React + Vite + Tailwind 前端（中文 UI）
+frontend/          # React + Vite + Tailwind 前端（中文 UI，玻璃拟态组件）
 backend/
   app/
     api/           # REST API（翻译 / 词典 / 文件）
     services/      # 翻译流水线（可插拔引擎）
       engines/
+        base.py         # 引擎基类与工厂
         detector.py     # 文本检测（OpenCV）
-        ocr.py          # OCR（PaddleOCR 真实识别 / Demo）
-        translator.py   # 翻译（DeepSeek/Google/MyMemory/DeepL/OpenAI）
+        ocr.py          # OCR（PaddleOCR 真实识别 / Demo，竖排旋转检测）
+        translator.py   # 翻译（DeepSeek/Google/MyMemory/DeepL/OpenAI，批量+回退链）
         mask.py         # 精确笔画掩膜（poly + Otsu 自适应阈值）
         inpainter.py    # 图像修复（CV 无模型）
+        bubble.py       # 气泡过滤（气泡外涂鸦丢弃）
         lama.py         # LaMa 神经修复引擎
         lama_model.py   # LaMa 模型结构（FFC 生成网络）
-        renderer.py     # 渲染排版
+        renderer.py     # 渲染排版（气泡感知，横排/竖排自适应）
     storage/       # SQLite + 文件存储
 docs/             # PRD / 竞品分析 / 功能矩阵
 ```
+
+> 引擎通过 `services/engines/factory.py` 的 `get_engine(type)` 统一获取（lru_cache 缓存）。OCR 引擎自带检测（`supports_detection=True`）时跳过独立 detector，直接用 OCR 检测+识别。
 
 ## 翻译流水线
 
 ```
 上传图片
-  → 文本检测   定位气泡文字区域（PaddleOCR 检测）
-  → OCR        识别文字内容，保留完整检测多边形
-  → 翻译       DeepSeek 口语化翻译（自动应用专有名词词典）
-  → 图像修复   精确掩膜 + 神经修复擦除原文字
-  → 渲染       将译文排版回原气泡位置
+  → 文本检测   定位气泡文字区域（PaddleOCR 检测，置信度 ≥0.5 过滤）
+  → OCR        识别文字内容，保留完整检测多边形 + 气泡过滤
+  → 翻译       智能后端（DeepSeek 最自然 / 批量请求 / 自动应用词典整词匹配）
+  → 图像修复   精确掩膜 + 修复擦除原文字（cv / LaMa）
+  → 渲染       气泡感知排版，横排/竖排自适应回原位置
   → 下载结果
 ```
 
@@ -117,9 +139,18 @@ docs/             # PRD / 竞品分析 / 功能矩阵
 
 在线 API 文档：`/docs`
 
+## 测试
+
+```bash
+.venv\Scripts\python.exe backend\tests\test_app.py
+```
+
+stdlib `unittest`（非 pytest）。测试会设 `MANGA_DATA_DIR` 到临时目录；`test_pipeline_runs` 走真实 OCR 路径，已装 AI 依赖时会加载 PaddleOCR 模型、较慢。
+
 ## 说明
 
-- **真实 OCR**：安装 `requirements-ai.txt` 后自动启用 PaddleOCR 真实文字识别（首次运行会自动下载模型）。
+- **真实 OCR**：安装 `requirements-ai.txt` 后自动启用 PaddleOCR 真实文字识别（首次运行会自动下载模型）。检测框置信度 <0.5 或空文本会被过滤。
 - **LaMa 修复**：安装 `requirements-inpaint.txt`（torch）后，设置 `MANGA_INPAINTER_BACKEND=lama` 启用神经修复，效果接近 manga-image-translator。
 - **Demo 模式**：未安装 AI 依赖时，OCR 使用模拟识别，适合快速体验流程。
-- 翻译默认使用 DeepSeek（`deepseek-chat`），免费后端（Google / MyMemory）作为自动 fallback。
+- **翻译**：默认使用 DeepSeek（`deepseek-chat`），免费后端（Google / MyMemory）作为自动 fallback。Google 需用 `dict-chrome-ex` 接口防限流；DeepL 支持批量请求。
+- **竖排渲染**：漫画竖排文字靠把原图旋转 90° 再检测、坐标映射回原图实现；渲染时逐列从右到左、整组居中，列间距与字距自适应防文字重叠。

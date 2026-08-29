@@ -3,6 +3,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
+from PIL import Image
+
 from app.config import get_settings
 from app.services.engines.base import BaseOCR
 from app.services.pipeline import TextRegion
@@ -352,7 +355,7 @@ def create_ocr_engine() -> BaseOCR:
         engine = PaddleOCREngine()
         if engine.available:
             return engine
-    # 默认也尝试真实 OCR（若已安装且可用），否则 demo
+    # 默认也尝试真�?OCR（若已安装且可用），否则 demo
     try:
         engine = PaddleOCREngine()
         if engine.available:
@@ -360,3 +363,88 @@ def create_ocr_engine() -> BaseOCR:
     except Exception:  # noqa: BLE001
         pass
     return DemoOCREngine()
+
+
+class MIT48OCREngine(BaseOCR):
+    """移植自 manga-image-translator 的 48px 自训 OCR（ConvNeXt + RoFormer + beam search）
+
+    不自带检测（supports_detection=False），由 detector 提供 textline 四边形。
+    """
+
+    name = "mit48"
+
+    supports_detection = False
+
+    def __init__(self):
+        self.settings = get_settings()
+        self._impl = None
+        self._load_error = ""
+        self._load()
+
+    @property
+    def available(self) -> bool:
+        return self._impl is not None
+
+    def _load(self):
+        try:
+            from app.services.engines.mit.config import ocr_params, resolve_device
+            from app.services.engines.mit.ocr_48px import Mit48Ocr
+
+            p = ocr_params()
+            self._impl = Mit48Ocr(device=resolve_device(self.settings.mit_device))
+            self._prob = p.prob
+        except Exception as e:  # noqa: BLE001
+            self._load_error = f"mit48 OCR 加载失败: {e}"
+            self._impl = None
+
+    def recognize(
+        self,
+        image_path: Path,
+        regions: list[TextRegion],
+        source_lang: str = "ja",
+    ) -> None:
+        if self._impl is None:
+            for r in regions:
+                r.text = ""
+                r.confidence = 0.0
+            return
+        try:
+            from app.services.engines.mit.quadrilateral import Quadrilateral
+
+            img = np.array(Image.open(image_path).convert("RGB"))
+            quads = []
+            for r in regions:
+                q = r._quad
+                if q is None:
+                    q = Quadrilateral(np.asarray(r.box, dtype=float).reshape(4, 2), r.text, r.confidence)
+                    r._quad = q
+                quads.append(q)
+            self._impl.recognize(img, quads, prob_threshold=getattr(self, "_prob", 0.2))
+            for r, q in zip(regions, quads):
+                pts = np.asarray(q.pts).round().astype(int)
+                r.box = [[int(pts[i][0]), int(pts[i][1])] for i in range(4)]
+                r.poly = [[float(pts[i][0]), float(pts[i][1])] for i in range(4)]
+                r.direction = q.direction
+                r.text = q.text or ""
+                r.confidence = float(q.prob)
+                if q.text:
+                    r.fg_color = (int(q.fg_r), int(q.fg_g), int(q.fg_b))
+                    r.bg_color = (int(q.bg_r), int(q.bg_g), int(q.bg_b))
+        except Exception as e:  # noqa: BLE001
+            print(f"[mit48] OCR 推理失败: {e}")
+            for r in regions:
+                r.confidence = 0.0
+
+
+def create_ocr_engine_router() -> BaseOCR:
+    """按 ocr_backend 配置路由：mit48 优先，缺失回退 create_ocr_engine()"""
+    settings = get_settings()
+    if settings.ocr_backend == "mit48":
+        try:
+            engine = MIT48OCREngine()
+            if engine.available:
+                return engine
+            print(f"[ocr] mit48 不可用，回退 PaddleOCR: {engine._load_error}")
+        except Exception as e:  # noqa: BLE001
+            print(f"[ocr] mit48 加载异常，回退 PaddleOCR: {e}")
+    return create_ocr_engine()

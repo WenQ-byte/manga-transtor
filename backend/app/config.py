@@ -30,6 +30,29 @@ class Settings(BaseSettings):
     default_target_lang: str = "CHS"
     # OCR 支持语言
     ocr_langs: str = "ja,en,ch"
+    # OCR 引擎: paddle | mit48（移植自 manga-image-translator 的 48px 自训模型）
+    ocr_backend: str = "paddle"
+    # 文本检测引擎: cv（OpenCV 启发式） | paddle（PaddleOCR 自带检测） | manga（MIT DBNet/ctd）
+    # 空字符串 = 自动：OCR 用 mit48 时选 manga，否则 cv
+    detector_backend: str = ""
+    # MIT 检测器类型: default（DBNet+ResNet34） | ctd（ComicTextDetector）
+    mit_detector: str = "default"
+    # MIT 模型权重目录（默认项目 data/models/mit，可指向已下载的 MIT 仓库 models/）
+    mit_model_dir: str = ""
+    # 额外回退目录（可指向本机 manga-image-translator 的 models/），mit_model_dir 缺失时使用
+    mit_fallback_dir: str = ""
+    # MIT 推理设备: cpu | cuda | mps | auto（auto 会自动探测，缺 torch 时回退）
+    mit_device: str = "auto"
+    # MIT 检测/识别参数
+    mit_detect_size: int = 1280
+    mit_text_threshold: float = 0.7
+    mit_box_threshold: float = 0.7
+    mit_unclip_ratio: float = 2.2
+    mit_ocr_prob: float = 0.2
+    # 气泡过滤: auto（MIT 检测时关闭白占比启发式） | on | off
+    bubble_filter: str = "auto"
+    # MIT 掩膜级气泡去噪（1-50，数值越小越激进；0=关闭）
+    mit_ignore_bubble: int = 0
 
     # 翻译API（可选）
     translator_backend: str = "google"  # google | deepseek | deepl | openai
@@ -61,6 +84,7 @@ class Settings(BaseSettings):
         base = Path(self.data_dir)
         self.upload_dir = self.upload_dir or str(base / "uploads")
         self.result_dir = self.result_dir or str(base / "results")
+        self.mit_model_dir = self.mit_model_dir or str(base / "models" / "mit")
 
     @property
     def upload_path(self) -> Path:

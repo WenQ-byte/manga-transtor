@@ -1,0 +1,9 @@
+# MIT 检测/OCR 依赖（可选，移植自 manga-image-translator，GPL-3.0）
+# 安装：pip install -r requirements-mit.txt
+# 需先装 requirements-inpaint.txt（提供 torch）才有意义
+torchvision
+einops
+py3langid
+pyclipper
+shapely
+networkx

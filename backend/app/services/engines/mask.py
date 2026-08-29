@@ -17,11 +17,11 @@ from app.services.pipeline import TextRegion
 
 
 def build_full_mask(img: np.ndarray, regions: list[TextRegion], pad: int = 2) -> np.ndarray:
-    """整图 0/255 笔画掩膜（LaMa 用），缓存 region.mask"""
+    """整图 0/255 笔画掩膜（LaMa 用），缓存 region.mask；已缓存（如 MIT 检测器预填充）的直接复用"""
     h, w = img.shape[:2]
     mask = np.zeros((h, w), dtype=np.uint8)
     for region in regions:
-        res = build_region_mask(img, region, pad=pad)
+        res = region_patch(img, region, pad=pad)
         if res is None:
             continue
         x0, y0, x1, y1, patch = res

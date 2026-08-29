@@ -12,14 +12,14 @@ def get_engine(engine_type: str):
     settings = get_settings()
 
     if engine_type == "detector":
-        from app.services.engines.detector import CVDetector
+        from app.services.engines.detector import create_detector_engine
 
-        return CVDetector()
+        return create_detector_engine()
 
     if engine_type == "ocr":
-        from app.services.engines.ocr import create_ocr_engine
+        from app.services.engines.ocr import create_ocr_engine_router
 
-        return create_ocr_engine()
+        return create_ocr_engine_router()
 
     if engine_type == "translator":
         from app.services.engines.translator import create_translator

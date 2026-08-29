@@ -11,8 +11,13 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from PIL import Image, ImageDraw, ImageFont
 
+import numpy as np
+
 from app.services.glossary_service import GlossaryService
 from app.services.pipeline import create_pipeline
+
+
+_MIT_MODEL_DIR = Path(__file__).resolve().parent.parent / "data" / "models" / "mit"
 
 
 def make_test_image(path: Path, text: str = "Hello World") -> Path:
@@ -60,6 +65,54 @@ class TestPipeline(unittest.TestCase):
         img = Image.open(self.image)
         parsed = Image.open(io.BytesIO(out))
         self.assertEqual(parsed.size, img.size)
+
+
+class TestMitEngines(unittest.TestCase):
+    """MIT 引擎冒烟测试：权重缺失时跳过（默认 backend/data/models/mit）"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model_dir = _MIT_MODEL_DIR
+        if cls.model_dir.exists():
+            os.environ["MANGA_MIT_MODEL_DIR"] = str(cls.model_dir)
+
+    def _default_ready(self):
+        from app.services.engines.mit import paths
+
+        return paths.model_ready("detection/detect-20241225.ckpt")
+
+    @unittest.skipUnless(
+        (_MIT_MODEL_DIR / "detection" / "detect-20241225.ckpt").exists(),
+        "detect-20241225.ckpt 缺失，跳过",
+    )
+    def test_default_detector_loads_and_detects(self):
+        from app.services.engines.mit.dbnet import DefaultDetector
+
+        det = DefaultDetector(device="cpu")
+        img = np.array(Image.open(self.image).convert("RGB"))
+        textlines, raw_mask = det.detect(img, detect_size=768)
+        self.assertIsInstance(textlines, list)
+        self.assertEqual(raw_mask.ndim, 2)
+        self.assertLessEqual(raw_mask.max(), 255)
+
+    @unittest.skipUnless(
+        (_MIT_MODEL_DIR / "ocr" / "ocr_ar_48px.ckpt").exists(),
+        "ocr_ar_48px.ckpt 缺失，跳过",
+    )
+    def test_mit48_ocr(self):
+        from app.services.engines.mit.ocr_48px import Mit48Ocr
+        from app.services.engines.mit.quadrilateral import Quadrilateral
+
+        ocr = Mit48Ocr(device="cpu")
+        img = np.zeros((300, 300, 3), dtype=np.uint8)
+        img[:] = (255, 255, 255)
+        quads = [Quadrilateral(np.array([[50, 50], [150, 50], [150, 66], [50, 66]]), "", 0.9)]
+        ocr.recognize(img, quads, prob_threshold=0.2)
+        self.assertIsInstance(quads[0].text, str)
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.image = make_test_image(Path(self.tmp) / "test.png")
 
 
 class TestGlossary(unittest.TestCase):
