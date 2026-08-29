@@ -27,7 +27,7 @@
 
 ## 配置
 
-- pydantic-settings，环境变量前缀 `MANGA_`，读 `.env`（见 `backend/app/config.py`）。如 `MANGA_PIPELINE_MODE`（real/demo）、`MANGA_TRANSLATOR_BACKEND`（deepseek/google/deepl/openai/mymemory）、`MANGA_MAX_UPLOAD_MB`、`MANGA_INPAINTER_BACKEND`（cv/lama）、`MANGA_OCR_BACKEND`（paddle/mit48）、`MANGA_DETECTOR_BACKEND`（空/cv/manga）、`MANGA_MIT_DETECTOR`（default/ctd）、`MANGA_MIT_MODEL_DIR`/`MANGA_MIT_FALLBACK_DIR`、`MANGA_MIT_DEVICE`（cpu/cuda/mps/auto）、`MANGA_BUBBLE_FILTER`（auto/on/off）。
+- pydantic-settings，环境变量前缀 `MANGA_`，读 `.env`（见 `backend/app/config.py`）。如 `MANGA_PIPELINE_MODE`（real/demo）、`MANGA_TRANSLATOR_BACKEND`（deepseek/google/deepl/openai/mymemory）、`MANGA_MAX_UPLOAD_MB`、`MANGA_INPAINTER_BACKEND`（cv/lama）、`MANGA_OCR_BACKEND`（mit48/paddle）、`MANGA_DETECTOR_BACKEND`（空/cv/manga）、`MANGA_MIT_DETECTOR`（default/ctd）、`MANGA_MIT_MODEL_DIR`/`MANGA_MIT_FALLBACK_DIR`、`MANGA_MIT_DEVICE`（cpu/cuda/mps/auto）、`MANGA_BUBBLE_FILTER`（auto/on/off）。
 - `.env` 已 gitignore；`.env.example` 展示全部可配项。DeepL 免费版 auth key 以 `:fx` 结尾。
 
 ## 架构要点（非文件名能看出的）
@@ -35,11 +35,12 @@
 - 应用代码在 `backend/app`（不是 `backend`），运行/测试都要保证 `backend` 在 `sys.path`。
 - 流水线编排在 `services/pipeline.py`，顺序 detect → ocr → translate → inpaint → render。引擎可插拔，统一通过 `services/engines/factory.py` 的 `get_engine(type)` 获取（lru_cache 缓存）。
 - OCR 引擎自带检测（`supports_detection=True`，如 PaddleOCR）时，`pipeline.py` 跳过独立 detector，直接用 OCR 检测+识别。
+- **默认组合**：`MANGA_OCR_BACKEND=mit48`（默认）→ `supports_detection=False`，走 `detector=MangaDetector → MIT48OCR` 流程；显式设 `MANGA_OCR_BACKEND=paddle` 才回到 PaddleOCR 一体化检测+识别。
 - OCR 结果按 `confidence >= 0.5` 且非空文本过滤噪声（`pipeline.py` 中 `regions = [r for r in regions if r.confidence >= 0.5 and r.text.strip()]`）。
 
 ## MIT 引擎（移植自 manga-image-translator，GPL-3.0）
 
-代码在 `backend/app/services/engines/mit/`（裁剪为仅推理），引擎包装在 `engines/detector.py:MangaDetector` 与 `engines/ocr.py:MIT48OCREngine`。**建议 2112+ 显存或纯 CPU**；模型权重在 `backend/data/models/mit/`（gitignore，不提交），可用 `MANGA_MIT_MODEL_DIR` 指向已下载的 MIT 仓库 `models/`。
+代码在 `backend/app/services/engines/mit/`（裁剪为仅推理），引擎包装在 `engines/detector.py:MangaDetector` 与 `engines/ocr.py:MIT48OCREngine`。**MIT 是默认检测/OCR**（`MANGA_OCR_BACKEND` 默认 `mit48` → detector 自动 `manga`；MIT 加载失败或权重缺失时引擎工厂回退 PaddleOCR/CV）。**建议 2112+ 显存或纯 CPU**；模型权重在 `backend/data/models/mit/`（gitignore，不提交），可用 `MANGA_MIT_MODEL_DIR` 指向已下载的 MIT 仓库 `models/`。
 
 - **检测**：`mit_detector=default` 用自实现 ResNet34 + DBNet（`mit/resnet34.py` 替代 torchvision 的 resnet34，避免版本匹配问题，权重名一致）；`ctd` 用 `mit/ctd.py` + `ctd_utils/`（YOLOv5-s backbone + UNet 文本掩膜头 + DBNet 行头；GPU 用 `.pt`，CPU 用 `.pt.onnx` + cv2.dnn；YOLO 块/语言检测输出已弃用，照搬 MIT 行为只消费 mask+lines）。
 - **识别**：`mit/ocr_48px.py`（ConvNeXt 骨干 + RoFormer/XPOS + beam search，`infer_beam_batch_tensor`），`mit/xpos.py`。逐字符预测前景/背景色，回填 `TextRegion.fg_color/bg_color`。

@@ -5,8 +5,8 @@
 ## 功能
 
 - 上传漫画图片（JPG / PNG / WebP / BMP，≤10MB）
-- 真实 OCR 文字识别（PaddleOCR，支持日/英/中，置信度 ≥0.5 过滤噪声）
-- 可选 **manga-image-translator 检测/OCR 引擎**（`MANGA_OCR_BACKEND=mit48` + `MANGA_MIT_DETECTOR=default|ctd`）：漫画专训模型，复杂漫画（艺术字/竖排/网点底）识别显著更准（GPL-3.0，见 `THIRD_PARTY.md`）
+- 真实 OCR 文字识别，**默认 manga-image-translator 检测/OCR 引擎**（漫画专训模型，复杂漫画/艺术字/竖排/网点底识别更准；GPL-3.0，见 `THIRD_PARTY.md`），PaddleOCR 为可切回退（`MANGA_OCR_BACKEND=paddle`）
+- 检测器可选 DBNet / ComicTextDetector（`MANGA_MIT_DETECTOR=default|ctd`），置信度 ≥0.5 过滤噪声
 - 翻译流水线：文本检测 → OCR → 翻译 → 图像修复 → 渲染
 - 横排 / 竖排自适应排版：气泡感知渲染（整气泡检测 → 合并 → 字号填满），竖排按列从右到左并整组居中
 - 分步进度条实时反馈（检测/识别/翻译/修复/渲染）

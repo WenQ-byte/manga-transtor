@@ -30,8 +30,8 @@ class Settings(BaseSettings):
     default_target_lang: str = "CHS"
     # OCR 支持语言
     ocr_langs: str = "ja,en,ch"
-    # OCR 引擎: paddle | mit48（移植自 manga-image-translator 的 48px 自训模型）
-    ocr_backend: str = "paddle"
+    # OCR 引擎: mit48（默认，manga-image-translator 48px 自训模型） | paddle（PaddleOCR，回退）
+    ocr_backend: str = "mit48"
     # 文本检测引擎: cv（OpenCV 启发式） | paddle（PaddleOCR 自带检测） | manga（MIT DBNet/ctd）
     # 空字符串 = 自动：OCR 用 mit48 时选 manga，否则 cv
     detector_backend: str = ""

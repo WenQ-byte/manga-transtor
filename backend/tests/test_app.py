@@ -7,6 +7,9 @@ from pathlib import Path
 
 # 测试环境
 os.environ["MANGA_DATA_DIR"] = tempfile.mkdtemp(prefix="manga_test_")
+# 通用流水线测试固定用 PaddleOCR + CV 检测，避免依赖本地 MIT 权重或触发网络下载
+os.environ["MANGA_OCR_BACKEND"] = "paddle"
+os.environ["MANGA_DETECTOR_BACKEND"] = "cv"
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from PIL import Image, ImageDraw, ImageFont
