@@ -45,7 +45,8 @@
 - **检测**：`mit_detector=default` 用自实现 ResNet34 + DBNet（`mit/resnet34.py` 替代 torchvision 的 resnet34，避免版本匹配问题，权重名一致）；`ctd`（默认）用 `mit/ctd.py` + `ctd_utils/`（YOLOv5-s backbone + UNet 文本掩膜头 + DBNet 行头；GPU 用 `.pt`，CPU 用 `.pt.onnx` + cv2.dnn；YOLO 块/语言检测输出已弃用，照搬 MIT 行为只消费 mask+lines）。
 - **识别**：`mit/ocr_48px.py`（ConvNeXt 骨干 + RoFormer/XPOS + beam search，`infer_beam_batch_tensor`），`mit/xpos.py`。逐字符预测前景/背景色，回填 `TextRegion.fg_color/bg_color`。可选 `mangaocr`/`mit48+mangaocr`（`mit/mocr.py`，HF `kha-white/manga-ocr-base`，风格化字体更强但无置信度，混合模式按 `MANGA_MIT_OCR_MIX_THRESHOLD` 兜底）。小字（字号 < `MANGA_MIT_OCR_UPSCALE`）先 2x 放大再识别（`Mit48Ocr._region_image`）。
 - **翻译分组**：pipeline 翻译前用 `bubble.py:group_regions_by_bubble` 按气泡泛洪分组，整块 `\n` 拼接一次翻译（更地道），整块译文存 `region.group_translated` 并尽力按行拆回 `region.translated`。
-- **方向**：`Quadrilateral.direction`（横/竖）由 `sort_pnts` 判定，回填 `TextRegion.direction`；渲染仍按气泡宽高比决定横竖排（renderer 未消费 direction，留作后续）。
+- **方向**：`Quadrilateral.direction`（横/竖）由 `sort_pnts` 判定，回填 `TextRegion.direction`；渲染竖排判定以气泡形状为主（`bh > bw*MANGA_RENDER_VERTICAL_MIN_RATIO` 且方向 v 占多，或高远超宽），方向仅作联席依据，避免矮气泡被误判强制竖排。
+- **排版**：文本绘制到透明 overlay，按气泡泛洪掩膜裁剪合成（`bubble.bubble_with_mask`）——文字绝不越出气泡框；横排单行优先 + 孤字规避（`_select_horizontal_font`），竖排整块按气泡分列、列组对称居中顶部对齐（`_render_vertical_bubble_block`）。内边距 `MANGA_RENDER_PADDING`。
 - **掩膜**：检测阶段直接把 raw_mask 裁剪成 0/255 patch 存入 `region.mask`（`{bbox, patch}`），`mask.py:build_full_mask` 已改为**缓存优先**（否则会覆盖 MIT 预填充）。`MANGA_MIT_IGNORE_BUBBLE`（1-50）开启时，非气泡区域（拟声词等）不生成掩膜、原文保留。
 - **管线配合**：MIT 检测器的每个 textline 即一个 region（不停靠 textline_merge，因为 renderer 按 region 分组渲染多行/多列气泡）；`MANGA_BUBBLE_FILTER` 默认 auto，MIT 模式自动关闭白占比气泡过滤（对彩色/深色气泡误删）。翻译按气泡整块进行（见上），渲染优先用 `group_translated` 整块排版（横排二分字号填满、竖排整块分列重排）。
 

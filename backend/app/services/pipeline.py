@@ -133,6 +133,10 @@ class TranslationPipeline:
         # 1.4 过滤低置信度识别与空文本（噪声）
         regions = [r for r in regions if r.confidence >= 0.5 and r.text.strip()]
 
+        from app.services.engines.bubble import merge_punctuation_regions
+
+        regions = merge_punctuation_regions(regions)
+
         # 1.5 过滤气泡外文字（丢弃涂鸦/噪声），无有效气泡时保留原样
         # MIT 检测引擎自带漫画文本先验，且白占比启发式对彩色/深色气泡误删，跳过
         bf = getattr(self, "_bubble_on", True)

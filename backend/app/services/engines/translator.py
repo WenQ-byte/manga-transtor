@@ -29,6 +29,7 @@ LANG_MAP = {
 
 # 文本中常见的拟声词/符号，保留不翻译
 KEEP_PATTERN = re.compile(r"^[\s~！!？?…☆★♪♫◎○●▲△□■]+$")
+_CJK_RE = re.compile(r"[\u3040-\u30ff\u3400-\u9fff]")
 
 
 class BaseRemoteTranslator(BaseTranslator):
@@ -205,21 +206,29 @@ class DeepSeekTranslator(BaseRemoteTranslator):
     """
 
     name = "deepseek"
+    prompt_glossary = True
 
     def __init__(self):
         self.settings = get_settings()
 
-    def _system_prompt(self, source: LangCode, target: LangCode) -> str:
+    def _system_prompt(self, source: LangCode, target: LangCode, glossary=None) -> str:
         lang_names = {"ja": "日语", "en": "英语", "zh": "中文"}
-        return (
+        prompt = (
             f"你是专业的漫画翻译。将以下{lang_names.get(source, source)}文本翻译成{lang_names.get(target, target)}。"
             "要求：1) 自然流畅，符合漫画对话口吻（口语化、接地气）；"
             "2) 保留人名、专有名词的统一译法；"
             "3) 语气词、感叹词用中文常用表达（如「嗯」「诶」「诶嘿」）；"
-            "4) 只输出译文本身，不要任何解释或引号。"
+            "4) 原文有几行，译文也要几行，用换行对齐；"
+            "5) 不要添加原文没有的内容，看不懂就按字面直译，禁止脑补；"
+            "6) 只输出译文本身，不要任何解释或引号。"
         )
+        if glossary:
+            mapping = "、".join(f"{k}→{v}" for k, v in glossary.items() if k and v)
+            if mapping:
+                prompt += f"人名对照：{mapping}"
+        return prompt
 
-    def translate_one(self, text: str, source: LangCode, target: LangCode) -> str:
+    def translate_one(self, text: str, source: LangCode, target: LangCode, glossary=None) -> str:
         if not text.strip() or KEEP_PATTERN.match(text):
             return text
         base = self.settings.deepseek_base_url or "https://api.deepseek.com"
@@ -231,7 +240,7 @@ class DeepSeekTranslator(BaseRemoteTranslator):
                 json={
                     "model": model,
                     "messages": [
-                        {"role": "system", "content": self._system_prompt(source, target)},
+                        {"role": "system", "content": self._system_prompt(source, target, glossary=glossary)},
                         {"role": "user", "content": text},
                     ],
                     "temperature": 0.3,
@@ -248,19 +257,27 @@ class OpenAITranslator(BaseRemoteTranslator):
     """OpenAI 兼容接口翻译（需要 MANGA_OPENAI_API_KEY）"""
 
     name = "openai"
+    prompt_glossary = True
 
     def __init__(self):
         self.settings = get_settings()
 
-    def _system_prompt(self, source: LangCode, target: LangCode) -> str:
+    def _system_prompt(self, source: LangCode, target: LangCode, glossary=None) -> str:
         lang_names = {"ja": "日语", "en": "英语", "zh": "中文"}
-        return (
+        prompt = (
             f"你是专业的漫画翻译。将以下{lang_names.get(source, source)}文本翻译成{lang_names.get(target, target)}。"
             "要求：1) 自然流畅，符合漫画对话口吻；2) 保留人名、专有名词的统一译法；"
-            "3) 只输出译文本身，不要任何解释或引号。"
+            "3) 原文有几行，译文也要几行，用换行对齐；"
+            "4) 不要添加原文没有的内容，看不懂就按字面直译，禁止脑补；"
+            "5) 只输出译文本身，不要任何解释或引号。"
         )
+        if glossary:
+            mapping = "、".join(f"{k}→{v}" for k, v in glossary.items() if k and v)
+            if mapping:
+                prompt += f"人名对照：{mapping}"
+        return prompt
 
-    def translate_one(self, text: str, source: LangCode, target: LangCode) -> str:
+    def translate_one(self, text: str, source: LangCode, target: LangCode, glossary=None) -> str:
         if not text.strip() or KEEP_PATTERN.match(text):
             return text
         try:
@@ -270,7 +287,7 @@ class OpenAITranslator(BaseRemoteTranslator):
                 json={
                     "model": self.settings.openai_model,
                     "messages": [
-                        {"role": "system", "content": self._system_prompt(source, target)},
+                        {"role": "system", "content": self._system_prompt(source, target, glossary=glossary)},
                         {"role": "user", "content": text},
                     ],
                     "temperature": 0.3,
@@ -323,11 +340,14 @@ class SmartTranslator(BaseTranslator):
 
     @staticmethod
     def _apply_glossary(text: str, glossary) -> str:
-        """应用词典：整词匹配替换，避免误替换词的一部分"""
+        """应用词典：CJK 最长匹配；拉丁词仍用整词边界"""
         if not glossary:
             return text
-        for k, v in glossary.items():
-            if k:
+        items = sorted(((k, v) for k, v in glossary.items() if k), key=lambda kv: len(kv[0]), reverse=True)
+        for k, v in items:
+            if _CJK_RE.search(k):
+                text = text.replace(k, v)
+            else:
                 text = re.sub(r"(?<!\w)" + re.escape(k) + r"(?!\w)", v, text)
         return text
 
@@ -340,7 +360,8 @@ class SmartTranslator(BaseTranslator):
             # 全部失败：仅应用词典
             return self._apply_glossary_only(texts, glossary)
 
-        srcs = [self._apply_glossary(t, glossary) for t in texts]
+        use_prompt = getattr(backend, "prompt_glossary", False)
+        srcs = list(texts) if use_prompt else [self._apply_glossary(t, glossary) for t in texts]
 
         # 支持批量 API 的后端（DeepL）一次性发送，减少请求数
         if getattr(backend, "batch", False):
@@ -353,19 +374,25 @@ class SmartTranslator(BaseTranslator):
         out = []
         total = len(srcs)
         for i, src in enumerate(srcs):
-            result = self._translate_with_fallback(src, source_lang, target_lang, backend)
+            result = self._translate_with_fallback(
+                src, source_lang, target_lang, backend, glossary=glossary if use_prompt else None
+            )
             out.append(result)
             if progress_cb and total:
                 progress_cb((i + 1) / total)
         return out
 
-    def _translate_with_fallback(self, text: str, source, target, primary) -> str:
+    def _translate_with_fallback(self, text: str, source, target, primary, glossary=None) -> str:
         ordered = [primary] + [b for b in self._backends if b is not primary]
         for backend in ordered:
             if not text.strip():
                 return text
             try:
-                result = backend.translate_one(text, source, target)
+                if getattr(backend, "prompt_glossary", False):
+                    result = backend.translate_one(text, source, target, glossary=glossary)
+                else:
+                    src = self._apply_glossary(text, glossary) if glossary else text
+                    result = backend.translate_one(src, source, target)
                 if result:
                     return result
             except Exception:

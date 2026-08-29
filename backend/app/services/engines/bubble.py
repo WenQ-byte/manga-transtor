@@ -74,13 +74,22 @@ def create_bubble_filter() -> BubbleFilter:
 
 def detect_bubble(bgr, bounds, img_w, img_h, flood_tol=FLOOD_TOL, grow_ratio=BUBBLE_GROW_RATIO):
     """通过泛洪填充找到文本框所属气泡的真实边界（与 renderer 同算法）"""
+    bb, _ = bubble_with_mask(bgr, bounds, img_w, img_h, flood_tol=flood_tol, grow_ratio=grow_ratio)
+    return bb
+
+
+def bubble_with_mask(bgr, bounds, img_w, img_h, flood_tol=FLOOD_TOL, grow_ratio=BUBBLE_GROW_RATIO):
+    """泛洪推气泡：返回 (bbox, mask)
+
+    mask 为气泡形状的整图 0/255 uint8（可作绘制裁剪）；漏尾/无边框时退回矩形框并返回 mask=None。
+    """
     x0, y0, x1, y1 = [int(v) for v in bounds]
     x0 = max(0, min(x0, img_w - 1))
     x1 = max(0, min(x1, img_w - 1))
     y0 = max(0, min(y0, img_h - 1))
     y1 = max(0, min(y1, img_h - 1))
     if x1 <= x0 or y1 <= y0:
-        return (x0, y0, x1, y1)
+        return _fallback_box(x0, y0, x1, y1, img_w, img_h), None
 
     max_bw = max((x1 - x0) * grow_ratio, img_w * 0.85)
     max_bh = max((y1 - y0) * grow_ratio, img_h * 0.85)
@@ -88,14 +97,9 @@ def detect_bubble(bgr, bounds, img_w, img_h, flood_tol=FLOOD_TOL, grow_ratio=BUB
     if cv2 is not None:
         h, w = bgr.shape[:2]
         flags = 8 | cv2.FLOODFILL_MASK_ONLY | (255 << 8)
-        seeds = [
-            ((x0 + x1) // 2, (y0 + y1) // 2),
-            (x0 + 2, y0 + 2),
-            (x1 - 2, y0 + 2),
-            (x0 + 2, y1 - 2),
-            (x1 - 2, y1 - 2),
-        ]
+        seeds = _bright_seeds(bgr, x0, y0, x1, y1, w, h)
         best = None
+        best_mask = None
         best_area = -1
         for seed in seeds:
             sx, sy = seed
@@ -120,12 +124,13 @@ def detect_bubble(bgr, bounds, img_w, img_h, flood_tol=FLOOD_TOL, grow_ratio=BUB
             if area > best_area:
                 best_area = area
                 best = (bx0, by0, bx1, by1)
+                best_mask = filled.astype(np.uint8) * 255
         if best is not None:
             if (best[2] - best[0]) * (best[3] - best[1]) < (x1 - x0) * (y1 - y0) * 0.5:
-                return _fallback_box(x0, y0, x1, y1, img_w, img_h)
-            return best
+                return _fallback_box(x0, y0, x1, y1, img_w, img_h), None
+            return best, best_mask
 
-    return _fallback_box(x0, y0, x1, y1, img_w, img_h)
+    return _fallback_box(x0, y0, x1, y1, img_w, img_h), None
 
 
 def _fallback_box(x0, y0, x1, y1, img_w, img_h, pad_xr=0.35, pad_yr=0.35):
@@ -176,6 +181,8 @@ def group_regions_by_bubble(bgr, regions: list[TextRegion], img_w, img_h, overla
         else:
             groups.append({"bbox": bb, "regions": [region]})
 
+    groups = _merge_overlap_groups(groups, overlap)
+
     out = []
     for g in groups:
         regions = g["regions"]
@@ -197,3 +204,114 @@ def group_regions_by_bubble(bgr, regions: list[TextRegion], img_w, img_h, overla
             r.group_bounds = bbox
         out.append({"bbox": bbox, "regions": regions_sorted})
     return out
+
+
+_PUNCT = set("。、，,！!？?…〜~ー―─-「」『』（）()♪☆★・･ ")
+
+
+def merge_punctuation_regions(regions: list[TextRegion]) -> list[TextRegion]:
+    """把 1～2 字纯标点行并入最近邻文本行"""
+    if len(regions) < 2:
+        return regions
+
+    def is_frag(r: TextRegion) -> bool:
+        t = (r.text or "").strip()
+        return bool(t) and len(t) <= 2 and all(c in _PUNCT for c in t)
+
+    def center(r: TextRegion):
+        a, b, c, d = r.bounds
+        return ((a + c) / 2, (b + d) / 2)
+
+    frags = [r for r in regions if is_frag(r)]
+    mains = [r for r in regions if not is_frag(r)]
+    if not frags or not mains:
+        return regions
+
+    dropped = set()
+    for frag in frags:
+        fx, fy = center(frag)
+        best, best_d = None, 1e18
+        for m in mains:
+            mx, my = center(m)
+            dist = (fx - mx) ** 2 + (fy - my) ** 2
+            if dist < best_d:
+                best_d, best = dist, m
+        if best is None:
+            continue
+        ft = (frag.text or "").strip()
+        vertical = (best.direction or frag.direction) == "v"
+        bx, by = center(best)
+        if (fy >= by) if vertical else (fx >= bx):
+            best.text = (best.text or "") + ft
+        else:
+            best.text = ft + (best.text or "")
+        x0, y0, x1, y1 = best.bounds
+        fx0, fy0, fx1, fy1 = frag.bounds
+        nx0, ny0 = min(x0, fx0), min(y0, fy0)
+        nx1, ny1 = max(x1, fx1), max(y1, fy1)
+        best.box = [[nx0, ny0], [nx1, ny0], [nx1, ny1], [nx0, ny1]]
+        if best.poly or frag.poly:
+            best.poly = list(best.poly or best.box) + list(frag.poly or frag.box)
+        dropped.add(id(frag))
+    return [r for r in regions if id(r) not in dropped]
+
+
+def _bright_seeds(bgr, x0, y0, x1, y1, w, h):
+    """文本框附近的亮像素（气泡底）作泛洪种子，避开黑字中心"""
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY) if bgr.ndim == 3 else bgr
+    raw = [
+        ((x0 + x1) // 2, (y0 + y1) // 2),
+        (x0 + 2, y0 + 2),
+        (x1 - 2, y0 + 2),
+        (x0 + 2, y1 - 2),
+        (x1 - 2, y1 - 2),
+    ]
+    seeds = []
+    seen = set()
+    for sx, sy in raw:
+        px, py = _nearest_bright(gray, sx, sy, w, h)
+        key = (px, py)
+        if key not in seen:
+            seen.add(key)
+            seeds.append((px, py))
+    return seeds
+
+
+def _nearest_bright(gray, sx, sy, w, h, radius=12, thresh=200):
+    sx = int(np.clip(sx, 0, w - 1))
+    sy = int(np.clip(sy, 0, h - 1))
+    if int(gray[sy, sx]) > thresh:
+        return sx, sy
+    y0, y1 = max(0, sy - radius), min(h, sy + radius + 1)
+    x0, x1 = max(0, sx - radius), min(w, sx + radius + 1)
+    patch = gray[y0:y1, x0:x1]
+    ys, xs = np.where(patch > thresh)
+    if xs.size == 0:
+        return sx, sy
+    d = (xs + x0 - sx) ** 2 + (ys + y0 - sy) ** 2
+    i = int(np.argmin(d))
+    return int(xs[i] + x0), int(ys[i] + y0)
+
+
+def _contains(a, b) -> bool:
+    return a[0] <= b[0] and a[1] <= b[1] and a[2] >= b[2] and a[3] >= b[3]
+
+
+def _merge_overlap_groups(groups, overlap=0.15):
+    changed = True
+    while changed:
+        changed = False
+        i = 0
+        while i < len(groups):
+            j = i + 1
+            while j < len(groups):
+                a, b = groups[i]["bbox"], groups[j]["bbox"]
+                if _overlap_ratio(a, b) > overlap or _contains(a, b) or _contains(b, a):
+                    groups[i]["bbox"] = _union(a, b)
+                    groups[i]["regions"].extend(groups[j]["regions"])
+                    groups.pop(j)
+                    changed = True
+                else:
+                    j += 1
+            i += 1
+    return groups

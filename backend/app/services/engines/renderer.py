@@ -3,9 +3,8 @@
 字号方案：
   - 气泡检测：在修复后的图像上对每个文本框做泛洪填充，找到所属气泡的真实边界
     （修复后气泡内部为纯色，泛洪填充可靠）
-  - 同一气泡内的多行文本合并渲染，字号统一
-  - 用 PIL multiline_textbbox 精确测量 + 二分查找能放进气泡的最大字号
-    （留少量边距），译文既填满气泡又不超出
+  - 同一气泡内的多行文本合并渲染，字号统一（单行优先、避免孤字折行）
+  - 文本绘制到透明 overlay，再用气泡泛洪掩膜裁剪合成——文字永不出气泡框
 """
 from __future__ import annotations
 
@@ -13,14 +12,16 @@ import io
 from pathlib import Path
 
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageChops, ImageDraw, ImageFont
 
+from app.config import get_settings
 from app.models.schemas import LangCode
 from app.services.engines.base import BaseRenderer
 from app.services.pipeline import TextRegion
 
 # 中文字体候选（Windows / Linux）
 FONT_CANDIDATES = [
+    "C:/Windows/Fonts/msyhbd.ttc",  # 微软雅黑 Bold
     "C:/Windows/Fonts/msyh.ttc",  # 微软雅黑
     "C:/Windows/Fonts/simhei.ttf",  # 黑体
     "C:/Windows/Fonts/msjh.ttc",  # 微软正黑（繁中）
@@ -61,6 +62,9 @@ class PILRenderer(BaseRenderer):
     def __init__(self):
         self._font_cache: dict[int, ImageFont.FreeTypeFont] = {}
         self._font_path = self._find_font()
+        s = get_settings()
+        self.pad_ratio = max(0.02, float(s.render_padding))
+        self.vertical_min_ratio = max(1.0, float(s.render_vertical_min_ratio))
 
     def _find_font(self) -> str | None:
         for p in FONT_CANDIDATES:
@@ -81,7 +85,6 @@ class PILRenderer(BaseRenderer):
 
     def render(self, cleaned_image_path: Path, regions: list[TextRegion], target_lang: LangCode) -> bytes:
         img = Image.open(cleaned_image_path).convert("RGB")
-        draw = ImageDraw.Draw(img)
         img_w, img_h = img.size
         min_font_size = max(1, round((img_w + img_h) / 200))
 
@@ -89,23 +92,93 @@ class PILRenderer(BaseRenderer):
 
         groups = self._group_by_bubble(bgr, regions, img_w, img_h)
 
-        for bubble, group_regions in groups:
-            bx0, by0, bx1, by1 = bubble
+        # 文本画到透明 overlay，最后按气泡掩膜裁剪合成（文字永不出气泡框）
+        overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
+        odraw = ImageDraw.Draw(overlay)
+        clip_mask = np.zeros((img_h, img_w), np.uint8)
+
+        for _bubble, group_regions in groups:
+            bb, mask = self._bubble_geometry(bgr, group_regions, img_w, img_h)
+            if bb is None:
+                continue
+            bx0, by0, bx1, by1 = bb
             bw, bh = bx1 - bx0, by1 - by0
             if bw <= 0 or bh <= 0:
                 continue
             block = self._group_block_text(group_regions)
-            if bh > bw * 1.5:
+            fill, stroke = self._text_colors(group_regions)
+            if self._use_vertical(group_regions, bw, bh):
                 if block:
-                    self._render_vertical_bubble_block(draw, block, bx0, by0, bw, bh, min_font_size)
+                    self._render_vertical_bubble_block(
+                        odraw, block, bx0, by0, bw, bh, min_font_size, fill=fill, stroke=stroke
+                    )
                 else:
-                    self._render_vertical_bubble(draw, group_regions, bx0, by0, bw, bh, min_font_size)
+                    self._render_vertical_bubble(
+                        odraw, group_regions, bx0, by0, bw, bh, min_font_size, fill=fill, stroke=stroke
+                    )
             else:
-                self._render_horizontal_bubble(draw, group_regions, bx0, by0, bw, bh, min_font_size, block=block)
+                self._render_horizontal_bubble(
+                    odraw, group_regions, bx0, by0, bw, bh, min_font_size, block=block, fill=fill, stroke=stroke
+                )
+
+            if mask is not None:
+                clip_mask = np.maximum(clip_mask, mask)
+            else:
+                cx0, cy0 = max(0, bx0), max(0, by0)
+                cx1, cy1 = min(img_w, bx1), min(img_h, by1)
+                if cx1 > cx0 and cy1 > cy0:
+                    clip_mask[cy0:cy1, cx0:cx1] = 255
+
+        # 仅保留「有文字且位于气泡内」的像素
+        text_alpha = np.array(overlay.getchannel("A"))
+        keep = np.minimum(text_alpha, clip_mask).astype(np.uint8)
+        overlay.putalpha(Image.fromarray(keep, "L"))
+        base = img.convert("RGBA")
+        merged = Image.alpha_composite(base, overlay).convert("RGB")
 
         buf = io.BytesIO()
-        img.save(buf, format="PNG")
+        merged.save(buf, format="PNG")
         return buf.getvalue()
+
+    def _bubble_geometry(self, bgr, group_regions: list[TextRegion], img_w, img_h):
+        """在修复后图像上重推该组的气泡：返回 (bbox, mask|None)"""
+        from app.services.engines.bubble import bubble_with_mask
+
+        x0 = min(r.bounds[0] for r in group_regions)
+        y0 = min(r.bounds[1] for r in group_regions)
+        x1 = max(r.bounds[2] for r in group_regions)
+        y1 = max(r.bounds[3] for r in group_regions)
+        return bubble_with_mask(bgr, (x0, y0, x1, y1), img_w, img_h)
+
+    @staticmethod
+    def _use_vertical(group_regions, bw, bh, min_ratio=None) -> bool:
+        dirs = [r.direction for r in group_regions if r.direction]
+        v = dirs.count("v")
+        h = dirs.count("h")
+        # 强竖形状（高远大于宽）无条件竖排
+        if bh > bw * 1.6:
+            return True
+        # 形状略高 + 方向以竖排为主 才竖排（避免矮气泡被方向误判强制竖排）
+        ratio = min_ratio if min_ratio is not None else 1.2
+        return bh > bw * ratio and v > h
+
+    @staticmethod
+    def _text_colors(group_regions) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
+        fill = (0, 0, 0)
+        stroke = (255, 255, 255)
+        fgs = [r.fg_color for r in group_regions if r.fg_color]
+        bgs = [r.bg_color for r in group_regions if r.bg_color]
+        if fgs:
+            fg = fgs[0]
+            lum = 0.299 * fg[0] + 0.587 * fg[1] + 0.114 * fg[2]
+            if lum < 180:
+                fill = fg
+        if bgs:
+            bg = bgs[0]
+            lum = 0.299 * bg[0] + 0.587 * bg[1] + 0.114 * bg[2]
+            if lum > 160:
+                stroke = bg
+        return fill, stroke
 
     @staticmethod
     def _group_block_text(group_regions: list[TextRegion]) -> str | None:
@@ -259,14 +332,19 @@ class PILRenderer(BaseRenderer):
     def _union(a, b):
         return (min(a[0], b[0]), min(a[1], b[1]), max(a[2], b[2]), max(a[3], b[3]))
 
-    def _render_horizontal_bubble(self, draw, regions, bx0, by0, bw, bh, min_font_size, block=None):
-        """横排气泡：整块文本（或各 region 合并）二分字号填满气泡"""
+    def _render_horizontal_bubble(
+        self, draw, regions, bx0, by0, bw, bh, min_font_size, block=None, fill=(0, 0, 0), stroke=(255, 255, 255)
+    ):
+        """横排气泡：整块文本（或各 region 合并）排版，单行优先、避免孤字折行、填满气泡"""
         lines = sorted(regions, key=lambda r: (r.bounds[1], r.bounds[0]))
         text = block if block is not None else "\n".join((r.translated or "").strip() for r in lines)
-        avail_w = bw * (1 - 2 * PAD_RATIO)
-        avail_h = bh * (1 - 2 * PAD_RATIO)
+        if not text.strip():
+            return
+        pad = self.pad_ratio
+        avail_w = bw * (1 - 2 * pad)
+        avail_h = bh * (1 - 2 * pad)
         max_font = max(min_font_size, int(bh * MAX_FONT_RATIO))
-        font_size = self._find_max_font_in(draw, text, avail_w, avail_h, max_font, min_font_size)
+        font_size = self._select_horizontal_font(draw, text, avail_w, avail_h, max_font, min_font_size)
 
         font = self._get_font(font_size)
         sw = max(1, int(font_size * STROKE_RATIO))
@@ -288,70 +366,109 @@ class PILRenderer(BaseRenderer):
             (tx, ty),
             joined,
             font=font,
-            fill=(0, 0, 0),
+            fill=fill,
             stroke_width=sw,
-            stroke_fill=(255, 255, 255),
+            stroke_fill=stroke,
             spacing=spacing,
             align="center",
         )
 
-    def _render_vertical_bubble(self, draw, regions, bx0, by0, bw, bh, min_font_size):
-        """竖排气泡：按列从右到左排列，字号统一，整组对称居中
+    def _select_horizontal_font(self, draw, text, avail_w, avail_h, max_size, min_size) -> int:
+        """横排字号：优先单行，否则取能放下的最大字号并规避孤字最后一行"""
+        # 单行优先：某字号整段一行放得下 → 直接单行（不折出怪行）
+        for font in range(max_size, min_size - 1, -1):
+            if self._fits_oneline(draw, text, font, avail_w, avail_h):
+                return font
+        # 多行：取最大适应字号，并尝试避免最后一行孤儿
+        for font in range(max_size, min_size - 1, -1):
+            if self._fits_in(draw, text, font, avail_w, avail_h):
+                return self._refine_last_line(draw, text, font, avail_w, avail_h, min_size)
+        return min_size
 
-        - 列间距 = 可用宽 / 列数，字号 ≤ 列间距 * VERTICAL_COL_USE_RATIO（防列间重叠）
-        - 字号同时受高度约束：最长列字符数 * 字距 ≤ 可用高
-        - 整组水平居中（左右对称边距），每列垂直居中
-        """
+    def _fits_oneline(self, draw, text, font_size, max_w, max_h) -> bool:
+        font = self._get_font(font_size)
+        sw = max(1, int(font_size * STROKE_RATIO))
+        w = _text_length(font, text) + sw * 2
+        h = font_size * 1.4 + sw * 2
+        return w <= max_w and h <= max_h
+
+    def _refine_last_line(self, draw, text, font_size, avail_w, avail_h, min_size) -> int:
+        """若多行最后一行过短（孤字），尝试更小字号减少行数"""
+        font = self._get_font(font_size)
+        wrapped = self._wrap_paragraph(text, font, avail_w)
+        if len(wrapped) < 2:
+            return font_size
+        last = wrapped[-1].strip()
+        if not last:
+            return font_size
+        max_len = max(len(l.strip()) for l in wrapped)
+        if max_len <= 0 or len(last) / max_len >= 0.25:
+            return font_size
+        for trial in range(font_size - 1, max(min_size, int(font_size * 0.8)) - 1, -1):
+            tw = self._wrap_paragraph(text, self._get_font(trial), avail_w)
+            if len(tw) < len(wrapped) and self._fits_in(draw, text, trial, avail_w, avail_h):
+                return trial
+            if len(tw) < len(wrapped):
+                break
+        return font_size
+
+    def _render_vertical_bubble(
+        self, draw, regions, bx0, by0, bw, bh, min_font_size, fill=(0, 0, 0), stroke=(255, 255, 255)
+    ):
+        """竖排气泡（每 region 即一列）：整组对称居中，每列垂直居中"""
         columns = sorted(regions, key=lambda r: -r.bounds[0])
         texts = [t for t in ((r.translated or "").strip() for r in columns) if t]
         if not texts:
             return
         n = len(texts)
-        pad_x = PAD_RATIO * bw
-        pad_y = PAD_RATIO * bh
+        pad = self.pad_ratio
+        pad_x = pad * bw
+        pad_y = pad * bh
         avail_w = bw - 2 * pad_x
         avail_h = bh - 2 * pad_y
         if avail_w <= 0 or avail_h <= 0:
             return
         col_gap = avail_w / n
         longest = max(len(t) for t in texts)
-        # 字号：受列间距（防重叠）与高度共同约束
         font_size = int(min(col_gap * VERTICAL_COL_USE_RATIO, avail_h / max(1, longest * VERTICAL_CHAR_RATIO)))
         font_size = max(1, font_size)
 
         font = self._get_font(font_size)
         sw = max(1, int(font_size * STROKE_RATIO))
         char_h = int(font_size * VERTICAL_CHAR_RATIO)
-        # 整组水平居中：从右到左排列，第一列中心在右侧
-        right_pad = pad_x + col_gap / 2
-        x_center = bx0 + bw - right_pad
-        for t in texts:
+        # 整组对称居中（从右到左依次排布）
+        total_w = n * col_gap
+        left = bx0 + (bw - total_w) / 2
+        for i, t in enumerate(texts):
             total_h = len(t) * char_h
-            ty = by0 + avail_h / 2 - total_h / 2 + pad_y
-            tx = x_center - font_size / 2
+            ty = by0 + (bh - total_h) / 2
+            tx = left + col_gap * (i + 0.5) - font_size / 2
             for ch in t:
                 draw.text(
                     (tx, ty),
                     ch,
                     font=font,
-                    fill=(0, 0, 0),
+                    fill=fill,
                     stroke_width=sw,
-                    stroke_fill=(255, 255, 255),
+                    stroke_fill=stroke,
                 )
                 ty += char_h
-            x_center -= col_gap
 
-    def _render_vertical_bubble_block(self, draw, text, bx0, by0, bw, bh, min_font_size):
-        """竖排气泡整块重排：整块译文按气泡框尺寸拆分为多列（右→左），对称居中
+    def _render_vertical_bubble_block(
+        self, draw, text, bx0, by0, bw, bh, min_font_size, fill=(0, 0, 0), stroke=(255, 255, 255)
+    ):
+        """竖排气泡整块重排：整块译文按气泡框拆分为多列，整组对称居中、顶部对齐
 
-        - 每个逻辑行（\\n）独立成列，超长行自动折到新列
-        - 字号受列宽（防列间重叠）与高度（每列字数*字距 ≤ 可用高）双约束
+        - 逻辑行（\\n）软分列：能独立成列则独立，超长行才续列
+        - 字号上界 = min(可用宽*比率, 最长行高度约束)，向下搜索至「列数×列距 ≤ 可用宽」
+        - 列组水平居中，各列顶部对齐
         """
         lines = [ln for ln in text.split("\n") if ln]
         if not lines:
             return
-        pad_x = PAD_RATIO * bw
-        pad_y = PAD_RATIO * bh
+        pad = self.pad_ratio
+        pad_x = pad * bw
+        pad_y = pad * bh
         avail_w = bw - 2 * pad_x
         avail_h = bh - 2 * pad_y
         if avail_w <= 0 or avail_h <= 0:
@@ -371,42 +488,44 @@ class PILRenderer(BaseRenderer):
                 columns.append(ln[i : i + chars_per_col])
         n = len(columns)
         col_gap = avail_w / max(1, n)
-        right_pad = pad_x + col_gap / 2
-        x_center = bx0 + bw - right_pad
-        cent_y = by0 + avail_h / 2 + pad_y
+        total_w = n * col_gap
+        left = bx0 + (bw - total_w) / 2
+        max_col = max(len(c) for c in columns)
+        group_top = by0 + (bh - max_col * char_h) / 2
         for col_idx, col in enumerate(columns):
-            cx = x_center - col_idx * col_gap
-            total_h = len(col) * char_h
-            ty = cent_y - total_h / 2
+            cx = left + col_gap * (col_idx + 0.5)
+            ty = group_top
             tx = cx - font_size / 2
             for ch in col:
                 draw.text(
                     (tx, ty),
                     ch,
                     font=font,
-                    fill=(0, 0, 0),
+                    fill=fill,
                     stroke_width=sw,
-                    stroke_fill=(255, 255, 255),
+                    stroke_fill=stroke,
                 )
                 ty += char_h
 
     def _vertical_optimal_font(self, lines, avail_w, avail_h, min_font_size) -> int:
-        """竖排整块：返回能满足「字距·列数 ≤ 可用宽」「列字数·字距 ≤ 可用高」的最大字号"""
-        chars_total = sum(len(ln) for ln in lines)
-        _max = max(self._MIN_FONT_LIMIT, int(avail_h / max(1, chars_total) * VERTICAL_CHAR_RATIO), min_font_size)
-        max_font = max(min_font_size, min(int(avail_w * VERTICAL_COL_USE_RATIO), _max))
-        best = 0
-        for font in range(max_font, min_font_size - 1, -1):
+        """竖排整块：从合理上界向下找最大字号，使「列数·列距 ≤ 可用宽」且每列高度可容纳"""
+        max_line_len = max(len(ln) for ln in lines) or 1
+        # 上界：单列宽约束 + 最长逻辑行一列内放下（避免短文本字号暴涨 → 单字一列塌方）
+        upper = int(
+            min(
+                avail_w * VERTICAL_COL_USE_RATIO,
+                avail_h / max(1.0, max_line_len * VERTICAL_CHAR_RATIO),
+            )
+        )
+        upper = max(min_font_size, upper)
+        for font in range(upper, min_font_size - 1, -1):
             char_h = int(font * VERTICAL_CHAR_RATIO)
             chars_per_col = max(1, int(avail_h // char_h))
             n_cols = sum(max(1, -(-len(ln) // chars_per_col)) for ln in lines)
             col_gap = avail_w / max(1, n_cols)
             if font <= col_gap * VERTICAL_COL_USE_RATIO:
-                best = font
-                break
-        return best if best >= min_font_size else max(min_font_size, best)
-
-    _MIN_FONT_LIMIT = 8
+                return font
+        return max(1, min_font_size)
 
     def _find_max_font_in(self, draw, text, max_w, max_h, max_size, min_size):
         """二分查找 [min_size, max_size] 内能放进 (max_w, max_h) 的最大字号"""

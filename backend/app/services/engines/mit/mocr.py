@@ -43,5 +43,6 @@ class MangaOcrWrapper:
                 txt = self._mocr(Image.fromarray(crop))
                 if txt:
                     q.text = txt
+                    q.prob = max(float(q.prob), 0.85)
             except Exception:  # noqa: BLE001
                 continue

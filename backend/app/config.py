@@ -78,6 +78,12 @@ class Settings(BaseSettings):
     # 修复推理设备: cpu | cuda（cuda 不可用时自动回退 cpu）
     inpaint_device: str = "cpu"
 
+    # 气泡级渲染参数
+    # 气泡内边距比例（相对气泡宽/高，文本留白）
+    render_padding: float = 0.12
+    # 竖排判定：气泡高宽比需超过该值且方向以竖排为主时才竖排
+    render_vertical_min_ratio: float = 1.2
+
     class Config:
         env_prefix = "MANGA_"
         env_file = ".env"
