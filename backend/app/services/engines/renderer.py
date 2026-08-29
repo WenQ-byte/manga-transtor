@@ -29,12 +29,14 @@ FONT_CANDIDATES = [
     "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
 ]
 
-# 竖排字距系数
-VERTICAL_CHAR_RATIO = 1.1
+# 竖排字距系数（字号 * 该系数 = 相邻字符垂直间距）
+VERTICAL_CHAR_RATIO = 1.15
+# 竖排列宽占列间距比例（留出描边与间隔，防相邻列文字重叠）
+VERTICAL_COL_USE_RATIO = 0.82
 # 描边宽度系数（相对字号）
 STROKE_RATIO = 1 / 14
-# 横排行距（相对字号）
-LINE_SPACING_RATIO = 0.1
+# 横排行距（相对字号，中文行距需偏大避免拥挤）
+LINE_SPACING_RATIO = 0.3
 
 # 气泡内边距比例（相对气泡宽/高，用于留白控制）
 PAD_RATIO = 0.12
@@ -264,28 +266,38 @@ class PILRenderer(BaseRenderer):
         )
 
     def _render_vertical_bubble(self, draw, regions, bx0, by0, bw, bh, min_font_size):
-        """竖排气泡：按列从右到左排列，字号统一（且不超过列宽，避免列间重叠）"""
+        """竖排气泡：按列从右到左排列，字号统一，整组对称居中
+
+        - 列间距 = 可用宽 / 列数，字号 ≤ 列间距 * VERTICAL_COL_USE_RATIO（防列间重叠）
+        - 字号同时受高度约束：最长列字符数 * 字距 ≤ 可用高
+        - 整组水平居中（左右对称边距），每列垂直居中
+        """
         columns = sorted(regions, key=lambda r: -r.bounds[0])
         texts = [t for t in ((r.translated or "").strip() for r in columns) if t]
         if not texts:
             return
         n = len(texts)
-        avail_w = bw * (1 - 2 * PAD_RATIO)
-        avail_h = bh * (1 - 2 * PAD_RATIO)
-        col_w = avail_w / n
+        pad_x = PAD_RATIO * bw
+        pad_y = PAD_RATIO * bh
+        avail_w = bw - 2 * pad_x
+        avail_h = bh - 2 * pad_y
+        if avail_w <= 0 or avail_h <= 0:
+            return
+        col_gap = avail_w / n
         longest = max(len(t) for t in texts)
-        # 字号受列宽（防重叠）与高度共同约束，允许小于 min_font_size 以保证不重叠
-        font_size = int(min(col_w, avail_h / max(1, longest * VERTICAL_CHAR_RATIO)))
+        # 字号：受列间距（防重叠）与高度共同约束
+        font_size = int(min(col_gap * VERTICAL_COL_USE_RATIO, avail_h / max(1, longest * VERTICAL_CHAR_RATIO)))
         font_size = max(1, font_size)
 
         font = self._get_font(font_size)
         sw = max(1, int(font_size * STROKE_RATIO))
         char_h = int(font_size * VERTICAL_CHAR_RATIO)
-        right_pad = PAD_RATIO * bw
-        x_center = bx0 + bw - right_pad - col_w / 2
+        # 整组水平居中：从右到左排列，第一列中心在右侧
+        right_pad = pad_x + col_gap / 2
+        x_center = bx0 + bw - right_pad
         for t in texts:
             total_h = len(t) * char_h
-            ty = by0 + bh / 2 - total_h / 2
+            ty = by0 + avail_h / 2 - total_h / 2 + pad_y
             tx = x_center - font_size / 2
             for ch in t:
                 draw.text(
@@ -297,7 +309,7 @@ class PILRenderer(BaseRenderer):
                     stroke_fill=(255, 255, 255),
                 )
                 ty += char_h
-            x_center -= col_w
+            x_center -= col_gap
 
     def _find_max_font_in(self, draw, text, max_w, max_h, max_size, min_size):
         """二分查找 [min_size, max_size] 内能放进 (max_w, max_h) 的最大字号"""
