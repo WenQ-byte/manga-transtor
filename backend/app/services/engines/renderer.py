@@ -254,6 +254,8 @@ class PILRenderer(BaseRenderer):
         if any(r.group_index is not None for r in regions):
             groups_by_idx: dict[int, list] = {}
             for region in regions:
+                if getattr(region, "_no_erase", False):
+                    continue
                 text = (region.group_translated or "").strip() or (region.translated or "").strip()
                 if not text:
                     continue
@@ -271,6 +273,8 @@ class PILRenderer(BaseRenderer):
 
         groups: list[list] = []
         for region in regions:
+            if getattr(region, "_no_erase", False):
+                continue
             text = (region.translated or "").strip()
             if not text:
                 continue

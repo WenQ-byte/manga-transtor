@@ -78,6 +78,32 @@ def detect_bubble(bgr, bounds, img_w, img_h, flood_tol=FLOOD_TOL, grow_ratio=BUB
     return bb
 
 
+# 非气泡文字（刊头/拟声词/贴纸字）几何判据：泛洪 bbox 为细长横条或跨页宽横带
+STRIP_RATIO = 8.0
+STRIP_H_RATIO = 0.04
+BAND_W_RATIO = 0.5
+BAND_H_RATIO = 0.05
+
+
+def _is_strip_bbox(bb, img_w, img_h, direction) -> bool:
+    """泛洪 bbox 是否为非气泡形态：细长横条（w/h≥8 且高≤4%页高）或跨页宽横带"""
+    bw = bb[2] - bb[0]
+    bh = bb[3] - bb[1]
+    if bw <= 0 or bh <= 0:
+        return False
+    if bw / bh >= STRIP_RATIO and bh <= STRIP_H_RATIO * img_h:
+        return True
+    if direction == "h" and bw >= BAND_W_RATIO * img_w and bh <= BAND_H_RATIO * img_h:
+        return True
+    return False
+
+
+def classify_non_bubble(bgr, region, img_w, img_h) -> bool:
+    """判定 region 是否为非气泡文字（刊头/拟声词等）：泛洪 bbox 命中细横条/跨页横带"""
+    bb = detect_bubble(bgr, region.bounds, img_w, img_h)
+    return _is_strip_bbox(bb, img_w, img_h, getattr(region, "direction", None))
+
+
 def bubble_with_mask(bgr, bounds, img_w, img_h, flood_tol=FLOOD_TOL, grow_ratio=BUBBLE_GROW_RATIO):
     """泛洪推气泡：返回 (bbox, mask)
 

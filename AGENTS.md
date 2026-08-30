@@ -36,7 +36,8 @@
 - 流水线编排在 `services/pipeline.py`，顺序 detect → ocr → **inpaint → translate** → render（修复提前：同一气泡的分组泛洪在擦除后的干净图上进行，分组必准；翻译整块进行）。引擎可插拔，统一通过 `services/engines/factory.py` 的 `get_engine(type)` 获取（lru_cache 缓存）。
 - OCR 引擎自带检测（`supports_detection=True`）时，`pipeline.py` 跳过独立 detector，直接用 OCR 检测+识别。
 - OCR 结果按 `confidence >= 0.5` 且非空文本过滤噪声（`pipeline.py` 中 `regions = [r for r in regions if r.confidence >= 0.5 and r.text.strip()]`）。
-- **掩膜整块化**：`mask.py` 优先按文本多边形整块填充（`fillPoly` + 膨胀，零残留），无 poly 才回退 Otsu 笔画；结果覆盖 MIT 检测器预填充的紧致神经掩膜（后者偏紧会残留）。`mit_ignore_bubble` 判定的 region 打 `_no_erase` 标记跳过擦除。
+- **非气泡文字判定**（`bubble.py:classify_non_bubble`）：泛洪 bbox 为细长横条（w/h≥8 且高≤4%页高）或跨页宽横带（方向横且宽≥50%页宽且高≤5%页高）→ 判为刊头/拟声词等非气泡，标 `_no_erase`；`pipeline.py:drop_non_bubble_regions` 移出工作集（不擦除、不翻译、不渲染，原文保留），renderer 同跳过（双保险）。默认开启，不依赖旧 `is_ignore` 启发式（后者仅 config≥1 时 opt-in，且对贴字/彩色背景不可靠）。
+- **掩膜整块化**：`mask.py` 优先按文本多边形整块填充（`fillPoly` + 膨胀，零残留），无 poly 才回退 Otsu 笔画；结果覆盖 MIT 检测器预填充的紧致神经掩膜（后者偏紧会残留）。非气泡文字（刊头/拟声词）打 `_no_erase` 标记跳过擦除并整体移出翻译/渲染（原文保留）。
 - 渲染防丢字：`renderer.py` 逐组统计「文字像素 ∩ 气泡掩膜」覆盖率，<50% 回退矩形裁剪（防泛洪掩膜不可信时整段文字被裁掉）。
 - **分组防链式吞并**：`bubble.py:_balloon_ok` 要求合并后包围盒面积 ≤ 1.6×(两框面积和)——页眉横条/拟声词等细长区域的泛洪 bbox 若被近邻合并链式吞并整页会爆炸（跨页杂志实测 17 组并成 1 组导致整页巨字），膨胀校验阻断；渲染端 `_bubble_geometry` 另加绝对上限：泛洪结果不得超出 `group_bounds` 边长 15%，超限回退锚定矩形。
 - 排版均衡：竖排整块 `_balance_columns` 均衡切列（列长差 ≤1）、横排 `_wrap_text` 均衡断行。
@@ -50,7 +51,7 @@
 - **翻译分组**：pipeline 翻译前用 `bubble.py:group_regions_by_bubble` 按气泡泛洪分组，整块 `\n` 拼接一次翻译（更地道），整块译文存 `region.group_translated` 并尽力按行拆回 `region.translated`。
 - **方向**：`Quadrilateral.direction`（横/竖）由 `sort_pnts` 判定，回填 `TextRegion.direction`；渲染竖排判定以气泡形状为主（`bh > bw*MANGA_RENDER_VERTICAL_MIN_RATIO` 且方向 v 占多，或高远超宽），方向仅作联席依据，避免矮气泡被误判强制竖排。
 - **排版**：文本绘制到透明 overlay，按气泡泛洪掩膜裁剪合成（`bubble.bubble_with_mask`）——文字绝不越出气泡框；横排单行优先 + 孤字规避（`_select_horizontal_font`），竖排整块按气泡分列、列组对称居中顶部对齐（`_render_vertical_bubble_block`）。内边距 `MANGA_RENDER_PADDING`。
-- **掩膜**：检测阶段直接把 raw_mask 裁剪成 0/255 patch 存入 `region.mask`（`{bbox, patch}`），`mask.py:build_full_mask` 已改为**缓存优先**（否则会覆盖 MIT 预填充）。`MANGA_MIT_IGNORE_BUBBLE`（1-50）开启时，非气泡区域（拟声词等）不生成掩膜、原文保留。
+- **掩膜**：检测阶段直接把 raw_mask 裁剪成 0/255 patch 存入 `region.mask`（`{bbox, patch}`），`mask.py:build_full_mask` 已改为**缓存优先**（否则会覆盖 MIT 预填充）。非气泡文字（拟声词等）由 `classify_non_bubble` 泛洪几何判定并移出管线，原文保留。
 - **管线配合**：MIT 检测器的每个 textline 即一个 region（不停靠 textline_merge，因为 renderer 按 region 分组渲染多行/多列气泡）；`MANGA_BUBBLE_FILTER` 默认 auto，MIT 模式自动关闭白占比气泡过滤（对彩色/深色气泡误删）。翻译按气泡整块进行（见上），渲染优先用 `group_translated` 整块排版（横排二分字号填满、竖排整块分列重排）。
 
 ## 易踩的坑（改动引擎时注意）

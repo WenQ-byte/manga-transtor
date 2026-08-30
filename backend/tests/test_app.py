@@ -475,5 +475,33 @@ class TestBubbleGeometryLeakCap(unittest.TestCase):
         self.assertEqual(bb, (40, 40, 200, 300))
 
 
+class TestNonBubbleClassify(unittest.TestCase):
+    """非气泡文字（刊头横条/跨页横带）几何判定 → 保留原文不翻译"""
+
+    def test_banner_strip_classified(self):
+        from app.services.engines.bubble import _is_strip_bbox
+
+        self.assertTrue(_is_strip_bbox((26, 15, 985, 69), 1921, 1412, "h"))
+
+    def test_legit_vertical_bubble_not_flagged(self):
+        from app.services.engines.bubble import _is_strip_bbox
+
+        self.assertFalse(_is_strip_bbox((764, 309, 829, 796), 1921, 1412, "v"))
+
+    def test_legit_horizontal_bubble_not_flagged(self):
+        from app.services.engines.bubble import _is_strip_bbox
+
+        self.assertFalse(_is_strip_bbox((300, 400, 600, 520), 1921, 1412, "h"))
+
+    def test_drop_non_bubble_regions(self):
+        from app.services.pipeline import TextRegion, drop_non_bubble_regions
+
+        a = TextRegion(box=[[0, 0], [10, 0], [10, 10], [0, 10]], text="a")
+        b = TextRegion(box=[[0, 0], [10, 0], [10, 10], [0, 10]], text="b")
+        b._no_erase = True
+        out = drop_non_bubble_regions([a, b])
+        self.assertEqual([r.text for r in out], ["a"])
+
+
 if __name__ == "__main__":
     unittest.main()

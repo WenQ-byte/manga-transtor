@@ -51,6 +51,11 @@ class TextRegion:
         return int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys))
 
 
+def drop_non_bubble_regions(regions: list[TextRegion]) -> list[TextRegion]:
+    """移出非气泡文字（刊头/拟声词，标 _no_erase）：原文保留，不翻译不渲染"""
+    return [r for r in regions if not getattr(r, "_no_erase", False)]
+
+
 @dataclass
 class PipelineResult:
     """流水线执行结果"""
@@ -143,6 +148,23 @@ class TranslationPipeline:
         bf = getattr(self, "_bubble_on", True)
         if bf:
             regions = self.bubble_filter.filter(image_path, regions)
+        if not regions:
+            return PipelineResult(regions=[], duration_ms=int((time.monotonic() - start) * 1000))
+
+        # 1.6 非气泡文字（页眉横条/拟声词，泛洪几何判定）保留原文：不擦除、不翻译
+        from PIL import Image
+
+        import numpy as np
+
+        from app.services.engines.bubble import classify_non_bubble
+
+        img0 = np.array(Image.open(image_path).convert("RGB"))
+        bgr0 = img0[:, :, ::-1].copy()
+        h0, w0 = bgr0.shape[:2]
+        for r in regions:
+            if classify_non_bubble(bgr0, r, w0, h0):
+                r._no_erase = True
+        regions = drop_non_bubble_regions(regions)
         if not regions:
             return PipelineResult(regions=[], duration_ms=int((time.monotonic() - start) * 1000))
 
