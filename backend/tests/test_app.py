@@ -615,7 +615,7 @@ class TestMaskCoverage(unittest.TestCase):
 
 
 class TestCVInpainter(unittest.TestCase):
-    def test_row_fill_samples_each_mask_run_locally(self):
+    def test_row_fill_uses_local_bright_background(self):
         import numpy as np
 
         from app.services.engines.inpainter import CVInpainter

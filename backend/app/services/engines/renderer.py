@@ -21,8 +21,8 @@ from app.services.pipeline import TextRegion
 
 # 中文字体候选（Windows / Linux）
 FONT_CANDIDATES = [
-    "C:/Windows/Fonts/msyhbd.ttc",  # 微软雅黑 Bold
     "C:/Windows/Fonts/msyh.ttc",  # 微软雅黑
+    "C:/Windows/Fonts/msyhbd.ttc",  # 微软雅黑 Bold（无常规字体时回退）
     "C:/Windows/Fonts/simhei.ttf",  # 黑体
     "C:/Windows/Fonts/msjh.ttc",  # 微软正黑（繁中）
     "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
@@ -608,7 +608,9 @@ class PILRenderer(BaseRenderer):
         for i, t in enumerate(texts):
             total_h = len(t) * char_h
             ty = by0 + (bh - total_h) / 2
-            tx = left + col_gap * (i + 0.5) - font_size / 2
+            # 日文原稿的竖排列序从右向左；group_regions 已按右到左整理，绘制时
+            # 也必须把第一个源列放在最右侧，避免整句译文列序反转。
+            tx = left + col_gap * (n - i - 0.5) - font_size / 2
             for ch in t:
                 draw.text(
                     (tx, ty),
@@ -653,7 +655,8 @@ class PILRenderer(BaseRenderer):
         max_col = max(len(c) for c in columns)
         group_top = by0 + (bh - max_col * char_h) / 2
         for col_idx, col in enumerate(columns):
-            cx = left + col_gap * (col_idx + 0.5)
+            # columns 保持源文本的右到左顺序，因此第 0 列位于最右侧。
+            cx = left + col_gap * (n - col_idx - 0.5)
             ty = group_top
             tx = cx - font_size / 2
             for ch in col:
@@ -712,19 +715,24 @@ class PILRenderer(BaseRenderer):
         # 行数超列数：按顺序把相邻行塞进同一列，直到放满一列再开新列
         cols: list[str] = []
         cur = ""
-        n = max(1, min(avail_cols, -(-total // avail_cols)))
-        target = -(-total // n)
-        for ln in lines:
-            if len(cur) + len(ln) > avail_cols and cur:
+        for raw in lines:
+            ln = raw
+            if not ln:
+                continue
+            # 翻译服务偶尔会返回比单列更长的一行；切成连续片段，避免整颗气泡不渲染。
+            while len(ln) > avail_cols:
+                if cur:
+                    cols.append(cur)
+                    cur = ""
+                cols.append(ln[:avail_cols])
+                ln = ln[avail_cols:]
+            if cur and len(cur) + len(ln) > avail_cols:
                 cols.append(cur)
                 cur = ""
             cur += ln
-            # 单行超列容量 → 直接返回 None（放不下）
-            if len(cur) > avail_cols:
-                return None
         if cur:
             cols.append(cur)
-        return cols
+        return cols or None
 
     def _find_max_font_in(self, draw, text, max_w, max_h, max_size, min_size):
         """二分查找 [min_size, max_size] 内能放进 (max_w, max_h) 的最大字号"""

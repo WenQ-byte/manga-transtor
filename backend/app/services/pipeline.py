@@ -136,19 +136,22 @@ class TranslationPipeline:
             self.ocr.recognize(image_path, regions, source_lang)
             self._report(progress_cb, 1, 100)
 
-        # 1.4 过滤低置信度识别与空文本（噪声）
-        regions = [r for r in regions if r.confidence >= 0.5 and r.text.strip()]
+        # 1.4 保留高置信度但未识别出文本的检测框：它们仍需参与擦除（常见于注音/小字），
+        # 但不能送入翻译。真正参与翻译的区域在分组时再按 text.strip() 过滤。
+        regions = [r for r in regions if r.confidence >= 0.5]
+        text_regions = [r for r in regions if r.text.strip()]
+        erase_only_regions = [r for r in regions if not r.text.strip()]
 
         from app.services.engines.bubble import merge_punctuation_regions
 
-        regions = merge_punctuation_regions(regions)
+        text_regions = merge_punctuation_regions(text_regions)
 
         # 1.5 过滤气泡外文字（丢弃涂鸦/噪声），无有效气泡时保留原样
         # MIT 检测引擎自带漫画文本先验，且白占比启发式对彩色/深色气泡误删，跳过
         bf = getattr(self, "_bubble_on", True)
         if bf:
-            regions = self.bubble_filter.filter(image_path, regions)
-        if not regions:
+            text_regions = self.bubble_filter.filter(image_path, text_regions)
+        if not text_regions and not erase_only_regions:
             return PipelineResult(regions=[], duration_ms=int((time.monotonic() - start) * 1000))
 
         # 1.6 非气泡文字（页眉横条/拟声词，泛洪几何判定）保留原文：不擦除、不翻译
@@ -161,23 +164,24 @@ class TranslationPipeline:
         img0 = np.array(Image.open(image_path).convert("RGB"))
         bgr0 = img0[:, :, ::-1].copy()
         h0, w0 = bgr0.shape[:2]
-        for r in regions:
+        for r in text_regions:
             if classify_non_bubble(bgr0, r, w0, h0):
                 r._no_erase = True
-        regions = drop_non_bubble_regions(regions)
-        if not regions:
+        text_regions = drop_non_bubble_regions(text_regions)
+        erase_regions = text_regions + erase_only_regions
+        if not erase_regions:
             return PipelineResult(regions=[], duration_ms=int((time.monotonic() - start) * 1000))
 
         # 3. 图像修复（擦除原文）—— 提前到翻译前，使气泡分组可在干净图上进行
         self._report(progress_cb, 2, 10)
-        cleaned = self.inpainter.inpaint(image_path, regions)
+        cleaned = self.inpainter.inpaint(image_path, erase_regions)
         self._report(progress_cb, 2, 100)
 
         # 4. 按气泡分组（干净图上泛洪，笔画已擦除 → 分组可靠）→ 整块翻译
         glossary = self.glossary.get_mapping(source_lang)
         self._report(progress_cb, 3, 5)
-        groups = self._group_regions(cleaned, regions)
-        group_texts = ["\n".join(r.text for r in g["regions"]) for g in groups]
+        groups = self._group_regions(cleaned, text_regions)
+        group_texts = ["\n".join(r.text for r in g["regions"] if r.text.strip()) for g in groups]
         translated_blocks = self.translator.translate_batch(
             group_texts,
             source_lang,
@@ -199,11 +203,11 @@ class TranslationPipeline:
 
         # 5. 渲染译文
         self._report(progress_cb, 4, 10)
-        result_bytes = self.renderer.render(cleaned, regions, target_lang=target_lang)
+        result_bytes = self.renderer.render(cleaned, text_regions, target_lang=target_lang)
         self._report(progress_cb, 4, 100)
 
         duration = int((time.monotonic() - start) * 1000)
-        return PipelineResult(regions=regions, duration_ms=duration, image_bytes=result_bytes)
+        return PipelineResult(regions=text_regions, duration_ms=duration, image_bytes=result_bytes)
 
 
 def create_pipeline() -> TranslationPipeline:

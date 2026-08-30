@@ -28,7 +28,9 @@ def build_full_mask(img: np.ndarray, regions: list[TextRegion], pad: int = 2) ->
     for region in regions:
         if getattr(region, "_no_erase", False):
             continue
-        res = build_region_mask(img, region, pad=pad)
+        # MIT 检测器已经提供逐像素文本掩膜，优先复用它；只有没有缓存时才
+        # 依据 OCR 多边形/笔画候选重新计算，避免重算掩膜漏掉风格化字或注音。
+        res = region_patch(img, region, pad=pad)
         if res is None:
             continue
         x0, y0, x1, y1, patch = res

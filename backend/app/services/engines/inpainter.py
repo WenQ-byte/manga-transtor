@@ -30,6 +30,14 @@ class CVInpainter(BaseInpainter):
         if not mask.any():
             return self._save_temp(img)
 
+        # MIT 检测器的缓存掩膜是逐像素笔画图，直接用 TELEA 重建比逐行取样
+        # 更平滑；逐行方案保留给没有缓存掩膜的通用 OCR/CV 路径。
+        has_cached_mask = any(isinstance(r.mask, dict) and "patch" in r.mask for r in regions)
+        if has_cached_mask:
+            smooth = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+            repaired = cv2.inpaint(img, smooth, 3, cv2.INPAINT_TELEA)
+            return self._save_temp(repaired)
+
         result = img.copy()
         # 1. 局部行背景填充掩膜内部（保留气泡渐变）
         body = cv2.erode(mask, np.ones((3, 3), np.uint8), iterations=1)
@@ -62,7 +70,11 @@ class CVInpainter(BaseInpainter):
                 samples = [part for part in (left, right) if part.size]
                 if not samples:
                     continue
-                color = np.median(np.concatenate(samples, axis=0), axis=0).astype(np.uint8)
+                src = np.concatenate(samples, axis=0)
+                # 白色/浅色气泡中，邻近文字笔画可能占据一侧采样带；优先用亮像素
+                # 的中位数，避免把相邻黑字或整页远处纹理涂回擦除区。
+                bright = src[np.mean(src, axis=1) > 160]
+                color = np.median(bright if len(bright) >= 2 else src, axis=0).astype(np.uint8)
                 img[y, x0:x1 + 1] = color
 
     def _save_temp(self, arr: np.ndarray) -> Path:
