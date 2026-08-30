@@ -592,31 +592,31 @@ class PILRenderer(BaseRenderer):
         return 0, [], 0
 
     def _balance_columns(self, lines, total, avail_h, char_h) -> list[str] | None:
-        """均衡切列：target = ceil(总字数/列数)，整行优先入列、超长行按 target 软断
+        """按原文行序而非字数重切：整行作为一列，保持句读顺序不被跨列打散
 
+        行为：行数不超可用列数 → 每行独立成列（顺序即原文顺序）；
+        行数超可用列数 → 才把相邻行合并进同一列（从上到下依次排），仍不跨句重切。
         返回列列表；若任意列超出可用高度返回 None。
         """
         avail_cols = max(1, int(avail_h // char_h))
-        n = max(1, -(-total // avail_cols))
-        target = -(-total // n)
-        # target 不能超过 avail_cols，否则该字号放不下
-        if target > avail_cols:
+        if not lines:
             return None
+        # 优先整行独立成列：每行长度不超列容量即可
+        if len(lines) <= avail_cols and all(len(ln) <= avail_cols for ln in lines):
+            return list(lines)
+        # 行数超列数：按顺序把相邻行塞进同一列，直到放满一列再开新列
         cols: list[str] = []
         cur = ""
+        n = max(1, min(avail_cols, -(-total // avail_cols)))
+        target = -(-total // n)
         for ln in lines:
-            remaining = ln
-            while remaining:
-                if cur and len(cur) >= target:
-                    cols.append(cur)
-                    cur = ""
-                space = target - len(cur)
-                take = min(space, len(remaining))
-                cur += remaining[:take]
-                remaining = remaining[take:]
-            if len(cur) >= target * 0.6:
+            if len(cur) + len(ln) > avail_cols and cur:
                 cols.append(cur)
                 cur = ""
+            cur += ln
+            # 单行超列容量 → 直接返回 None（放不下）
+            if len(cur) > avail_cols:
+                return None
         if cur:
             cols.append(cur)
         return cols

@@ -59,7 +59,7 @@ def build_region_mask(img: np.ndarray, region: TextRegion, pad: int = 2) -> Opti
 
     h, w = img.shape[:2]
 
-    # bbox：优先用 poly（OCR 原始多边形），否则用 box
+    # bbox：以 box 与 poly 的并集为界（poly 常偏紧包不住笔画外缘，box 更完整）
     pts = region.poly if region.poly else region.box
     if not pts:
         return None
@@ -67,6 +67,13 @@ def build_region_mask(img: np.ndarray, region: TextRegion, pad: int = 2) -> Opti
     ys = [p[1] for p in pts]
     x0, x1 = int(min(xs)), int(max(xs))
     y0, y1 = int(min(ys)), int(max(ys))
+    if region.box:
+        bxs = [p[0] for p in region.box]
+        bys = [p[1] for p in region.box]
+        x0 = min(x0, int(min(bxs)))
+        x1 = max(x1, int(max(bxs)))
+        y0 = min(y0, int(min(bys)))
+        y1 = max(y1, int(max(bys)))
 
     # 缩进，避免覆盖气泡边框
     x0 = max(0, x0 + pad)
@@ -78,9 +85,28 @@ def build_region_mask(img: np.ndarray, region: TextRegion, pad: int = 2) -> Opti
 
     poly_filled = _fill_poly(region, x0, y0, x1, y1)
     if poly_filled is not None:
-        # 整块擦除：文本多边形内部全部是掩膜 + 膨胀覆盖抗锯齿边缘
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-        cand = cv2.dilate(poly_filled, kernel, iterations=1)
+        # 整块擦除：文本多边形内部全部是掩膜；再并上 Otsu 笔画候选（覆盖 poly 外缘漏出的笔画）
+        # 并放大膨胀补防抗锯齿边缘，杜绝原文灰影残留。
+        img_gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY) if img.ndim == 3 else img
+        patch_gray = img_gray[y0:y1, x0:x1]
+        strokes = _stroke_candidates(patch_gray)
+        cand = poly_filled
+        if strokes is not None and strokes.any():
+            cand = np.maximum(cand, strokes)
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
+        cand = cv2.dilate(cand, kernel, iterations=1)
+        # 把 pad 缩进丢掉的边带补回掩膜（覆盖到 box/poly 边界），防边缘笔画残留
+        if pad > 0:
+            x0 = max(0, x0 - pad)
+            y0 = max(0, y0 - pad)
+            x1 = min(w, x1 + pad)
+            y1 = min(h, y1 + pad)
+            padded = np.zeros((y1 - y0, x1 - x0), dtype=np.uint8)
+            padded[pad:pad + cand.shape[0], pad:pad + cand.shape[1]] = cand
+            cand = padded
+        # 注音扩展：竖排汉字旁常印小号假名（furigana），检测器往往漏检，若不擦除会原文灰影残留。
+        # 沿主字 bbox 上下/左右各扩 FURIGANA_MARGIN，并仅拾取带内的小连通字形成分（避免误伤大结构）。
+        x0, y0, x1, y1, cand = _add_furigana_margin(img, x0, y0, x1, y1, cand)
         return (x0, y0, x1, y1, cand)
 
     # 无 poly 兜底：Otsu 笔画候选（仅 box），并剔除疑似气泡边框的大连通组件
@@ -119,6 +145,49 @@ def _fill_poly(region: TextRegion, x0: int, y0: int, x1: int, y1: int) -> Option
         return mask
     except Exception:  # noqa: BLE001
         return None
+
+
+# 注音（furigana）扩展带：主字 bbox 外扩该距离，拾取带内小字形成分
+FURIGANA_MARGIN = 16
+# 注音字形尺寸上限（px）：高 ≤ 该值、宽 ≤ 该值且面积 ≤ 该上限
+_FURIGANA_MAX_H = 16
+_FURIGANA_MAX_W = 18
+_FURIGANA_MAX_AREA = 260
+
+
+def _add_furigana_margin(img, x0, y0, x1, y1, cand):
+    """沿主字 bbox 外扩 FURIGANA_MARGIN，把带内小连通字形成分（注音）并入掩膜。
+
+    只拾取尺寸/面积达标的紧凑成分，不误伤旁侧大结构（面板/网点/人物）。
+    返回扩大的 (x0,y0,x1,y1,cand)；无注音时保持原 bbox。
+    """
+    import cv2
+
+    h, w = img.shape[:2]
+    nx0 = max(0, x0 - FURIGANA_MARGIN)
+    ny0 = max(0, y0 - FURIGANA_MARGIN)
+    nx1 = min(w, x1 + FURIGANA_MARGIN)
+    ny1 = min(h, y1 + FURIGANA_MARGIN)
+    if nx0 >= x0 and ny0 >= y0 and nx1 <= x1 and ny1 <= y1:
+        return x0, y0, x1, y1, cand
+    expand_w = nx1 - nx0
+    expand_h = ny1 - ny0
+    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY) if img.ndim == 3 else img
+    band = (gray[ny0:ny1, nx0:nx1] < 140).astype(np.uint8) * 255
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(band, 8)
+    new_cand = np.zeros((expand_h, expand_w), dtype=np.uint8)
+    # 主字已有的掩膜拷入新 bbox 左上(相对偏移)
+    ox, oy = x0 - nx0, y0 - ny0
+    new_cand[oy:oy + cand.shape[0], ox:ox + cand.shape[1]] = cand
+    for i in range(1, num):
+        bx, by, bw, bh, area = stats[i]
+        if (
+            FURIGANA_MARGIN - 1 <= bh <= _FURIGANA_MAX_H
+            and 1 <= bw <= _FURIGANA_MAX_W
+            and area <= _FURIGANA_MAX_AREA
+        ):
+            new_cand[by:by + bh, bx:bx + bw] = 255
+    return nx0, ny0, nx1, ny1, new_cand
 
 
 def _stroke_candidates(patch_gray: np.ndarray) -> Optional[np.ndarray]:

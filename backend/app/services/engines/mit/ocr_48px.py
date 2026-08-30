@@ -340,10 +340,14 @@ class OCR(nn.Module):
             for idx in finished_batch_indices:
                 batch_log_probs = new_log_probs[idx]
                 best = int(batch_log_probs.argmax())
+                # new_log_probs[idx] 是 beams_k*beams_k=25 个候选（每束×下一字符），`best` 在该范围内；
+                # 但 out_idx 经 top-k 裁剪后每批只剩 beams_k=5 行，直接用 `idx*beams_k+best` 会越界
+                # （大批次/长行时 finished_batch 提前命中，best>=beams_k 即崩）。
+                # 正确取未裁剪前的完整候选序列 new_out_idx[idx, best]，激活对应父束 best//beams_k。
                 finished_hypos[int(batch_index[beams_k * idx].item())] = (
-                    out_idx[idx * beams_k + best],
+                    new_out_idx[idx, best],
                     float(torch.exp(batch_log_probs[best]).item()),
-                    cached_activations[idx * beams_k + best],
+                    cached_activations[beams_k * idx + best // beams_k],
                 )
             remaining = [
                 i * beams_k + j

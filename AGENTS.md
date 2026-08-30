@@ -37,10 +37,10 @@
 - OCR 引擎自带检测（`supports_detection=True`）时，`pipeline.py` 跳过独立 detector，直接用 OCR 检测+识别。
 - OCR 结果按 `confidence >= 0.5` 且非空文本过滤噪声（`pipeline.py` 中 `regions = [r for r in regions if r.confidence >= 0.5 and r.text.strip()]`）。
 - **非气泡文字判定**（`bubble.py:classify_non_bubble`）：泛洪 bbox 为细长横条（w/h≥8 且高≤4%页高）或跨页宽横带（方向横且宽≥50%页宽且高≤5%页高）→ 判为刊头/拟声词等非气泡，标 `_no_erase`；`pipeline.py:drop_non_bubble_regions` 移出工作集（不擦除、不翻译、不渲染，原文保留），renderer 同跳过（双保险）。默认开启，不依赖旧 `is_ignore` 启发式（后者仅 config≥1 时 opt-in，且对贴字/彩色背景不可靠）。
-- **掩膜整块化**：`mask.py` 优先按文本多边形整块填充（`fillPoly` + 膨胀，零残留），无 poly 才回退 Otsu 笔画；结果覆盖 MIT 检测器预填充的紧致神经掩膜（后者偏紧会残留）。非气泡文字（刊头/拟声词）打 `_no_erase` 标记跳过擦除并整体移出翻译/渲染（原文保留）。
+- **掩膜整块化**：`mask.py` 优先按文本多边形整块填充（`fillPoly` + 膨胀），**并集 Otsu 笔画候选 + 7×7 膨胀**（poly 常偏紧、pad 缩进会漏掉笔画外缘 → 原文灰影残留）；bbox 以 box∩poly 并集为界。无 poly 才回退 Otsu 笔画。**注音扩展 `_add_furigana_margin`**：竖排汉字旁的小号 furigana 检测器常漏检 → 沿主字 bbox 外扩 16px 拾取带内小连通字形成分并擦除（`FURIGANA_MARGIN` 可调）。非气泡文字（刊头/拟声词）打 `_no_erase` 标记跳过擦除并整体移出翻译/渲染（原文保留）。
 - 渲染防丢字：`renderer.py` 逐组统计「文字像素 ∩ 气泡掩膜」覆盖率，<50% 回退矩形裁剪（防泛洪掩膜不可信时整段文字被裁掉）。
 - **分组防链式吞并**：`bubble.py:_balloon_ok` 要求合并后包围盒面积 ≤ 1.6×(两框面积和)——页眉横条/拟声词等细长区域的泛洪 bbox 若被近邻合并链式吞并整页会爆炸（跨页杂志实测 17 组并成 1 组导致整页巨字），膨胀校验阻断；渲染端 `_bubble_geometry` 另加绝对上限：泛洪结果不得超出 `group_bounds` 边长 15%，超限回退锚定矩形。
-- 排版均衡：竖排整块 `_balance_columns` 均衡切列（列长差 ≤1）、横排 `_wrap_text` 均衡断行。
+- 排版均衡：竖排整块 `_balance_columns` **按原文行序分配列**（整行成列、不按字数重切打散句读；行数超列数才相邻合并）、横排 `_wrap_text` 均衡断行。翻译提示词强调「严格保持原文换行/句子结构，行数顺序一致，不跨句硬断」（`translator.py:_system_prompt`/`_context_prompt`），配合排版保证句子不被拆列错。`_render_vertical_bubble_block` 整块按气泡分列、列组对称居中顶部对齐。
 
 ## MIT 引擎（移植自 manga-image-translator，GPL-3.0）
 

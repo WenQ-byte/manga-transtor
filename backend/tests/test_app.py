@@ -113,6 +113,40 @@ class TestMitEngines(unittest.TestCase):
         ocr.recognize(img, quads, prob_threshold=0.2)
         self.assertIsInstance(quads[0].text, str)
 
+    @unittest.skipUnless(
+        (_MIT_MODEL_DIR / "ocr" / "ocr_ar_48px.ckpt").exists(),
+        "ocr_ar_48px.ckpt 缺失，跳过",
+    )
+    def test_mit48_large_batch_no_crash(self):
+        """大批次束搜索越界回归：finished_batch 提前命中且 best>=beams_k 时不得 IndexError。
+
+        之前用 out_idx[idx*beams_k+best]（每批仅 beams_k 行）索引 25 候选，越界崩 →
+        MixedOCR 吞掉异常、整页只得 0 文字（实测一页 36 行 → IndexError: index 90
+        is out of bounds for dimension 0 with size 80）。回归用一张多行密集页 fixture，
+        断言识别不崩且至少识别出若干行。
+        """
+        from app.services.engines.mit.ocr_48px import Mit48Ocr
+        from app.services.engines.mit.quadrilateral import Quadrilateral
+
+        fixture = Path(__file__).resolve().parent / "fixtures" / "desert_many_lines.jpg"
+        if not fixture.exists():
+            self.skipTest("desert_many_lines.jpg 未随测试分发，跳过")
+        ocr = Mit48Ocr(device="cpu")
+        img = np.array(Image.open(fixture).convert("RGB"))
+        h, w = img.shape[:2]
+        # 生成一批竖排文本行 quads（覆盖整页，乱序行长短不一，能触发 finished 提前命中）
+        quads = []
+        cols = 28
+        for i in range(cols):
+            x0 = int(w * (0.03 + 0.92 * i / cols))
+            x1 = x0 + int(w * 0.022)
+            y1 = int(h * (0.03 + 0.94 * (i % 3) / 3))
+            pts = np.array([[x0, 20], [x1, 20], [x1, y1], [x0, y1]], dtype=np.float64)
+            quads.append(Quadrilateral(pts, "", 0.9))
+        ocr.recognize(img, quads, prob_threshold=0.2)
+        filled = sum(1 for q in quads if (q.text or "").strip())
+        self.assertGreater(filled, 0)
+
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
         self.image = make_test_image(Path(self.tmp) / "test.png")
@@ -541,6 +575,53 @@ class TestVerticalCropOrientation(unittest.TestCase):
         upright = cv2.rotate(raw, cv2.ROTATE_90_CLOCKWISE)    # manga-ocr 路径：转回竖直
         self.assertTrue(raw.shape[1] > raw.shape[0])          # 原始共享结果偏宽（旋转过）
         self.assertTrue(upright.shape[0] > upright.shape[1])  # manga-ocr 用竖直窄高
+
+
+class TestMaskCoverage(unittest.TestCase):
+    """擦除掩膜应覆盖区域内的全部暗像素（防原文灰影残留）"""
+
+    def test_region_mask_covers_dark_strokes(self):
+        import numpy as np
+
+        from app.services.engines.mask import build_region_mask
+        from app.services.pipeline import TextRegion
+
+        # 竖排一列假字（黑字），笔画紧贴 box 边缘——pad 缩进会把外缘笔画整块丢掉
+        img = np.full((300, 120, 3), 255, dtype=np.uint8)
+        for y in range(30, 270, 30):
+            img[y:y + 18, 42:82] = 0  # 笔画从 box 左缘 x=42 铺到右缘 x=82
+        box = [[40, 24], [84, 24], [84, 274], [40, 274]]
+        poly = [[46, 28], [78, 28], [78, 270], [46, 270]]
+        r = TextRegion(box=box, text="仮", poly=poly)
+        res = build_region_mask(img, r, pad=2)
+        self.assertIsNotNone(res)
+        x0, y0, x1, y1, patch = res
+        # 以完整 box 为评估区（放大 2px 边带），掩膜应包住所有暗像素，不残留
+        cbx0, cby0, cbx1, cby1 = 38, 22, 86, 276
+        cover_region = img[cby0:cby1, cbx0:cbx1]
+        dark = (cover_region.mean(axis=2) < 120)
+        if not dark.any():
+            self.skipTest("无暗像素可测")
+        # 把 mask 对齐到同一个全局坐标
+        mask_full = np.zeros((img.shape[0], img.shape[1]), dtype=np.uint8)
+        mask_full[y0:y1, x0:x1] = patch
+        sub = mask_full[cby0:cby1, cbx0:cbx1] > 0
+        cov = float((sub & dark).sum()) / float(dark.sum())
+        self.assertGreaterEqual(cov, 0.95, f"掩膜只覆盖了 {cov:.2%} 暗像素，会残留原文")
+
+
+class TestVerticalColumnOrder(unittest.TestCase):
+    """竖排整块应按原文行序分配列，不按字数重切打散句读"""
+
+    def test_columns_preserve_line_order(self):
+        from app.services.engines.renderer import PILRenderer
+
+        r = PILRenderer.__new__(PILRenderer)
+        lines = ["因为你总是那样想", "所以没人能理解你", "一旦认定了", "就是这样", "从小时候起"]
+        # 足够大的可用高度，让每行都能独立成列（列数=行数）
+        cols = r._balance_columns(lines, sum(len(l) for l in lines), avail_h=10000, char_h=30)
+        self.assertIsNotNone(cols)
+        self.assertEqual(cols, lines, "竖排列应保持原文行序，不应按字数切碎")
 
 
 if __name__ == "__main__":
