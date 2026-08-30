@@ -38,6 +38,7 @@
 - OCR 结果按 `confidence >= 0.5` 且非空文本过滤噪声（`pipeline.py` 中 `regions = [r for r in regions if r.confidence >= 0.5 and r.text.strip()]`）。
 - **掩膜整块化**：`mask.py` 优先按文本多边形整块填充（`fillPoly` + 膨胀，零残留），无 poly 才回退 Otsu 笔画；结果覆盖 MIT 检测器预填充的紧致神经掩膜（后者偏紧会残留）。`mit_ignore_bubble` 判定的 region 打 `_no_erase` 标记跳过擦除。
 - 渲染防丢字：`renderer.py` 逐组统计「文字像素 ∩ 气泡掩膜」覆盖率，<50% 回退矩形裁剪（防泛洪掩膜不可信时整段文字被裁掉）。
+- **分组防链式吞并**：`bubble.py:_balloon_ok` 要求合并后包围盒面积 ≤ 1.6×(两框面积和)——页眉横条/拟声词等细长区域的泛洪 bbox 若被近邻合并链式吞并整页会爆炸（跨页杂志实测 17 组并成 1 组导致整页巨字），膨胀校验阻断；渲染端 `_bubble_geometry` 另加绝对上限：泛洪结果不得超出 `group_bounds` 边长 15%，超限回退锚定矩形。
 - 排版均衡：竖排整块 `_balance_columns` 均衡切列（列长差 ≤1）、横排 `_wrap_text` 均衡断行。
 
 ## MIT 引擎（移植自 manga-image-translator，GPL-3.0）

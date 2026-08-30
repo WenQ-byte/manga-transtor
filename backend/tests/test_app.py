@@ -408,5 +408,72 @@ class TestDeepSeekPrompt(unittest.TestCase):
         self.assertEqual(parse("译文：<1>好</1><2>行</2> 以上", 2), ["好", "行"])
 
 
+class TestBubbleGroupMergeBalloon(unittest.TestCase):
+    """页眉横幅等细长组的并集膨胀不应链式吞并整页气泡（跨页杂志页实测 bug）"""
+
+    def test_wide_strip_does_not_swallow_adjacent_bubbles(self):
+        from app.services.engines.bubble import _merge_overlap_groups
+
+        groups = [
+            {"bbox": (26, 15, 985, 69), "regions": ["banner"]},
+            {"bbox": (6, 38, 110, 276), "regions": ["a1"]},
+            {"bbox": (148, 40, 285, 348), "regions": ["b1"]},
+            {"bbox": (763, 36, 843, 340), "regions": ["c1"]},
+        ]
+        out = _merge_overlap_groups(groups)
+        self.assertEqual(len(out), 4)
+
+    def test_same_bubble_columns_still_merge(self):
+        from app.services.engines.bubble import _merge_overlap_groups
+
+        groups = [
+            {"bbox": (764, 309, 829, 796), "regions": ["col1"]},
+            {"bbox": (805, 317, 880, 759), "regions": ["col2"]},
+        ]
+        out = _merge_overlap_groups(groups)
+        self.assertEqual(len(out), 1)
+
+
+class TestBubbleGeometryLeakCap(unittest.TestCase):
+    """泛洪掩膜超出组气泡包围盒太多即判泄漏，回退锚定矩形（防整页巨字）"""
+
+    def _make_region(self):
+        from app.services.pipeline import TextRegion
+
+        r = TextRegion(box=[[50, 50], [190, 50], [190, 290], [50, 290]], text="x", direction="v")
+        r.group_bounds = (40, 40, 200, 300)
+        return r
+
+    def test_rejects_mask_beyond_group_bounds(self):
+        import numpy as np
+        from unittest import mock
+
+        from app.services.engines.renderer import PILRenderer
+
+        r = self._make_region()
+        mask = np.zeros((1000, 1000), np.uint8)
+        mask[:150, :] = 255  # 150k px，通过 6× 面积校验但 bbox 远超 group_bounds
+        fake = lambda *a, **k: ((0, 0, 1000, 1000), mask)
+        with mock.patch("app.services.engines.bubble.bubble_with_mask", fake):
+            bb, out = PILRenderer()._bubble_geometry(np.zeros((1000, 1000, 3), np.uint8), [r], 1000, 1000)
+        self.assertIsNone(out)
+        self.assertLessEqual(bb[2], 190 + int(140 * 0.35) + 1)
+
+    def test_accepts_mask_within_group_bounds(self):
+        import numpy as np
+        from unittest import mock
+
+        from app.services.engines.renderer import PILRenderer
+
+        r = self._make_region()
+        mask = np.zeros((1000, 1000), np.uint8)
+        mask[40:300, 40:200] = 255
+        fake = lambda *a, **k: ((40, 40, 200, 300), mask)
+        with mock.patch("app.services.engines.bubble.bubble_with_mask", fake):
+            bb, out = PILRenderer()._bubble_geometry(np.zeros((1000, 1000, 3), np.uint8), [r], 1000, 1000)
+        self.assertIsNotNone(out)
+        self.assertEqual(bb, (40, 40, 200, 300))
+
+
 if __name__ == "__main__":
     unittest.main()

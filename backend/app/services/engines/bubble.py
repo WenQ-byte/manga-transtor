@@ -180,7 +180,7 @@ def group_regions_by_bubble(bgr, regions: list[TextRegion], img_w, img_h, overla
             ov = _overlap_ratio(bb, g["bbox"])
             if ov > best_ov:
                 best_ov, best_idx = ov, i
-        if best_idx >= 0 and best_ov > overlap:
+        if best_idx >= 0 and best_ov > overlap and _balloon_ok(bb, groups[best_idx]["bbox"]):
             groups[best_idx]["bbox"] = _union(bb, groups[best_idx]["bbox"])
             groups[best_idx]["regions"].append(region)
         else:
@@ -313,6 +313,19 @@ def _proximity_overlap(a, b) -> bool:
     return _overlap_ratio(ea, eb) > 0.15 or _contains(ea, eb) or _contains(eb, ea)
 
 
+# 并集膨胀上限：合并后包围盒面积超过两框面积和该倍数说明是"桥接"（如页眉横条吞并远处气泡）
+MERGE_BALLOON_RATIO = 1.6
+
+
+def _balloon_ok(a, b) -> bool:
+    """合并防链式吞并：合法同气泡合并的并集 ≈ 两框之和，桥接合并的并集含大片空白会暴涨"""
+    aa = max(1, (a[2] - a[0]) * (a[3] - a[1]))
+    ab = max(1, (b[2] - b[0]) * (b[3] - b[1]))
+    u = _union(a, b)
+    ua = max(1, (u[2] - u[0]) * (u[3] - u[1]))
+    return ua <= MERGE_BALLOON_RATIO * (aa + ab)
+
+
 def _merge_overlap_groups(groups, overlap=0.15):
     changed = True
     while changed:
@@ -322,7 +335,7 @@ def _merge_overlap_groups(groups, overlap=0.15):
             j = i + 1
             while j < len(groups):
                 a, b = groups[i]["bbox"], groups[j]["bbox"]
-                if (
+                if _balloon_ok(a, b) and (
                     _overlap_ratio(a, b) > overlap
                     or _contains(a, b)
                     or _contains(b, a)

@@ -178,6 +178,17 @@ class PILRenderer(BaseRenderer):
         tb_area = max(1, (x1 - x0) * (y1 - y0))
         if int((mask > 0).sum()) > tb_area * 6:
             return anchored()
+        # 绝对上限：泛洪结果不得远超分组已知的气泡包围盒（防大组泛洪泄漏到整页背景）
+        gb = next((r.group_bounds for r in group_regions if r.group_bounds), None)
+        if gb is not None:
+            margin = 0.15 * max(gb[2] - gb[0], gb[3] - gb[1])
+            if (
+                bb[0] < gb[0] - margin
+                or bb[1] < gb[1] - margin
+                or bb[2] > gb[2] + margin
+                or bb[3] > gb[3] + margin
+            ):
+                return anchored()
         for r in group_regions:
             m = r.mask
             if not m or "patch" not in m or "bbox" not in m:
