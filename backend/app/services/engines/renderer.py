@@ -170,7 +170,14 @@ class PILRenderer(BaseRenderer):
         y1 = max(r.bounds[3] for r in group_regions)
 
         def anchored():
-            return self._fallback_box(x0, y0, x1, y1, img_w, img_h), None
+            # 掩膜不可用/不可信时：以本组文本框的紧致包围盒（必然在气泡内）作为布局与裁剪框。
+            # 不可用向外扩展的备用框——否则译文填满超框的矩形会溢出到气泡外的版面（文字压在脸上/头发上）。
+            # 裁掉极细边带防文字贴边被截断。
+            ix0 = max(0, x0 + 1)
+            iy0 = max(0, y0 + 1)
+            ix1 = min(img_w, x1 - 1)
+            iy1 = min(img_h, y1 - 1)
+            return (ix0, iy0, ix1, iy1), None
 
         bb, mask = bubble_with_mask(bgr, (x0, y0, x1, y1), img_w, img_h)
         if mask is None or not mask.any():
