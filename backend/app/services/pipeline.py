@@ -58,6 +58,16 @@ def drop_non_bubble_regions(regions: list[TextRegion]) -> list[TextRegion]:
     return [r for r in regions if not getattr(r, "_no_erase", False)]
 
 
+def preserve_latin_label(region: TextRegion, source_lang: LangCode) -> bool:
+    """日语漫画中的高比例拉丁文本通常是歌名、艺名或装饰字，默认保留原文。"""
+    lang = getattr(source_lang, "value", source_lang)
+    if lang != "ja":
+        return False
+    chars = [c for c in (region.text or "") if not c.isspace()]
+    latin = [c for c in chars if c.isascii() and (c.isalpha() or c.isdigit() or c in "-'&")]
+    return len(latin) >= 4 and len(latin) / max(1, len(chars)) >= 0.7
+
+
 @dataclass
 class PipelineResult:
     """流水线执行结果"""
@@ -167,7 +177,7 @@ class TranslationPipeline:
         bgr0 = img0[:, :, ::-1].copy()
         h0, w0 = bgr0.shape[:2]
         for r in text_regions:
-            if classify_non_bubble(bgr0, r, w0, h0):
+            if preserve_latin_label(r, source_lang) or classify_non_bubble(bgr0, r, w0, h0):
                 r._no_erase = True
         text_regions = drop_non_bubble_regions(text_regions)
         erase_regions = text_regions + erase_only_regions

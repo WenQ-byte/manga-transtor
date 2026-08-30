@@ -603,6 +603,22 @@ class TestNonBubbleClassify(unittest.TestCase):
         out = drop_non_bubble_regions([a, b])
         self.assertEqual([r.text for r in out], ["a"])
 
+    def test_preserve_latin_label_on_japanese_page(self):
+        from app.services.pipeline import TextRegion, preserve_latin_label
+
+        label = TextRegion(
+            box=[[0, 0], [100, 0], [100, 20], [0, 20]],
+            text="ASIAN KUNG-FU GENERATION",
+        )
+        self.assertTrue(preserve_latin_label(label, "ja"))
+        self.assertFalse(preserve_latin_label(label, "en"))
+
+    def test_japanese_dialogue_is_not_latin_label(self):
+        from app.services.pipeline import TextRegion, preserve_latin_label
+
+        region = TextRegion(box=[[0, 0], [40, 0], [40, 40], [0, 40]], text="メール読まれてよかったね")
+        self.assertFalse(preserve_latin_label(region, "ja"))
+
 
 class TestMixedOcrMixing(unittest.TestCase):
     """manga-ocr 只救空行：mit48 已读出内容（即使低置信）不交给 manga-ocr 覆盖成乱码"""

@@ -136,7 +136,8 @@ def build_region_mask(img: np.ndarray, region: TextRegion, pad: int = 2) -> Opti
             cand = padded
         # 注音扩展：竖排汉字旁常印小号假名（furigana），检测器往往漏检，若不擦除会原文灰影残留。
         # 沿主字 bbox 上下/左右各扩 FURIGANA_MARGIN，并仅拾取带内的小连通字形成分（避免误伤大结构）。
-        x0, y0, x1, y1, cand = _add_furigana_margin(img, x0, y0, x1, y1, cand)
+        if not complex_bg:
+            x0, y0, x1, y1, cand = _add_furigana_margin(img, x0, y0, x1, y1, cand)
         return (x0, y0, x1, y1, cand)
 
     # 无 poly 兜底：Otsu 笔画候选（仅 box），并剔除疑似气泡边框的大连通组件
@@ -171,7 +172,8 @@ def _complex_background(patch_gray: np.ndarray) -> bool:
     ).astype(np.float32)
     median = float(np.median(border))
     mad = float(np.median(np.abs(border - median)))
-    return float(border.std()) > 24.0 and mad > 8.0
+    midtone_ratio = float(((patch_gray > 110) & (patch_gray < 230)).mean())
+    return midtone_ratio > 0.20 and float(border.std()) > 24.0 and mad > 8.0
 
 
 def _fill_poly(region: TextRegion, x0: int, y0: int, x1: int, y1: int) -> Optional[np.ndarray]:
@@ -229,7 +231,7 @@ def _add_furigana_margin(img, x0, y0, x1, y1, cand):
     for i in range(1, num):
         bx, by, bw, bh, area = stats[i]
         if (
-            FURIGANA_MARGIN - 1 <= bh <= _FURIGANA_MAX_H
+            2 <= bh <= _FURIGANA_MAX_H
             and 1 <= bw <= _FURIGANA_MAX_W
             and area <= _FURIGANA_MAX_AREA
         ):
