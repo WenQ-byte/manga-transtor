@@ -1,11 +1,6 @@
 """翻译引擎：支持多种后端 + 自动降级回退链
 
-后端优先级（可配置 translator_backend）：
-  1. deepseek  - 深度求索 API（漫画口语最自然，需要 MANGA_DEEPSEEK_API_KEY）
-  2. google    - translate.googleapis.com（免费，质量一般）
-  3. mymemory  - api.mymemory.translated.net（备用免费接口）
-  4. deepl     - 需要 MANGA_DEEPL_AUTH_KEY（口语翻译较差）
-  5. openai    - 需要 MANGA_OPENAI_API_KEY
+后端优先级（可配置 translator_backend）：配置后端 → 其他已配置高质量后端 → 免费后端。
 
 任意后端失败时自动回退到下一个可用后端，全部失败则返回原文
 （专有名词词典替换始终生效）。
@@ -374,7 +369,7 @@ class OpenAITranslator(BaseRemoteTranslator):
 class SmartTranslator(BaseTranslator):
     """智能翻译器：按配置选择后端，失败时自动回退
 
-    回退链顺序：配置后端 → google → mymemory → 原文
+    回退链顺序：配置后端 → 其他已配置高质量后端 → google → mymemory → 原文
     """
 
     name = "smart"
@@ -383,31 +378,26 @@ class SmartTranslator(BaseTranslator):
         self.settings = get_settings()
         self._backends: list[BaseRemoteTranslator] = []
         self._available: Optional[BaseRemoteTranslator] = None
+        self.last_backend_names: list[str] = []
+        self.last_failures: list[str] = []
+        self._last_backend_name = ""
         self._build_chain()
 
     def _build_chain(self) -> None:
         s = self.settings
         preferred = s.translator_backend
 
-        # 配置的后端优先
-        if preferred == "deepseek" and s.deepseek_api_key:
-            self._backends.append(DeepSeekTranslator())
-        elif preferred == "deepl" and s.deepl_auth_key:
-            self._backends.append(DeepLTranslator())
-        elif preferred == "openai" and s.openai_api_key:
-            self._backends.append(OpenAITranslator())
-
-        # 免费后端（google 为主，mymemory 备选）
-        self._backends.append(GoogleTranslator())
-        self._backends.append(MyMemoryTranslator())
-
-        # 有 key 的付费后端作为补充
-        if preferred != "deepseek" and s.deepseek_api_key:
-            self._backends.append(DeepSeekTranslator())
-        if preferred != "deepl" and s.deepl_auth_key:
-            self._backends.append(DeepLTranslator())
-        if preferred != "openai" and s.openai_api_key:
-            self._backends.append(OpenAITranslator())
+        configured = {
+            "deepseek": (bool(s.deepseek_api_key), DeepSeekTranslator),
+            "openai": (bool(s.openai_api_key), OpenAITranslator),
+            "deepl": (bool(s.deepl_auth_key), DeepLTranslator),
+        }
+        order = [preferred] + [name for name in ("deepseek", "openai", "deepl") if name != preferred]
+        for name in order:
+            item = configured.get(name)
+            if item and item[0]:
+                self._backends.append(item[1]())
+        self._backends.extend([GoogleTranslator(), MyMemoryTranslator()])
 
     @staticmethod
     def _apply_glossary(text: str, glossary) -> str:
@@ -423,12 +413,15 @@ class SmartTranslator(BaseTranslator):
         return text
 
     def translate_batch(self, texts, source_lang, target_lang, glossary=None, progress_cb=None):
+        self.last_backend_names = []
+        self.last_failures = []
         # 找出第一个可用的后端（发送探针，结果缓存）
         if self._available is None:
             self._available = self._find_available(source_lang, target_lang)
         backend = self._available
         if backend is None:
             # 全部失败：仅应用词典
+            self.last_backend_names = ["glossary"] * len(texts)
             return self._apply_glossary_only(texts, glossary)
 
         use_prompt = getattr(backend, "prompt_glossary", False)
@@ -441,10 +434,12 @@ class SmartTranslator(BaseTranslator):
                     srcs, source_lang, target_lang, glossary=glossary if use_prompt else None
                 )
                 if out and len(out) == len(srcs):
+                    self.last_backend_names = [getattr(backend, "name", type(backend).__name__)] * len(srcs)
                     if progress_cb:
                         progress_cb(1.0)
                     return out
             except Exception as e:  # noqa: BLE001
+                self.last_failures.append(f"{getattr(backend, 'name', 'unknown')}: {e}")
                 print(f"[translator] 批量翻译失败，逐条回退: {e}")
             # 批量失败 → 落到下面的逐条回退链
 
@@ -456,6 +451,7 @@ class SmartTranslator(BaseTranslator):
                 src, source_lang, target_lang, backend, glossary=glossary if use_prompt else None
             )
             out.append(result)
+            self.last_backend_names.append(self._last_backend_name or "original")
             if progress_cb and total:
                 progress_cb((i + 1) / total)
         # 整批全部失败（输出等于原文）→ 清除缓存的后端，下次任务重新探测
@@ -467,6 +463,7 @@ class SmartTranslator(BaseTranslator):
         ordered = [primary] + [b for b in self._backends if b is not primary]
         for backend in ordered:
             if not text.strip():
+                self._last_backend_name = "keep"
                 return text
             try:
                 if getattr(backend, "prompt_glossary", False):
@@ -475,15 +472,18 @@ class SmartTranslator(BaseTranslator):
                     src = self._apply_glossary(text, glossary) if glossary else text
                     result = backend.translate_one(src, source, target)
                 if result:
+                    self._last_backend_name = getattr(backend, "name", type(backend).__name__)
                     return result
-            except Exception:
+            except Exception as e:
+                self.last_failures.append(f"{getattr(backend, 'name', 'unknown')}: {e}")
                 continue
+        self._last_backend_name = "original"
         return text
 
     def _find_available(self, source, target):
         for backend in self._backends:
             try:
-                probe = "hello" if source != "zh" else "你好"
+                probe = {"ja": "こんにちは", "en": "hello", "zh": "你好"}.get(source, "hello")
                 result = backend.translate_one(probe, source, target)
                 if result:
                     return backend

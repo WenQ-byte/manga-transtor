@@ -93,8 +93,66 @@ class LaMaInpainter(BaseInpainter):
             # 理论上 create_inpainter 不会返回不可用的 lama，这里兜底
             return self._save_temp(img)
 
-        result = self._infer(img, mask)
+        from app.services.engines.inpainter import CVInpainter
+
+        cv_inpainter = CVInpainter()
+        result = img.copy()
+        flat_mask = cv_inpainter._flat_background_mask(img, regions)
+        flat_body = cv2.erode(flat_mask, np.ones((3, 3), np.uint8), iterations=1)
+        cv_inpainter._fill_with_row_bg(result, flat_body, prefer_bright=True)
+        neural_mask = cv2.bitwise_and(mask, cv2.bitwise_not(flat_body))
+        if neural_mask.any():
+            result = self._infer_by_crops(result, neural_mask)
+        result = cv_inpainter._second_pass_residual(result, regions)
         return self._save_temp(result)
+
+    def _infer_by_crops(self, image: np.ndarray, mask: np.ndarray) -> np.ndarray:
+        result = image.copy()
+        boxes = self._mask_crop_boxes(mask)
+        if not boxes:
+            return result
+
+        page_area = image.shape[0] * image.shape[1]
+        crop_area = sum((x1 - x0) * (y1 - y0) for x0, y0, x1, y1 in boxes)
+        if crop_area >= page_area * 0.85:
+            return self._infer(image, mask)
+
+        for x0, y0, x1, y1 in boxes:
+            crop_mask = mask[y0:y1, x0:x1]
+            if not crop_mask.any():
+                continue
+            crop = result[y0:y1, x0:x1]
+            result[y0:y1, x0:x1] = self._infer(crop, crop_mask)
+        return result
+
+    @staticmethod
+    def _mask_crop_boxes(
+        mask: np.ndarray,
+        merge_gap: int = 14,
+        context: int = 40,
+    ) -> list[tuple[int, int, int, int]]:
+        import cv2
+
+        binary = (mask > 0).astype(np.uint8)
+        if not binary.any():
+            return []
+
+        kernel_size = merge_gap * 2 + 1
+        merged = cv2.dilate(
+            binary,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_size, kernel_size)),
+        )
+        count, _, stats, _ = cv2.connectedComponentsWithStats(merged, connectivity=8)
+        height, width = binary.shape[:2]
+        boxes: list[tuple[int, int, int, int]] = []
+        for label in range(1, count):
+            x, y, w, h, _ = stats[label]
+            x0 = max(0, int(x) - context)
+            y0 = max(0, int(y) - context)
+            x1 = min(width, int(x + w) + context)
+            y1 = min(height, int(y + h) + context)
+            boxes.append((x0, y0, x1, y1))
+        return boxes
 
     def _infer(self, image: np.ndarray, mask: np.ndarray) -> np.ndarray:
         import cv2

@@ -137,7 +137,9 @@ def build_region_mask(img: np.ndarray, region: TextRegion, pad: int = 2) -> Opti
         # 注音扩展：竖排汉字旁常印小号假名（furigana），检测器往往漏检，若不擦除会原文灰影残留。
         # 沿主字 bbox 上下/左右各扩 FURIGANA_MARGIN，并仅拾取带内的小连通字形成分（避免误伤大结构）。
         if not complex_bg:
-            x0, y0, x1, y1, cand = _add_furigana_margin(img, x0, y0, x1, y1, cand)
+            x0, y0, x1, y1, cand = _add_furigana_margin(
+                img, x0, y0, x1, y1, cand, region.direction
+            )
         return (x0, y0, x1, y1, cand)
 
     # 无 poly 兜底：Otsu 笔画候选（仅 box），并剔除疑似气泡边框的大连通组件
@@ -159,21 +161,18 @@ def build_region_mask(img: np.ndarray, region: TextRegion, pad: int = 2) -> Opti
 
 
 def _complex_background(patch_gray: np.ndarray) -> bool:
-    """根据文字框边带判断是否为网点、烟花等复杂底纹。"""
+    """按亮背景中的边缘密度判断网点、烟花等复杂底纹，排除黑字本身的影响。"""
     if patch_gray.size == 0 or min(patch_gray.shape) < 4:
         return False
-    border = np.concatenate(
-        [
-            patch_gray[:2].reshape(-1),
-            patch_gray[-2:].reshape(-1),
-            patch_gray[:, :2].reshape(-1),
-            patch_gray[:, -2:].reshape(-1),
-        ]
-    ).astype(np.float32)
-    median = float(np.median(border))
-    mad = float(np.median(np.abs(border - median)))
+    import cv2
+
+    gx = cv2.Sobel(patch_gray, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(patch_gray, cv2.CV_32F, 0, 1, ksize=3)
+    grad = cv2.magnitude(gx, gy)
+    bright = patch_gray > 180
+    edge_density = float((grad[bright] > 80).mean()) if bright.any() else 0.0
     midtone_ratio = float(((patch_gray > 110) & (patch_gray < 230)).mean())
-    return midtone_ratio > 0.20 and float(border.std()) > 24.0 and mad > 8.0
+    return edge_density > 0.62 or (edge_density > 0.52 and midtone_ratio > 0.38)
 
 
 def _fill_poly(region: TextRegion, x0: int, y0: int, x1: int, y1: int) -> Optional[np.ndarray]:
@@ -199,12 +198,12 @@ def _fill_poly(region: TextRegion, x0: int, y0: int, x1: int, y1: int) -> Option
 # 注音（furigana）扩展带：主字 bbox 外扩该距离，拾取带内小字形成分
 FURIGANA_MARGIN = 16
 # 注音字形尺寸上限（px）：高 ≤ 该值、宽 ≤ 该值且面积 ≤ 该上限
-_FURIGANA_MAX_H = 16
+_FURIGANA_MAX_H = 20
 _FURIGANA_MAX_W = 18
-_FURIGANA_MAX_AREA = 260
+_FURIGANA_MAX_AREA = 360
 
 
-def _add_furigana_margin(img, x0, y0, x1, y1, cand):
+def _add_furigana_margin(img, x0, y0, x1, y1, cand, direction=None):
     """沿主字 bbox 外扩 FURIGANA_MARGIN，把带内小连通字形成分（注音）并入掩膜。
 
     只拾取尺寸/面积达标的紧凑成分，不误伤旁侧大结构（面板/网点/人物）。
@@ -217,6 +216,10 @@ def _add_furigana_margin(img, x0, y0, x1, y1, cand):
     ny0 = max(0, y0 - FURIGANA_MARGIN)
     nx1 = min(w, x1 + FURIGANA_MARGIN)
     ny1 = min(h, y1 + FURIGANA_MARGIN)
+    if direction == "v":
+        ny0, ny1 = y0, y1
+    elif direction == "h":
+        nx0, nx1 = x0, x1
     if nx0 >= x0 and ny0 >= y0 and nx1 <= x1 and ny1 <= y1:
         return x0, y0, x1, y1, cand
     expand_w = nx1 - nx0
@@ -230,8 +233,15 @@ def _add_furigana_margin(img, x0, y0, x1, y1, cand):
     new_cand[oy:oy + cand.shape[0], ox:ox + cand.shape[1]] = cand
     for i in range(1, num):
         bx, by, bw, bh, area = stats[i]
+        touches_outer = (
+            bx <= 1
+            or by <= 1
+            or bx + bw >= expand_w - 1
+            or by + bh >= expand_h - 1
+        )
         if (
-            2 <= bh <= _FURIGANA_MAX_H
+            not touches_outer
+            and 2 <= bh <= _FURIGANA_MAX_H
             and 1 <= bw <= _FURIGANA_MAX_W
             and area <= _FURIGANA_MAX_AREA
         ):

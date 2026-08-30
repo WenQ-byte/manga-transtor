@@ -575,6 +575,45 @@ class TestChineseBlockLayout(unittest.TestCase):
 
         self.assertEqual(PILRenderer._layout_block_text("one\ntwo", "en"), "one\ntwo")
 
+    def test_vertical_columns_avoid_splitting_common_words(self):
+        from app.services.engines.renderer import PILRenderer
+
+        columns = PILRenderer._split_semantic_columns("已经没有什么祖先的土地了所以必须离开", 6)
+        boundaries = {a[-1] + b[0] for a, b in zip(columns, columns[1:])}
+        self.assertNotIn("祖先", boundaries)
+        self.assertNotIn("土地", boundaries)
+        self.assertNotIn("所以", boundaries)
+        self.assertNotIn("必须", boundaries)
+
+    def test_vertical_columns_keep_closing_punctuation_with_previous_text(self):
+        from app.services.engines.renderer import PILRenderer
+
+        columns = PILRenderer._split_semantic_columns("这是第一句话，但是还没有说完。", 6)
+        self.assertTrue(all(not col.startswith(("，", "。")) for col in columns))
+
+
+class TestTranslationQualityGate(unittest.TestCase):
+    def test_flags_free_fallback_and_short_translation(self):
+        from app.services.pipeline import assess_translation_quality
+
+        warnings = assess_translation_quality(
+            "もう祖先の土地なんてないんだ", "土地", "ja", "zh", "google"
+        )
+        self.assertTrue(any("回退后端" in item for item in warnings))
+        self.assertTrue(any("明显过短" in item for item in warnings))
+
+    def test_flags_japanese_left_in_chinese_translation(self):
+        from app.services.pipeline import assess_translation_quality
+
+        warnings = assess_translation_quality("これはテストです", "这是テストです", "ja", "zh", "deepseek")
+        self.assertTrue(any("仍含较多日文" in item for item in warnings))
+
+    def test_mit_uses_separate_translation_and_erase_thresholds(self):
+        from app.services.pipeline import ocr_thresholds
+
+        self.assertEqual(ocr_thresholds("mit48"), (0.20, 0.0))
+        self.assertEqual(ocr_thresholds("paddle"), (0.50, 0.50))
+
 
 class TestNonBubbleClassify(unittest.TestCase):
     """非气泡文字（刊头横条/跨页横带）几何判定 → 保留原文不翻译"""
@@ -693,6 +732,44 @@ class TestMaskCoverage(unittest.TestCase):
         self.assertGreaterEqual(cov, 0.95, f"掩膜只覆盖了 {cov:.2%} 暗像素，会残留原文")
 
 
+class TestBackgroundComplexity(unittest.TestCase):
+    def test_black_text_on_white_is_not_mistaken_for_texture(self):
+        import numpy as np
+
+        from app.services.engines.mask import _complex_background
+
+        patch = np.full((180, 32), 255, np.uint8)
+        for y in range(8, 172, 22):
+            patch[y:y + 12, 7:25] = 0
+
+        self.assertFalse(_complex_background(patch))
+
+    def test_dense_screentone_is_complex_background(self):
+        import numpy as np
+
+        from app.services.engines.mask import _complex_background
+
+        yy, xx = np.indices((80, 80))
+        patch = np.where((xx + yy) % 4 < 2, 245, 100).astype(np.uint8)
+
+        self.assertTrue(_complex_background(patch))
+
+    def test_vertical_furigana_margin_only_expands_sideways(self):
+        import numpy as np
+
+        from app.services.engines.mask import _add_furigana_margin
+
+        image = np.full((100, 100, 3), 255, np.uint8)
+        candidate = np.full((40, 20), 255, np.uint8)
+        x0, y0, x1, y1, _ = _add_furigana_margin(
+            image, 40, 30, 60, 70, candidate, "v"
+        )
+
+        self.assertLess(x0, 40)
+        self.assertGreater(x1, 60)
+        self.assertEqual((y0, y1), (30, 70))
+
+
 class TestCVInpainter(unittest.TestCase):
     def test_row_fill_uses_local_bright_background(self):
         import numpy as np
@@ -710,6 +787,129 @@ class TestCVInpainter(unittest.TestCase):
 
         self.assertLess(img[0, 3].mean(), 80)
         self.assertGreater(img[0, 24].mean(), 180)
+
+    def test_second_pass_removes_gray_residual_inside_known_mask(self):
+        import numpy as np
+
+        from app.services.engines.inpainter import CVInpainter
+        from app.services.pipeline import TextRegion
+
+        img = np.full((50, 50, 3), 255, np.uint8)
+        img[20:23, 20:30] = 150
+        patch = np.zeros((24, 24), np.uint8)
+        patch[8:13, 8:20] = 255
+        region = TextRegion(box=[[10, 10], [34, 10], [34, 34], [10, 34]], text="字")
+        region.mask = {"bbox": (10, 10, 34, 34), "patch": patch}
+        cleaned = CVInpainter()._second_pass_residual(img, [region])
+        self.assertGreater(float(cleaned[20:23, 20:30].mean()), 200.0)
+
+    def test_white_bubble_is_selected_for_local_background_fill(self):
+        import numpy as np
+
+        from app.services.engines.inpainter import CVInpainter
+        from app.services.pipeline import TextRegion
+
+        img = np.full((60, 60, 3), 255, np.uint8)
+        img[20:40, 28:32] = 0
+        patch = np.zeros((30, 20), np.uint8)
+        patch[5:25, 7:13] = 255
+        region = TextRegion(box=[[20, 15], [40, 15], [40, 45], [20, 45]], text="字")
+        region.mask = {"bbox": (20, 15, 40, 45), "patch": patch}
+        flat = CVInpainter()._flat_background_mask(img, [region])
+        self.assertGreater(int((flat > 0).sum()), 0)
+
+    def test_flat_fill_excludes_detector_mask_outside_text_polygon(self):
+        import numpy as np
+
+        from app.services.engines.inpainter import CVInpainter
+        from app.services.pipeline import TextRegion
+
+        img = np.full((60, 60, 3), 255, np.uint8)
+        patch = np.zeros((30, 30), np.uint8)
+        patch[3:27, 3:27] = 255
+        region = TextRegion(
+            box=[[22, 22], [38, 22], [38, 38], [22, 38]],
+            poly=[[22, 22], [38, 22], [38, 38], [22, 38]],
+            text="字",
+        )
+        region.mask = {"bbox": (15, 15, 45, 45), "patch": patch}
+
+        flat = CVInpainter()._flat_background_mask(img, [region])
+
+        self.assertEqual(int(flat[18, 18]), 0)
+        self.assertEqual(int(flat[30, 30]), 255)
+
+
+class TestLaMaInpainter(unittest.TestCase):
+    def test_crop_boxes_merge_nearby_text_and_separate_distant_bubbles(self):
+        import numpy as np
+
+        from app.services.engines.lama import LaMaInpainter
+
+        mask = np.zeros((300, 400), np.uint8)
+        mask[40:70, 40:70] = 255
+        mask[80:110, 45:75] = 255
+        mask[210:240, 310:340] = 255
+
+        boxes = LaMaInpainter._mask_crop_boxes(mask, merge_gap=10, context=8)
+
+        self.assertEqual(len(boxes), 2)
+        self.assertTrue(any(x0 <= 40 and y0 <= 40 and x1 >= 75 and y1 >= 110 for x0, y0, x1, y1 in boxes))
+
+    def test_crop_inference_does_not_downscale_sparse_full_page(self):
+        import numpy as np
+
+        from app.services.engines.lama import LaMaInpainter
+
+        engine = LaMaInpainter.__new__(LaMaInpainter)
+        seen = []
+
+        def fake_infer(image, mask):
+            seen.append(image.shape[:2])
+            out = image.copy()
+            out[mask > 0] = 255
+            return out
+
+        engine._infer = fake_infer
+        image = np.zeros((1200, 1600, 3), np.uint8)
+        mask = np.zeros((1200, 1600), np.uint8)
+        mask[100:180, 100:180] = 255
+        mask[900:980, 1300:1380] = 255
+
+        result = engine._infer_by_crops(image, mask)
+
+        self.assertEqual(len(seen), 2)
+        self.assertTrue(all(h < 300 and w < 300 for h, w in seen))
+        self.assertTrue((result[mask > 0] == 255).all())
+
+    def test_lama_runs_residual_cleanup_after_neural_inference(self):
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+
+        import numpy as np
+        from PIL import Image
+
+        from app.services.engines.lama import LaMaInpainter
+        from app.services.pipeline import TextRegion
+
+        engine = LaMaInpainter.__new__(LaMaInpainter)
+        engine.model = object()
+        engine._infer_by_crops = lambda image, mask: image.copy()
+        engine._save_temp = lambda arr: Path("cleaned.png")
+        region = TextRegion(box=[[5, 5], [15, 5], [15, 15], [5, 15]], text="字")
+        region.mask = {"bbox": (5, 5, 15, 15), "patch": np.full((10, 10), 255, np.uint8)}
+        image = np.full((20, 20, 3), 255, np.uint8)
+
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "app.services.engines.inpainter.CVInpainter._second_pass_residual",
+            return_value=image,
+        ) as cleanup:
+            source = Path(tmp) / "source.png"
+            Image.fromarray(image).save(source)
+            engine.inpaint(source, [region])
+
+        cleanup.assert_called_once()
 
 
 class TestVerticalColumnOrder(unittest.TestCase):

@@ -1,6 +1,7 @@
 """翻译流水线服务：文本检测 → OCR → 翻译 → 图像修复 → 渲染"""
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -41,6 +42,8 @@ class TextRegion:
     group_translated: str = ""  # 整块气泡译文（renderer 优先用此排版）
     group_mask: Optional[object] = field(default=None, repr=False, compare=False)  # 分组时确认的容器掩膜
     group_mask_reliable: bool = field(default=False, repr=False, compare=False)
+    translation_backend: str = ""
+    quality_warnings: list[str] = field(default_factory=list)
 
     # 内部：MIT 检测器附加的 Quadrilateral、OCR 附加的内部状态
     _quad: Optional[object] = field(default=None, repr=False, compare=False)
@@ -75,6 +78,40 @@ class PipelineResult:
     regions: list[TextRegion] = field(default_factory=list)
     duration_ms: int = 0
     image_bytes: Optional[bytes] = None
+    ocr_backend: str = ""
+    translation_backends: list[str] = field(default_factory=list)
+    quality_warnings: list[str] = field(default_factory=list)
+
+
+_JA_RE = re.compile(r"[\u3040-\u30ff]")
+_MEANINGFUL_RE = re.compile(r"[\w\u3040-\u30ff\u3400-\u9fff]")
+
+
+def assess_translation_quality(source: str, translated: str, source_lang: LangCode, target_lang: LangCode, backend: str):
+    """轻量质量门控：只标记可客观判断的漏译、原文直出和低质量回退。"""
+    warnings: list[str] = []
+    src = "".join(_MEANINGFUL_RE.findall(source or ""))
+    dst = "".join(_MEANINGFUL_RE.findall(translated or ""))
+    if backend in {"google", "mymemory", "glossary", "original"}:
+        warnings.append(f"翻译使用回退后端:{backend}")
+    if src and (not dst or len(dst) < max(2, int(len(src) * 0.25))):
+        warnings.append("译文明显过短，可能漏译")
+    if source_lang == "ja" and target_lang == "zh":
+        ja_count = len(_JA_RE.findall(translated or ""))
+        if ja_count >= 2 and ja_count / max(1, len(dst)) > 0.15:
+            warnings.append("译文仍含较多日文")
+    source_numbers = set(re.findall(r"\d+", source or ""))
+    translated_numbers = set(re.findall(r"\d+", translated or ""))
+    if source_numbers - translated_numbers:
+        warnings.append("数字可能漏译")
+    return warnings
+
+
+def ocr_thresholds(ocr_name: str) -> tuple[float, float]:
+    """MIT 检测框可靠但字符置信度偏保守；翻译与擦除使用不同阈值。"""
+    if "mit48" in (ocr_name or "").lower():
+        return 0.20, 0.0
+    return 0.50, 0.50
 
 
 class TranslationPipeline:
@@ -148,11 +185,20 @@ class TranslationPipeline:
             self.ocr.recognize(image_path, regions, source_lang)
             self._report(progress_cb, 1, 100)
 
-        # 1.4 保留高置信度但未识别出文本的检测框：它们仍需参与擦除（常见于注音/小字），
-        # 但不能送入翻译。真正参与翻译的区域在分组时再按 text.strip() 过滤。
-        regions = [r for r in regions if r.confidence >= 0.5]
-        text_regions = [r for r in regions if r.text.strip()]
-        erase_only_regions = [r for r in regions if not r.text.strip()]
+        # 1.4 翻译与擦除阈值解耦：MIT 检测框/逐像素 mask 很可靠，但字符概率常仅 0.2~0.6；
+        # 低概率行仍需擦除，并保留可读文本参与整块翻译。Paddle/CV 继续使用保守阈值。
+        translate_threshold, erase_threshold = ocr_thresholds(getattr(self.ocr, "name", ""))
+        text_regions = [
+            r for r in regions if r.confidence >= translate_threshold and r.text.strip()
+        ]
+        text_region_ids = {id(r) for r in text_regions}
+        erase_only_regions = [
+            r
+            for r in regions
+            if id(r) not in text_region_ids
+            and r.confidence >= erase_threshold
+            and (r.mask is not None or not r.text.strip())
+        ]
 
         from app.services.engines.bubble import merge_punctuation_regions
 
@@ -176,10 +222,11 @@ class TranslationPipeline:
         img0 = np.array(Image.open(image_path).convert("RGB"))
         bgr0 = img0[:, :, ::-1].copy()
         h0, w0 = bgr0.shape[:2]
-        for r in text_regions:
+        for r in text_regions + erase_only_regions:
             if preserve_latin_label(r, source_lang) or classify_non_bubble(bgr0, r, w0, h0):
                 r._no_erase = True
         text_regions = drop_non_bubble_regions(text_regions)
+        erase_only_regions = drop_non_bubble_regions(erase_only_regions)
         erase_regions = text_regions + erase_only_regions
         if not erase_regions:
             return PipelineResult(regions=[], duration_ms=int((time.monotonic() - start) * 1000))
@@ -201,16 +248,27 @@ class TranslationPipeline:
             glossary=glossary,
             progress_cb=lambda p: self._report(progress_cb, 3, 5 + int(p * 0.95)),
         )
-        for g, block in zip(groups, translated_blocks):
+        backend_names = list(getattr(self.translator, "last_backend_names", []))
+        if len(backend_names) != len(groups):
+            fallback_name = getattr(self.translator, "name", type(self.translator).__name__)
+            backend_names = [fallback_name] * len(groups)
+        page_warnings: list[str] = []
+        for group_idx, (g, block) in enumerate(zip(groups, translated_blocks)):
             block = block or ""
             if not block.strip():
                 # 翻译失败/空结果：回退原文整块，避免文字消失
                 block = "\n".join(r.text for r in g["regions"])
+            source_block = group_texts[group_idx]
+            backend_name = backend_names[group_idx]
+            warnings = assess_translation_quality(source_block, block, source_lang, target_lang, backend_name)
+            page_warnings.extend(f"气泡{group_idx + 1}:{warning}" for warning in warnings)
             lines = block.split("\n")
             last = lines[-1] if lines else ""
             for i, r in enumerate(g["regions"]):
                 r.group_translated = block
                 r.translated = lines[i] if i < len(lines) else last
+                r.translation_backend = backend_name
+                r.quality_warnings = list(warnings)
         self._report(progress_cb, 3, 100)
 
         # 5. 渲染译文
@@ -219,7 +277,20 @@ class TranslationPipeline:
         self._report(progress_cb, 4, 100)
 
         duration = int((time.monotonic() - start) * 1000)
-        return PipelineResult(regions=text_regions, duration_ms=duration, image_bytes=result_bytes)
+        print(
+            f"[pipeline] ocr={getattr(self.ocr, 'name', type(self.ocr).__name__)} "
+            f"translate={','.join(sorted(set(backend_names)))} warnings={len(page_warnings)}"
+        )
+        if page_warnings:
+            print("[quality] " + " | ".join(page_warnings))
+        return PipelineResult(
+            regions=text_regions,
+            duration_ms=duration,
+            image_bytes=result_bytes,
+            ocr_backend=getattr(self.ocr, "name", type(self.ocr).__name__),
+            translation_backends=backend_names,
+            quality_warnings=page_warnings,
+        )
 
 
 def create_pipeline() -> TranslationPipeline:

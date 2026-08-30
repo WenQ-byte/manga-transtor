@@ -753,13 +753,14 @@ class PILRenderer(BaseRenderer):
             ln = raw
             if not ln:
                 continue
-            # 翻译服务偶尔会返回比单列更长的一行；切成连续片段，避免整颗气泡不渲染。
-            while len(ln) > avail_cols:
+            # 长句按中文词语/标点边界均衡分列，避免“祖|先”“所|以”等机械断词。
+            chunks = self._split_semantic_columns(ln, avail_cols)
+            while len(chunks) > 1:
                 if cur:
                     cols.append(cur)
                     cur = ""
-                cols.append(ln[:avail_cols])
-                ln = ln[avail_cols:]
+                cols.append(chunks.pop(0))
+            ln = chunks[0] if chunks else ""
             if cur and len(cur) + len(ln) > avail_cols:
                 cols.append(cur)
                 cur = ""
@@ -767,6 +768,43 @@ class PILRenderer(BaseRenderer):
         if cur:
             cols.append(cur)
         return cols or None
+
+    @staticmethod
+    def _split_semantic_columns(text: str, capacity: int) -> list[str]:
+        """在容量约束内均衡切列，优先标点边界并避免拆开常见中文双字/连接词。"""
+        if capacity <= 0 or len(text) <= capacity:
+            return [text]
+        no_split = {
+            "祖先", "土地", "所以", "但是", "已经", "这个", "没有", "就是", "属于",
+            "必须", "自己", "别人", "时候", "起来", "理解", "敌人", "文化", "大家",
+            "想法", "白人", "金钱", "保护", "一直", "这么", "地方", "有钱",
+        }
+        closing = set("，。！？；：、…」』）】》,.!?;:")
+        opening = set("「『（【《")
+        remaining = text
+        result: list[str] = []
+        while len(remaining) > capacity:
+            columns_left = max(2, (len(remaining) + capacity - 1) // capacity)
+            target = min(capacity, max(1, (len(remaining) + columns_left - 1) // columns_left))
+            lo = max(1, target - 3)
+            hi = min(capacity, target + 3, len(remaining) - 1)
+            best_cut, best_score = target, float("-inf")
+            for cut in range(lo, hi + 1):
+                left, right = remaining[:cut], remaining[cut:]
+                score = -abs(cut - target)
+                if left[-1] in closing:
+                    score += 8
+                if right[0] in closing or left[-1] in opening:
+                    score -= 12
+                if left[-1] + right[0] in no_split:
+                    score -= 16
+                if score > best_score:
+                    best_cut, best_score = cut, score
+            result.append(remaining[:best_cut])
+            remaining = remaining[best_cut:]
+        if remaining:
+            result.append(remaining)
+        return result
 
     def _find_max_font_in(self, draw, text, max_w, max_h, max_size, min_size):
         """二分查找 [min_size, max_size] 内能放进 (max_w, max_h) 的最大字号"""
