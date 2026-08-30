@@ -166,7 +166,7 @@ class DeepLTranslator(BaseRemoteTranslator):
         except Exception:
             return ""
 
-    def translate_batch(self, texts, source: LangCode, target: LangCode):
+    def translate_batch(self, texts, source: LangCode, target: LangCode, glossary=None, progress_cb=None):
         """一次 API 调用批量翻译（DeepL 支持数组输入），空文本/拟声词保留原样"""
         result = list(texts)
         indices: list[int] = []
@@ -203,10 +203,12 @@ class DeepSeekTranslator(BaseRemoteTranslator):
     """DeepSeek API 翻译（需要 MANGA_DEEPSEEK_API_KEY）
 
     使用 deepseek-chat（或 deepseek-v3），对漫画口语/网络用语理解力优于 DeepL。
+    页级上下文批量：整页全部文字合并成一次请求，结合语境翻译更地道。
     """
 
     name = "deepseek"
     prompt_glossary = True
+    batch = True
 
     def __init__(self):
         self.settings = get_settings()
@@ -227,6 +229,72 @@ class DeepSeekTranslator(BaseRemoteTranslator):
             if mapping:
                 prompt += f"人名对照：{mapping}"
         return prompt
+
+    def _context_prompt(self, source: LangCode, target: LangCode, glossary, n: int) -> str:
+        """页级批量系统提示：整页 n 段文字一次翻译，结合上下文"""
+        lang_names = {"ja": "日语", "en": "英语", "zh": "中文"}
+        prompt = (
+            f"你是专业的漫画翻译。下面是同一页漫画里的{n}段文字（按阅读顺序），每段用<序号>...</序号>包裹。"
+            f"请结合整页上下文把它们翻译成{lang_names.get(target, target)}：对话要自然连贯、口语化、符合漫画语气；"
+            "语气词用中文常用表达（如「嗯」「诶」）；保留人名、专有名词的统一译法；"
+            "看不懂就按字面直译，禁止脑补。"
+            f"输出{n}段，每段格式为<序号>译文</序号>，序号与输入一一对应，不要合并、拆分或增删段落；只输出译文。"
+        )
+        if glossary:
+            mapping = "、".join(f"{k}→{v}" for k, v in glossary.items() if k and v)
+            if mapping:
+                prompt += f"人名对照：{mapping}"
+        return prompt
+
+    @staticmethod
+    def _parse_segments(content: str, n: int):
+        """解析 <i>...</i> 编号段；序号缺失/重复/多余时返回 None"""
+        content = re.sub(r"```[a-zA-Z]*", "", content).strip()
+        pairs = re.findall(r"<(\d+)>\s*(.*?)\s*</\1>", content, re.S)
+        seg: dict[int, str] = {}
+        for num, txt in pairs:
+            seg.setdefault(int(num), txt.strip())
+        if sorted(seg.keys()) != list(range(1, n + 1)):
+            return None
+        return [seg[i] for i in range(1, n + 1)]
+
+    def _translate_context(self, srcs, source: LangCode, target: LangCode, glossary=None):
+        """整页 n 段一次请求，返回与 srcs 等长的译文列表；解析失败抛异常"""
+        base = self.settings.deepseek_base_url or "https://api.deepseek.com"
+        model = self.settings.deepseek_model or "deepseek-chat"
+        numbered = "".join(f"<{i + 1}>{t}</{i + 1}>" for i, t in enumerate(srcs))
+        resp = httpx.post(
+            f"{base}/chat/completions",
+            headers={"Authorization": f"Bearer {self.settings.deepseek_api_key}"},
+            json={
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": self._context_prompt(source, target, glossary, len(srcs))},
+                    {"role": "user", "content": numbered},
+                ],
+                "temperature": 0.3,
+            },
+            timeout=90,
+        )
+        resp.raise_for_status()
+        content = resp.json()["choices"][0]["message"]["content"]
+        segs = self._parse_segments(content, len(srcs))
+        if segs is None:
+            raise ValueError(f"段数不匹配: 期望 {len(srcs)} 段")
+        return segs
+
+    def translate_batch(self, texts, source_lang, target_lang, glossary=None, progress_cb=None):
+        """页级上下文批量：全部段合并一次请求；失败抛出由 SmartTranslator 逐条回退"""
+        idx_map = [i for i, t in enumerate(texts) if t.strip() and not KEEP_PATTERN.match(t)]
+        if not idx_map:
+            return list(texts)
+        srcs = [texts[i] for i in idx_map]
+        translated = self._translate_context(srcs, source_lang, target_lang, glossary)
+        out = list(texts)
+        for i, t in zip(idx_map, translated):
+            if t.strip():
+                out[i] = t
+        return out
 
     def translate_one(self, text: str, source: LangCode, target: LangCode, glossary=None) -> str:
         if not text.strip() or KEEP_PATTERN.match(text):
@@ -249,7 +317,8 @@ class DeepSeekTranslator(BaseRemoteTranslator):
             )
             resp.raise_for_status()
             return resp.json()["choices"][0]["message"]["content"].strip()
-        except Exception:
+        except Exception as e:  # noqa: BLE001
+            print(f"[deepseek] 翻译失败: {e}")
             return ""
 
 
@@ -363,12 +432,19 @@ class SmartTranslator(BaseTranslator):
         use_prompt = getattr(backend, "prompt_glossary", False)
         srcs = list(texts) if use_prompt else [self._apply_glossary(t, glossary) for t in texts]
 
-        # 支持批量 API 的后端（DeepL）一次性发送，减少请求数
+        # 支持批量 API 的后端（DeepL 数组 / DeepSeek 页级上下文）一次请求完成
         if getattr(backend, "batch", False):
-            out = backend.translate_batch(srcs, source_lang, target_lang)
-            if progress_cb:
-                progress_cb(1.0)
-            return out
+            try:
+                out = backend.translate_batch(
+                    srcs, source_lang, target_lang, glossary=glossary if use_prompt else None
+                )
+                if out and len(out) == len(srcs):
+                    if progress_cb:
+                        progress_cb(1.0)
+                    return out
+            except Exception as e:  # noqa: BLE001
+                print(f"[translator] 批量翻译失败，逐条回退: {e}")
+            # 批量失败 → 落到下面的逐条回退链
 
         # 其余后端逐条翻译，保留错误时的回退
         out = []
@@ -380,6 +456,9 @@ class SmartTranslator(BaseTranslator):
             out.append(result)
             if progress_cb and total:
                 progress_cb((i + 1) / total)
+        # 整批全部失败（输出等于原文）→ 清除缓存的后端，下次任务重新探测
+        if srcs and all(o == s for o, s in zip(out, srcs)):
+            self._available = None
         return out
 
     def _translate_with_fallback(self, text: str, source, target, primary, glossary=None) -> str:

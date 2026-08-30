@@ -384,6 +384,29 @@ class TestDeepSeekPrompt(unittest.TestCase):
         self.assertIn("换行", prompt)
         self.assertTrue("脑补" in prompt or "原文没有" in prompt)
 
+    def test_context_prompt_segment_count(self):
+        from app.services.engines.translator import DeepSeekTranslator
+
+        t = DeepSeekTranslator.__new__(DeepSeekTranslator)
+        prompt = t._context_prompt("ja", "zh", glossary=None, n=5)
+        self.assertIn("5段", prompt)
+        self.assertIn("<序号>译文</序号>", prompt)
+
+    def test_parse_segments(self):
+        from app.services.engines.translator import DeepSeekTranslator
+
+        parse = DeepSeekTranslator._parse_segments
+        # 正常解析
+        self.assertEqual(parse("<1>你好</1><2>再见</2>", 2), ["你好", "再见"])
+        # 带代码围栏与换行
+        self.assertEqual(parse("```xml\n<1>早上好</1>\n<2>晚安</2>\n```", 2), ["早上好", "晚安"])
+        # 序号乱序也能按号对齐
+        self.assertEqual(parse("<2>乙</2><1>甲</1>", 2), ["甲", "乙"])
+        # 缺号 → None
+        self.assertIsNone(parse("<1>你好</1>", 2))
+        # 多余尾随文本不影响
+        self.assertEqual(parse("译文：<1>好</1><2>行</2> 以上", 2), ["好", "行"])
+
 
 if __name__ == "__main__":
     unittest.main()
