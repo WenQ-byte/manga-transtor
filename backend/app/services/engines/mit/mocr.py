@@ -35,11 +35,17 @@ class MangaOcrWrapper:
     def recognize(self, image: np.ndarray, textlines: List[Quadrilateral]) -> None:
         if self._mocr is None:
             return
+        import cv2
+
         for q in textlines:
             try:
                 crop = q.get_transformed_region(image, q.direction, self.text_height)
                 if crop.size == 0:
                     continue
+                # get_transformed_region 会把竖排旋转 90° CCW 供水平训练模型；manga-ocr 本身支持任意朝向，
+                # 竖排应恢复为竖直裁剪（旋转回去再读），否则竖排文字会被读成横排列乱码（NS/SM/纽哈梅等）。
+                if q.direction == "v":
+                    crop = cv2.rotate(crop, cv2.ROTATE_90_CLOCKWISE)
                 txt = self._mocr(Image.fromarray(crop))
                 if txt:
                     q.text = txt

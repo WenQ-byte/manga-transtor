@@ -465,6 +465,17 @@ def create_ocr_engine_router() -> BaseOCR:
     return create_ocr_engine()
 
 
+def _empty_quads_only(quads: list) -> list:
+    """只把 mit48 完全没读出的行（空文本）交给 manga-ocr；mit48 有输出（即使低置信）直接保留
+
+    背景：mit48 对风格化/小字常能读对内容但置信度低（0.45~0.6）；manga-ocr 无真实置信度
+    （强行抬到 0.85）且对这类低置信行反而会幻觉成含拉丁字母的乱码（NS/SM/纽哈梅/古哈米）。
+    若按「prob < 阈值」把低置信行也交给 manga-ocr，会把已读对的内容覆盖成乱码。
+    故改为仅当 mit48 完全没读出（空文本）时才用 manga-ocr 补识别。
+    """
+    return [q for q in quads if not (q.text or "").strip()]
+
+
 def _quads_from_regions(regions: list[TextRegion]) -> list:
     """为 region 建立/复用 MIT Quadrilateral"""
     from app.services.engines.mit.quadrilateral import Quadrilateral
@@ -549,16 +560,14 @@ class MixedOCREngine(BaseOCR):
         return self._mit48 is not None and self._mocr is not None and self._mocr.available
 
     def _load(self):
-        from app.services.engines.mit.config import mixed_ocr_params, ocr_params, resolve_device
+        from app.services.engines.mit.config import ocr_params, resolve_device
         from app.services.engines.mit.mocr import MangaOcrWrapper
         from app.services.engines.mit.ocr_48px import Mit48Ocr
 
         p = ocr_params()
-        m = mixed_ocr_params()
         self._mit48 = Mit48Ocr(device=resolve_device(self.settings.mit_device))
         self._mocr = MangaOcrWrapper()
         self._prob = p.prob
-        self._mix_threshold = m.mix_threshold
         if not self._mocr.available:
             raise RuntimeError(self._mocr._error)
 
@@ -576,8 +585,8 @@ class MixedOCREngine(BaseOCR):
             img = np.array(Image.open(image_path).convert("RGB"))
             quads = _quads_from_regions(regions)
             self._mit48.recognize(img, quads, prob_threshold=getattr(self, "_prob", 0.2))
-            # 48px 概率低或未识别出的行 → 用 manga-ocr 补识别
-            low = [q for q in quads if (not (q.text or "").strip()) or q.prob < self._mix_threshold]
+            # 仅把 mit48 完全没读出的行交给 manga-ocr；mit48 有输出（即使低置信）保留，防被幻觉乱码覆盖
+            low = _empty_quads_only(quads)
             if low:
                 self._mocr.recognize(img, low)
             for r, q in zip(regions, quads):

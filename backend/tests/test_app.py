@@ -503,5 +503,45 @@ class TestNonBubbleClassify(unittest.TestCase):
         self.assertEqual([r.text for r in out], ["a"])
 
 
+class TestMixedOcrMixing(unittest.TestCase):
+    """manga-ocr 只救空行：mit48 已读出内容（即使低置信）不交给 manga-ocr 覆盖成乱码"""
+
+    def _quad(self, text, prob):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(text=text, prob=prob)
+
+    def test_empty_only_sent_to_mangaocr(self):
+        from app.services.engines.ocr import _empty_quads_only
+
+        quads = [
+            self._quad("ハレンチ撲滅", 0.55),   # mit48 有输出但低置信 → 保留，不再交给 manga-ocr
+            self._quad("", 0.0),                # 完全没读出 → 交给 manga-ocr
+            self._quad("とします", 0.56),
+            self._quad("  ", 0.1),              # 纯空白 → 视为空
+        ]
+        out = _empty_quads_only(quads)
+        self.assertEqual(len(out), 2)
+        self.assertTrue(all((q.text or "").strip() == "" for q in out))
+
+
+class TestVerticalCropOrientation(unittest.TestCase):
+    """竖排裁剪对 manga-ocr 应恢复为竖直（窄高）；若保持水平旋转则会读成乱码"""
+
+    def test_mangaocr_vertical_crop_is_tall(self):
+        import numpy as np
+        import cv2
+
+        from app.services.engines.mit.quadrilateral import Quadrilateral
+
+        pts = np.array([[165, 503], [204, 503], [204, 859], [165, 859]], dtype=np.float64)
+        q = Quadrilateral(pts, "", 0.0)
+        img = np.zeros((1000, 400, 3), dtype=np.uint8)
+        raw = q.get_transformed_region(img, "v", 96)          # 共享函数：会旋转成水平条
+        upright = cv2.rotate(raw, cv2.ROTATE_90_CLOCKWISE)    # manga-ocr 路径：转回竖直
+        self.assertTrue(raw.shape[1] > raw.shape[0])          # 原始共享结果偏宽（旋转过）
+        self.assertTrue(upright.shape[0] > upright.shape[1])  # manga-ocr 用竖直窄高
+
+
 if __name__ == "__main__":
     unittest.main()
