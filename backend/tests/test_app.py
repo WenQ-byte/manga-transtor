@@ -482,7 +482,7 @@ class TestBubbleGeometryLeakCap(unittest.TestCase):
         import numpy as np
         from unittest import mock
 
-        from app.services.engines.renderer import PILRenderer
+        from app.services.engines.renderer import SAFE_EXPAND_RATIO, PILRenderer
 
         r = self._make_region()
         mask = np.zeros((1000, 1000), np.uint8)
@@ -491,7 +491,11 @@ class TestBubbleGeometryLeakCap(unittest.TestCase):
         with mock.patch("app.services.engines.bubble.bubble_with_mask", fake):
             bb, out = PILRenderer()._bubble_geometry(np.zeros((1000, 1000, 3), np.uint8), [r], 1000, 1000)
         self.assertIsNone(out)
-        self.assertLessEqual(bb[2], 190 + int(140 * 0.35) + 1)
+        # 泄漏掩膜被拒后回退安全扩展框：受 SAFE_EXPAND_RATIO 上限约束，绝不用整页掩膜
+        cx = (50 + 190) / 2.0
+        cap_x1 = min(1000, int(cx + 140 * SAFE_EXPAND_RATIO / 2))
+        self.assertLessEqual(bb[2], cap_x1)
+        self.assertLess(bb[2], 1000)
 
     def test_accepts_mask_within_group_bounds(self):
         import numpy as np
@@ -608,6 +612,25 @@ class TestMaskCoverage(unittest.TestCase):
         sub = mask_full[cby0:cby1, cbx0:cbx1] > 0
         cov = float((sub & dark).sum()) / float(dark.sum())
         self.assertGreaterEqual(cov, 0.95, f"掩膜只覆盖了 {cov:.2%} 暗像素，会残留原文")
+
+
+class TestCVInpainter(unittest.TestCase):
+    def test_row_fill_samples_each_mask_run_locally(self):
+        import numpy as np
+
+        from app.services.engines.inpainter import CVInpainter
+
+        img = np.full((1, 30, 3), 255, dtype=np.uint8)
+        img[:, :10] = 30
+        img[:, 20:] = 220
+        mask = np.zeros((1, 30), dtype=np.uint8)
+        mask[0, 3:5] = 255
+        mask[0, 24:26] = 255
+
+        CVInpainter()._fill_with_row_bg(img, mask)
+
+        self.assertLess(img[0, 3].mean(), 80)
+        self.assertGreater(img[0, 24].mean(), 180)
 
 
 class TestVerticalColumnOrder(unittest.TestCase):

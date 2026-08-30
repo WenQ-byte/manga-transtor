@@ -47,6 +47,15 @@ MAX_FONT_RATIO = 0.85
 FLOOD_TOL = 40
 # 气泡相对文本框的最大放大倍数（防止无边框气泡泄漏到整张图）
 BUBBLE_GROW_RATIO = 6.0
+# 有限安全扩展框参数（气泡掩膜失败时的二级回退）
+# 扩展上限（相对锚点宽高，约 1.5~2 倍）
+SAFE_EXPAND_RATIO = 1.8
+# 单边单步扩展像素数
+SAFE_EXPAND_STEP = 3
+# 边缘像素判定阈值（Sobel 梯度幅度，低于该值视为平坦）
+SAFE_EDGE_THRESH = 25.0
+# 候选带内边缘像素占比上限（超过即视为触及轮廓/分镜线/人物纹理，停止该边）
+SAFE_EDGE_RATIO_MAX = 0.12
 
 try:
     import cv2
@@ -158,9 +167,12 @@ class PILRenderer(BaseRenderer):
     def _bubble_geometry(self, bgr, group_regions: list[TextRegion], img_w, img_h):
         """在修复后图像上重推该组的气泡：返回 (bbox, mask|None)
 
-        泛洪结果须通过可信度校验：掩膜必须覆盖本组全部擦除笔画区（原文位置必须在
-        新气泡内）、面积不得远超文本框（防泄漏到面板间隙/相邻气泡）。不合格时锚定
-        文本框外扩矩形（mask=None → 渲染端按矩形裁剪），保证文字不跑位不丢失。
+        回退分级（紧致文本框是最后兜底，不是掩膜失败时的默认方案）：
+          一级  可靠气泡掩膜（泛洪通过全部可信度校验）→ (bbox, mask) 按气泡形状裁剪
+          二级  有限安全扩展框（从文本框锚点向四周渐进扩展，边缘/纹理检查阻止
+                穿过气泡轮廓/分镜线/人物高纹理区）→ (box, None) 按矩形裁剪
+          三级  紧致文本框（锚点本身，必然在气泡内）→ (tight, None)
+          四级  全部失败 → None（渲染端跳过该气泡）
         """
         from app.services.engines.bubble import bubble_with_mask
 
@@ -169,22 +181,40 @@ class PILRenderer(BaseRenderer):
         x1 = max(r.bounds[2] for r in group_regions)
         y1 = max(r.bounds[3] for r in group_regions)
 
-        def anchored():
-            # 掩膜不可用/不可信时：以本组文本框的紧致包围盒（必然在气泡内）作为布局与裁剪框。
-            # 不可用向外扩展的备用框——否则译文填满超框的矩形会溢出到气泡外的版面（文字压在脸上/头发上）。
-            # 裁掉极细边带防文字贴边被截断。
-            ix0 = max(0, x0 + 1)
-            iy0 = max(0, y0 + 1)
-            ix1 = min(img_w, x1 - 1)
-            iy1 = min(img_h, y1 - 1)
-            return (ix0, iy0, ix1, iy1), None
+        def tight():
+            return (
+                max(0, x0 + 1),
+                max(0, y0 + 1),
+                min(img_w, x1 - 1),
+                min(img_h, y1 - 1),
+            )
 
+        # 一级：可靠气泡掩膜
         bb, mask = bubble_with_mask(bgr, (x0, y0, x1, y1), img_w, img_h)
-        if mask is None or not mask.any():
-            return anchored()
+        if mask is not None and mask.any() and self._mask_reliable(
+            bb, mask, group_regions, (x0, y0, x1, y1), img_w, img_h
+        ):
+            return bb, mask
+
+        # 二级：有限安全扩展框（锚点外扩，受边缘/纹理约束）
+        safe = self._safe_expand_box(bgr, x0, y0, x1, y1, img_w, img_h)
+        if safe is not None:
+            return safe, None
+
+        # 三级：紧致文本框兜底
+        t = tight()
+        if t[2] - t[0] >= 6 and t[3] - t[1] >= 6:
+            return t, None
+        # 四级：跳过该气泡
+        return None, None
+
+    @staticmethod
+    def _mask_reliable(bb, mask, group_regions, tight_box, img_w, img_h) -> bool:
+        """气泡掩膜可信度校验：覆盖全部擦除笔画、面积不超限、不越分组包围盒"""
+        x0, y0, x1, y1 = tight_box
         tb_area = max(1, (x1 - x0) * (y1 - y0))
         if int((mask > 0).sum()) > tb_area * 6:
-            return anchored()
+            return False
         # 绝对上限：泛洪结果不得远超分组已知的气泡包围盒（防大组泛洪泄漏到整页背景）
         gb = next((r.group_bounds for r in group_regions if r.group_bounds), None)
         if gb is not None:
@@ -195,7 +225,7 @@ class PILRenderer(BaseRenderer):
                 or bb[2] > gb[2] + margin
                 or bb[3] > gb[3] + margin
             ):
-                return anchored()
+                return False
         for r in group_regions:
             m = r.mask
             if not m or "patch" not in m or "bbox" not in m:
@@ -206,11 +236,79 @@ class PILRenderer(BaseRenderer):
                 continue
             sub = mask[py0:py1, px0:px1]
             if sub.shape != patch.shape:
-                return anchored()
+                return False
             covered = float((sub > 0)[patch].sum()) / float(patch.sum())
             if covered < 0.85:
-                return anchored()
-        return bb, mask
+                return False
+        return True
+
+    def _safe_expand_box(self, bgr, x0, y0, x1, y1, img_w, img_h):
+        """从紧致文本框锚点向四周渐进扩展，受边缘/纹理检查约束，返回最大安全排版框。
+
+        锚点（原始文字区域）必然在气泡内。逐边逐条带外扩：候选带内边缘像素占比低
+        （气泡内部平坦）即接受；一旦触及气泡轮廓/分镜线/人物高纹理（边缘密度升高）
+        即停该边。扩展上限为锚点宽高的 SAFE_EXPAND_RATIO 倍。无法安全扩展时返回
+        None（上层退回紧致文本框兜底）。
+        """
+        import cv2
+
+        if cv2 is None:
+            return None
+        bw = x1 - x0
+        bh = y1 - y0
+        if bw <= 0 or bh <= 0:
+            return None
+
+        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+        gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+        gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+        grad = cv2.magnitude(gx, gy)
+
+        # 锚点内部基线：气泡内部平坦区域边缘密度的参考
+        inner = grad[y0:y1, x0:x1]
+        base = float(inner.mean()) if inner.size else 0.0
+        edge_thr = max(SAFE_EDGE_THRESH, base * 1.5 + 8)
+
+        # 上限框：以锚点中心外扩到 ratio 倍
+        cx = (x0 + x1) / 2.0
+        cy = (y0 + y1) / 2.0
+        cap_w = max(1.0, bw * SAFE_EXPAND_RATIO)
+        cap_h = max(1.0, bh * SAFE_EXPAND_RATIO)
+        cap_x0 = max(0, int(cx - cap_w / 2))
+        cap_x1 = min(img_w, int(cx + cap_w / 2))
+        cap_y0 = max(0, int(cy - cap_h / 2))
+        cap_y1 = min(img_h, int(cy + cap_h / 2))
+
+        def band_safe(band) -> bool:
+            if band.size == 0:
+                return True
+            return float((band > edge_thr).mean()) <= SAFE_EDGE_RATIO_MAX
+
+        bx0, by0, bx1, by1 = x0, y0, x1, y1
+        step = max(2, SAFE_EXPAND_STEP)
+        changed = True
+        guard = 0
+        while changed and guard < 2000:
+            changed = False
+            guard += 1
+            if by0 - step >= cap_y0 and band_safe(grad[by0 - step:by0, bx0:bx1]):
+                by0 -= step
+                changed = True
+            if by1 + step <= cap_y1 and band_safe(grad[by1:by1 + step, bx0:bx1]):
+                by1 += step
+                changed = True
+            if bx0 - step >= cap_x0 and band_safe(grad[by0:by1, bx0 - step:bx0]):
+                bx0 -= step
+                changed = True
+            if bx1 + step <= cap_x1 and band_safe(grad[by0:by1, bx1:bx1 + step]):
+                bx1 += step
+                changed = True
+
+        # 只要任一侧发生过有效扩展就用扩展框（含单侧扩展，如竖排气泡只往右有空间）；
+        # 完全没扩出去（四周全是轮廓/人物纹理）才退回紧致框兜底。
+        if bx0 == x0 and by0 == y0 and bx1 == x1 and by1 == y1:
+            return None
+        return int(bx0), int(by0), int(bx1), int(by1)
 
     @staticmethod
     def _use_vertical(group_regions, bw, bh, min_ratio=None) -> bool:

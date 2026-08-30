@@ -47,27 +47,23 @@ class CVInpainter(BaseInpainter):
         rows = np.where(body_mask.any(axis=1))[0]
         if rows.size == 0:
             return
-        cols = np.where(body_mask.any(axis=0))[0]
-        x0, x1 = int(cols.min()), int(cols.max())
         edge = 4  # 边缘采样带宽
         for y in rows:
             xs = body_mask[y]
             if not xs.any():
                 continue
-            left_x0 = max(0, x0 - edge)
-            left = img[y, left_x0:x0].reshape(-1, 3)
-            right = img[y, (x1 + 1):min(img.shape[1], x1 + 1 + edge)].reshape(-1, 3)
-            samples = []
-            if left.size:
-                samples.append(left)
-            if right.size:
-                samples.append(right)
-            if not samples:
-                continue
-            src = np.concatenate(samples, axis=0)
-            color = np.median(src, axis=0).astype(np.uint8)
-            indices = np.where(xs)[0]
-            img[y, indices] = color
+            indices = np.flatnonzero(xs)
+            starts = np.r_[0, np.flatnonzero(np.diff(indices) > 1) + 1]
+            ends = np.r_[starts[1:] - 1, len(indices) - 1]
+            for start, end in zip(starts, ends):
+                x0, x1 = int(indices[start]), int(indices[end])
+                left = img[y, max(0, x0 - edge):x0].reshape(-1, 3)
+                right = img[y, x1 + 1:min(img.shape[1], x1 + 1 + edge)].reshape(-1, 3)
+                samples = [part for part in (left, right) if part.size]
+                if not samples:
+                    continue
+                color = np.median(np.concatenate(samples, axis=0), axis=0).astype(np.uint8)
+                img[y, x0:x1 + 1] = color
 
     def _save_temp(self, arr: np.ndarray) -> Path:
         tmp = tempfile.mkdtemp(prefix="manga_inpaint_")
