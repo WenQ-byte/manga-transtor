@@ -28,8 +28,8 @@ def build_full_mask(img: np.ndarray, regions: list[TextRegion], pad: int = 2) ->
     for region in regions:
         if getattr(region, "_no_erase", False):
             continue
-        # MIT 检测器已经提供逐像素文本掩膜，优先复用它；只有没有缓存时才
-        # 依据 OCR 多边形/笔画候选重新计算，避免重算掩膜漏掉风格化字或注音。
+        # MIT 逐像素掩膜与 OCR 多边形/笔画候选取并集：缓存通常很准但偏紧，
+        # 补充掩膜负责覆盖抗锯齿边缘和漏检注音。
         res = region_patch(img, region, pad=pad)
         if res is None:
             continue
@@ -42,10 +42,32 @@ def build_full_mask(img: np.ndarray, regions: list[TextRegion], pad: int = 2) ->
 def region_patch(img: np.ndarray, region: TextRegion, pad: int = 2) -> Optional[tuple[int, int, int, int, np.ndarray]]:
     """获取缓存/计算某 region 的掩膜 patch；返回 (x0,y0,x1,y1,mask patch 0/255)，无效时 None"""
     cached = region.mask
+    cached_res = None
     if cached and "patch" in cached:
         x0, y0, x1, y1 = cached["bbox"]
-        return x0, y0, x1, y1, cached["patch"]  # type: ignore
-    return build_region_mask(img, region, pad=pad)
+        cached_res = (x0, y0, x1, y1, cached["patch"])  # type: ignore
+    computed = build_region_mask(img, region, pad=pad)
+    return _merge_region_patches(cached_res, computed)
+
+
+def _merge_region_patches(a, b):
+    """把检测器缓存掩膜与自适应补充掩膜对齐后取并集。"""
+    if a is None:
+        return b
+    if b is None:
+        return a
+    ax0, ay0, ax1, ay1, ap = a
+    bx0, by0, bx1, by1, bp = b
+    x0, y0 = min(ax0, bx0), min(ay0, by0)
+    x1, y1 = max(ax1, bx1), max(ay1, by1)
+    merged = np.zeros((y1 - y0, x1 - x0), dtype=np.uint8)
+    merged[ay0 - y0:ay1 - y0, ax0 - x0:ax1 - x0] = np.maximum(
+        merged[ay0 - y0:ay1 - y0, ax0 - x0:ax1 - x0], ap
+    )
+    merged[by0 - y0:by1 - y0, bx0 - x0:bx1 - x0] = np.maximum(
+        merged[by0 - y0:by1 - y0, bx0 - x0:bx1 - x0], bp
+    )
+    return x0, y0, x1, y1, merged
 
 
 def build_region_mask(img: np.ndarray, region: TextRegion, pad: int = 2) -> Optional[tuple[int, int, int, int, np.ndarray]]:
@@ -92,10 +114,16 @@ def build_region_mask(img: np.ndarray, region: TextRegion, pad: int = 2) -> Opti
         img_gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY) if img.ndim == 3 else img
         patch_gray = img_gray[y0:y1, x0:x1]
         strokes = _stroke_candidates(patch_gray)
-        cand = poly_filled
-        if strokes is not None and strokes.any():
+        complex_bg = _complex_background(patch_gray)
+        # 纹理卡片不能整块抹平，否则烟花/网点会变成白斑；只擦笔画及其抗锯齿边缘。
+        if complex_bg and strokes is not None and strokes.any():
+            cand = strokes
+        else:
+            cand = poly_filled
+        if not complex_bg and strokes is not None and strokes.any():
             cand = np.maximum(cand, strokes)
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
+        kernel_size = 3 if complex_bg else 7
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_size, kernel_size))
         cand = cv2.dilate(cand, kernel, iterations=1)
         # 把 pad 缩进丢掉的边带补回掩膜（覆盖到 box/poly 边界），防边缘笔画残留
         if pad > 0:
@@ -127,6 +155,23 @@ def build_region_mask(img: np.ndarray, region: TextRegion, pad: int = 2) -> Opti
     cand = cv2.morphologyEx(cand, cv2.MORPH_CLOSE, kernel, iterations=1)
     cand = cv2.dilate(cand, kernel, iterations=1)
     return (x0, y0, x1, y1, cand)
+
+
+def _complex_background(patch_gray: np.ndarray) -> bool:
+    """根据文字框边带判断是否为网点、烟花等复杂底纹。"""
+    if patch_gray.size == 0 or min(patch_gray.shape) < 4:
+        return False
+    border = np.concatenate(
+        [
+            patch_gray[:2].reshape(-1),
+            patch_gray[-2:].reshape(-1),
+            patch_gray[:, :2].reshape(-1),
+            patch_gray[:, -2:].reshape(-1),
+        ]
+    ).astype(np.float32)
+    median = float(np.median(border))
+    mad = float(np.median(np.abs(border - median)))
+    return float(border.std()) > 24.0 and mad > 8.0
 
 
 def _fill_poly(region: TextRegion, x0: int, y0: int, x1: int, y1: int) -> Optional[np.ndarray]:

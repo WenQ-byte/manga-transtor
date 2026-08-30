@@ -467,6 +467,38 @@ class TestBubbleGroupMergeBalloon(unittest.TestCase):
         out = _merge_overlap_groups(groups)
         self.assertEqual(len(out), 1)
 
+    def test_overlapping_boxes_with_distinct_masks_do_not_merge(self):
+        import numpy as np
+
+        from app.services.engines.bubble import _merge_overlap_groups
+
+        left = np.zeros((200, 200), np.uint8)
+        right = np.zeros((200, 200), np.uint8)
+        left[20:160, 20:90] = 255
+        right[30:170, 105:180] = 255
+        groups = [
+            {"bbox": (20, 20, 125, 160), "regions": ["a"], "mask": left, "mask_reliable": True},
+            {"bbox": (75, 30, 180, 170), "regions": ["b"], "mask": right, "mask_reliable": True},
+        ]
+        out = _merge_overlap_groups(groups)
+        self.assertEqual(len(out), 2)
+
+    def test_vertical_cards_with_small_visual_gap_are_not_text_adjacent(self):
+        from app.services.engines.bubble import _text_regions_adjacent
+        from app.services.pipeline import TextRegion
+
+        upper = TextRegion(
+            box=[[1130, 213], [1152, 213], [1152, 350], [1130, 350]],
+            text="上方卡片",
+            direction="v",
+        )
+        lower = TextRegion(
+            box=[[1126, 411], [1144, 411], [1144, 545], [1126, 545]],
+            text="下方卡片",
+            direction="v",
+        )
+        self.assertFalse(_text_regions_adjacent(upper, lower))
+
 
 class TestBubbleGeometryLeakCap(unittest.TestCase):
     """泛洪掩膜超出组气泡包围盒太多即判泄漏，回退锚定矩形（防整页巨字）"""
@@ -511,6 +543,37 @@ class TestBubbleGeometryLeakCap(unittest.TestCase):
             bb, out = PILRenderer()._bubble_geometry(np.zeros((1000, 1000, 3), np.uint8), [r], 1000, 1000)
         self.assertIsNotNone(out)
         self.assertEqual(bb, (40, 40, 200, 300))
+
+    def test_sparse_multi_region_group_does_not_use_rectangle_fallback(self):
+        import numpy as np
+        from unittest import mock
+
+        from app.services.engines.renderer import PILRenderer
+        from app.services.pipeline import TextRegion
+
+        a = TextRegion(box=[[20, 20], [60, 20], [60, 80], [20, 80]], text="a", direction="v")
+        b = TextRegion(box=[[300, 300], [340, 300], [340, 360], [300, 360]], text="b", direction="v")
+        a.group_bounds = b.group_bounds = (20, 20, 340, 360)
+        fake = lambda *args, **kwargs: ((10, 10, 350, 370), None)
+        with mock.patch("app.services.engines.bubble.bubble_with_mask", fake):
+            bb, mask = PILRenderer()._bubble_geometry(
+                np.zeros((400, 400, 3), np.uint8), [a, b], 400, 400
+            )
+        self.assertIsNone(bb)
+        self.assertIsNone(mask)
+
+
+class TestChineseBlockLayout(unittest.TestCase):
+    def test_chinese_layout_does_not_keep_source_line_breaks(self):
+        from app.services.engines.renderer import PILRenderer
+
+        text = PILRenderer._layout_block_text("第一句\n第二句\n『第三句』", "zh")
+        self.assertEqual(text, "第一句第二句『第三句』")
+
+    def test_other_languages_keep_line_breaks(self):
+        from app.services.engines.renderer import PILRenderer
+
+        self.assertEqual(PILRenderer._layout_block_text("one\ntwo", "en"), "one\ntwo")
 
 
 class TestNonBubbleClassify(unittest.TestCase):

@@ -39,6 +39,8 @@ class TextRegion:
     group_index: Optional[int] = None  # 同一气泡的 region 共享
     group_bounds: Optional[tuple[int, int, int, int]] = None  # 气泡包围盒 (x0,y0,x1,y1)
     group_translated: str = ""  # 整块气泡译文（renderer 优先用此排版）
+    group_mask: Optional[object] = field(default=None, repr=False, compare=False)  # 分组时确认的容器掩膜
+    group_mask_reliable: bool = field(default=False, repr=False, compare=False)
 
     # 内部：MIT 检测器附加的 Quadrilateral、OCR 附加的内部状态
     _quad: Optional[object] = field(default=None, repr=False, compare=False)

@@ -101,14 +101,10 @@ class PILRenderer(BaseRenderer):
 
         groups = self._group_by_bubble(bgr, regions, img_w, img_h)
 
-        # 文本画到透明 overlay，最后按气泡掩膜裁剪合成（文字永不出气泡框）
+        # 每组使用独立 overlay，先按自身容器裁剪再合成，避免失败组污染其他组的覆盖率统计。
         overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
-        odraw = ImageDraw.Draw(overlay)
-        clip_mask = np.zeros((img_h, img_w), np.uint8)
 
         for _bubble, group_regions in groups:
-            pre_alpha = np.array(overlay.getchannel("A")).copy()
-
             bb, mask = self._bubble_geometry(bgr, group_regions, img_w, img_h)
             if bb is None:
                 continue
@@ -117,7 +113,10 @@ class PILRenderer(BaseRenderer):
             if bw <= 0 or bh <= 0:
                 continue
             block = self._group_block_text(group_regions)
+            block = self._layout_block_text(block, target_lang)
             fill, stroke = self._text_colors(group_regions)
+            group_overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
+            odraw = ImageDraw.Draw(group_overlay)
             if self._use_vertical(group_regions, bw, bh):
                 if block:
                     self._render_vertical_bubble_block(
@@ -132,31 +131,27 @@ class PILRenderer(BaseRenderer):
                     odraw, group_regions, bx0, by0, bw, bh, min_font_size, block=block, fill=fill, stroke=stroke
                 )
 
-            # 本组实际绘制的文字像素（本组新增 alpha）
-            post_alpha = np.array(overlay.getchannel("A"))
-            drawn = (post_alpha > 0) & (pre_alpha == 0)
+            group_alpha = np.array(group_overlay.getchannel("A"))
+            drawn = group_alpha > 0
+            if not drawn.any():
+                continue
             group_clip = np.zeros((img_h, img_w), np.uint8)
 
             if mask is not None:
-                # 掩膜可用但若覆盖率过低（泛洪泄漏/不可信），回退矩形裁剪以防文字消失
-                coverage = 0.0
-                if drawn.any():
-                    coverage = float((drawn & (mask > 0)).sum()) / float(drawn.sum())
-                if coverage >= 0.5:
-                    group_clip = mask
-                else:
-                    group_clip[by0:by1, bx0:bx1] = 255
+                # 可靠容器是硬边界；覆盖不足说明排版/几何不可信，宁可跳过也不放行到人物背景。
+                coverage = float((drawn & (mask > 0)).sum()) / float(drawn.sum())
+                if coverage < 0.5:
+                    continue
+                group_clip = mask
             else:
                 cx0, cy0 = max(0, bx0), max(0, by0)
                 cx1, cy1 = min(img_w, bx1), min(img_h, by1)
                 if cx1 > cx0 and cy1 > cy0:
                     group_clip[cy0:cy1, cx0:cx1] = 255
-            clip_mask = np.maximum(clip_mask, group_clip)
+            keep = np.minimum(group_alpha, group_clip).astype(np.uint8)
+            group_overlay.putalpha(Image.fromarray(keep, "L"))
+            overlay = Image.alpha_composite(overlay, group_overlay)
 
-        # 仅保留「有文字且位于气泡内」的像素
-        text_alpha = np.array(overlay.getchannel("A"))
-        keep = np.minimum(text_alpha, clip_mask).astype(np.uint8)
-        overlay.putalpha(Image.fromarray(keep, "L"))
         base = img.convert("RGBA")
         merged = Image.alpha_composite(base, overlay).convert("RGB")
 
@@ -189,12 +184,40 @@ class PILRenderer(BaseRenderer):
                 min(img_h, y1 - 1),
             )
 
+        # 优先复用分组阶段在同一张修复图上确认的容器，避免渲染阶段重新泛洪得到不同区域。
+        stored_mask = next(
+            (
+                r.group_mask
+                for r in group_regions
+                if getattr(r, "group_mask_reliable", False) and r.group_mask is not None
+            ),
+            None,
+        )
+        if stored_mask is not None and bool(stored_mask.any()):
+            ys, xs = np.where(stored_mask > 0)
+            stored_bb = (int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1)
+            if self._mask_reliable(
+                stored_bb, stored_mask, group_regions, (x0, y0, x1, y1), img_w, img_h
+            ):
+                return stored_bb, stored_mask
+
         # 一级：可靠气泡掩膜
         bb, mask = bubble_with_mask(bgr, (x0, y0, x1, y1), img_w, img_h)
         if mask is not None and mask.any() and self._mask_reliable(
             bb, mask, group_regions, (x0, y0, x1, y1), img_w, img_h
         ):
             return bb, mask
+
+        # 多 region 且没有共同可靠容器时，稀疏大包围盒通常是多个卡片被误并。
+        # 这种情况不得进入矩形扩展回退，否则译文会覆盖人物或背景。
+        if len(group_regions) > 1:
+            region_area = sum(
+                max(1, (r.bounds[2] - r.bounds[0]) * (r.bounds[3] - r.bounds[1]))
+                for r in group_regions
+            )
+            union_area = max(1, (x1 - x0) * (y1 - y0))
+            if union_area > region_area * 3.0:
+                return None, None
 
         # 二级：有限安全扩展框（锚点外扩，受边缘/纹理约束）
         safe = self._safe_expand_box(bgr, x0, y0, x1, y1, img_w, img_h)
@@ -349,6 +372,17 @@ class PILRenderer(BaseRenderer):
             if r.group_translated and r.group_translated.strip():
                 return r.group_translated
         return None
+
+    @staticmethod
+    def _layout_block_text(text: str | None, target_lang) -> str | None:
+        """中文排版不继承日文机械换行；换行只服务翻译上下文，最终按容器重新分列。"""
+        if not text:
+            return text
+        lang = getattr(target_lang, "value", target_lang)
+        if lang not in {"zh", "zh-cn", "zh-CN"}:
+            return text
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        return "".join(lines)
 
     def _group_by_bubble(self, bgr, regions, img_w, img_h):
         """将同一气泡内的 region 分组，返回 [(bubble_bbox, [regions])]

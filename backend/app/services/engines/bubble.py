@@ -200,17 +200,41 @@ def group_regions_by_bubble(bgr, regions: list[TextRegion], img_w, img_h, overla
     """
     groups: list[dict] = []
     for region in regions:
-        bb = detect_bubble(bgr, region.bounds, img_w, img_h)
+        bb, container_mask = bubble_with_mask(bgr, region.bounds, img_w, img_h)
+        mask_reliable = container_mask is not None and bool(container_mask.any())
         best_idx, best_ov = -1, 0.0
         for i, g in enumerate(groups):
-            ov = _overlap_ratio(bb, g["bbox"])
-            if ov > best_ov:
-                best_ov, best_idx = ov, i
-        if best_idx >= 0 and best_ov > overlap and _balloon_ok(bb, groups[best_idx]["bbox"]):
-            groups[best_idx]["bbox"] = _union(bb, groups[best_idx]["bbox"])
-            groups[best_idx]["regions"].append(region)
+            score = _container_merge_score(
+                bb,
+                container_mask,
+                mask_reliable,
+                region,
+                g,
+                overlap,
+            )
+            if score > best_ov:
+                best_ov, best_idx = score, i
+        if best_idx >= 0:
+            group = groups[best_idx]
+            group["bbox"] = _union(bb, group["bbox"])
+            group["regions"].append(region)
+            group["members"].append((bb, container_mask, mask_reliable, region))
+            if mask_reliable:
+                if group["mask"] is None:
+                    group["mask"] = container_mask
+                    group["mask_reliable"] = True
+                else:
+                    group["mask"] = np.maximum(group["mask"], container_mask)
         else:
-            groups.append({"bbox": bb, "regions": [region]})
+            groups.append(
+                {
+                    "bbox": bb,
+                    "regions": [region],
+                    "mask": container_mask if mask_reliable else None,
+                    "mask_reliable": mask_reliable,
+                    "members": [(bb, container_mask, mask_reliable, region)],
+                }
+            )
 
     groups = _merge_overlap_groups(groups, overlap)
 
@@ -233,8 +257,122 @@ def group_regions_by_bubble(bgr, regions: list[TextRegion], img_w, img_h, overla
         for i, r in enumerate(regions_sorted):
             r.group_index = len(out)
             r.group_bounds = bbox
-        out.append({"bbox": bbox, "regions": regions_sorted})
+            r.group_mask = g.get("mask")
+            r.group_mask_reliable = bool(g.get("mask_reliable"))
+        out.append(
+            {
+                "bbox": bbox,
+                "regions": regions_sorted,
+                "mask": g.get("mask"),
+                "mask_reliable": bool(g.get("mask_reliable")),
+            }
+        )
     return out
+
+
+def _mask_overlap_ratio(a, b) -> float:
+    if a is None or b is None or a.shape != b.shape:
+        return 0.0
+    aa = a > 0
+    bb = b > 0
+    denom = min(int(aa.sum()), int(bb.sum()))
+    if denom <= 0:
+        return 0.0
+    return float((aa & bb).sum()) / float(denom)
+
+
+def _container_merge_score(bb, mask, mask_reliable, region, group, overlap) -> float:
+    """容器合并评分：可靠掩膜是硬边界，回退框只允许紧凑近邻合并。"""
+    group_mask = group.get("mask")
+    group_mask_reliable = bool(group.get("mask_reliable")) and group_mask is not None
+    if mask_reliable and group_mask_reliable:
+        mask_ov = _mask_overlap_ratio(mask, group_mask)
+        if mask_ov < 0.55:
+            return 0.0
+        return 2.0 + mask_ov
+
+    gb = group["bbox"]
+    box_ov = _overlap_ratio(bb, gb)
+    if not _balloon_ok(bb, gb):
+        return 0.0
+    if not _compact_group_ok(group["members"], (bb, mask, mask_reliable, region)):
+        return 0.0
+    if not _region_adjacent_to_group(region, group["regions"]):
+        return 0.0
+    if box_ov >= max(0.45, overlap * 2.5):
+        return 1.0 + box_ov
+    if _contains(bb, gb) or _contains(gb, bb):
+        return 1.0
+    if _directions_compatible(region, group["regions"]) and _proximity_overlap(bb, gb):
+        return 0.5
+    return 0.0
+
+
+def _directions_compatible(region, group_regions) -> bool:
+    direction = getattr(region, "direction", None)
+    known = [getattr(r, "direction", None) for r in group_regions]
+    known = [d for d in known if d]
+    return not direction or not known or direction == max(set(known), key=known.count)
+
+
+def _axis_overlap(a0, a1, b0, b1) -> float:
+    inter = max(0, min(a1, b1) - max(a0, b0))
+    return inter / max(1, min(a1 - a0, b1 - b0))
+
+
+def _axis_gap(a0, a1, b0, b1) -> float:
+    return max(0, max(a0, b0) - min(a1, b1))
+
+
+def _text_regions_adjacent(a, b) -> bool:
+    """按原始文字框判断是否为同一排/列，避免外扩框在相邻卡片间搭桥。"""
+    if not hasattr(a, "bounds") or not hasattr(b, "bounds"):
+        return True
+    ax0, ay0, ax1, ay1 = a.bounds
+    bx0, by0, bx1, by1 = b.bounds
+    aw, ah = max(1, ax1 - ax0), max(1, ay1 - ay0)
+    bw, bh = max(1, bx1 - bx0), max(1, by1 - by0)
+    direction = getattr(a, "direction", None) or getattr(b, "direction", None)
+    if direction == "v":
+        same_rows = _axis_overlap(ay0, ay1, by0, by1) >= 0.45
+        nearby_columns = _axis_gap(ax0, ax1, bx0, bx1) <= 1.5 * max(aw, bw)
+        same_column = _axis_overlap(ax0, ax1, bx0, bx1) >= 0.5
+        nearby_parts = _axis_gap(ay0, ay1, by0, by1) <= 0.25 * max(ah, bh)
+        return (same_rows and nearby_columns) or (same_column and nearby_parts)
+    same_columns = _axis_overlap(ax0, ax1, bx0, bx1) >= 0.45
+    nearby_rows = _axis_gap(ay0, ay1, by0, by1) <= 1.5 * max(ah, bh)
+    same_row = _axis_overlap(ay0, ay1, by0, by1) >= 0.5
+    nearby_parts = _axis_gap(ax0, ax1, bx0, bx1) <= 0.25 * max(aw, bw)
+    return (same_columns and nearby_rows) or (same_row and nearby_parts)
+
+
+def _region_adjacent_to_group(region, group_regions) -> bool:
+    return _directions_compatible(region, group_regions) and any(
+        _text_regions_adjacent(region, other) for other in group_regions
+    )
+
+
+def _groups_text_compatible(a_regions, b_regions) -> bool:
+    real_a = [r for r in a_regions if hasattr(r, "bounds")]
+    real_b = [r for r in b_regions if hasattr(r, "bounds")]
+    if not real_a or not real_b:
+        return True
+    return any(
+        _directions_compatible(a, real_b) and _text_regions_adjacent(a, b)
+        for a in real_a
+        for b in real_b
+    )
+
+
+def _compact_group_ok(members, candidate) -> bool:
+    """拒绝由窄小区域桥接出的稀疏大组。"""
+    boxes = [m[0] for m in members] + [candidate[0]]
+    union = boxes[0]
+    for box in boxes[1:]:
+        union = _union(union, box)
+    union_area = max(1, (union[2] - union[0]) * (union[3] - union[1]))
+    member_area = sum(max(1, (b[2] - b[0]) * (b[3] - b[1])) for b in boxes)
+    return union_area <= 2.2 * member_area
 
 
 _PUNCT = set("。、，,！!？?…〜~ー―─-「」『』（）()♪☆★・･ ")
@@ -361,14 +499,32 @@ def _merge_overlap_groups(groups, overlap=0.15):
             j = i + 1
             while j < len(groups):
                 a, b = groups[i]["bbox"], groups[j]["bbox"]
-                if _balloon_ok(a, b) and (
-                    _overlap_ratio(a, b) > overlap
-                    or _contains(a, b)
-                    or _contains(b, a)
-                    or _proximity_overlap(a, b)
-                ):
+                ma, mb = groups[i].get("mask"), groups[j].get("mask")
+                ra = bool(groups[i].get("mask_reliable")) and ma is not None
+                rb = bool(groups[j].get("mask_reliable")) and mb is not None
+                same_mask = ra and rb and _mask_overlap_ratio(ma, mb) >= 0.55
+                fallback_ok = (
+                    not (ra and rb)
+                    and _balloon_ok(a, b)
+                    and _groups_text_compatible(groups[i]["regions"], groups[j]["regions"])
+                    and _compact_group_ok(
+                        groups[i].get("members") or [(a, ma, ra, None)],
+                        (b, mb, rb, None),
+                    )
+                    and (
+                        _overlap_ratio(a, b) > max(0.45, overlap * 2.5)
+                        or _contains(a, b)
+                        or _contains(b, a)
+                        or _proximity_overlap(a, b)
+                    )
+                )
+                if same_mask or fallback_ok:
                     groups[i]["bbox"] = _union(a, b)
                     groups[i]["regions"].extend(groups[j]["regions"])
+                    groups[i].setdefault("members", []).extend(groups[j].get("members", []))
+                    if mb is not None:
+                        groups[i]["mask"] = mb if ma is None else np.maximum(ma, mb)
+                        groups[i]["mask_reliable"] = ra or rb
                     groups.pop(j)
                     changed = True
                 else:
