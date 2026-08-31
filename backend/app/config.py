@@ -22,14 +22,16 @@ class Settings(BaseSettings):
 
     # 文件限制
     max_upload_mb: int = 10
-    batch_max_files: int = 10
-    batch_max_total_mb: int = 50
+    batch_max_files: int = 100
+    batch_max_total_mb: int = 500
     allowed_extensions: str = ".jpg,.jpeg,.png,.webp,.bmp"
 
     # 流水线引擎选择: demo | real
     pipeline_mode: str = "real"
     # 翻译语言
-    default_target_lang: str = "CHS"
+    default_source_lang: str = "auto"
+    default_target_lang: str = "zh"
+    auto_source_fallback: str = "ja"
     # OCR 支持语言
     ocr_langs: str = "ja,en,ch"
     # OCR 引擎（默认混合最准）: mit48+mangaocr（默认，48px + manga-ocr 补识别） | mit48 | mangaocr | paddle（回退）
@@ -64,7 +66,8 @@ class Settings(BaseSettings):
     translator_backend: str = "google"  # google | deepseek | deepl | openai
     deepl_auth_key: str = ""
     deepseek_api_key: str = ""
-    deepseek_model: str = "deepseek-chat"
+    deepseek_model: str = "deepseek-v4-flash"
+    deepseek_english_model: str = "deepseek-v4-flash"
     deepseek_base_url: str = "https://api.deepseek.com"
     openai_api_key: str = ""
     openai_base_url: str = "https://api.openai.com/v1"

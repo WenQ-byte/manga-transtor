@@ -1,6 +1,6 @@
 # 漫译 · 漫画多语言智能翻译系统
 
-面向日语/英语漫画的中文翻译 Web 应用。系统完成文本检测、OCR、原文擦除、气泡分组、上下文翻译和中文排版，并尽量保持原漫画的分镜、气泡轮廓与阅读顺序。
+面向中文、日语和英语漫画的三语互译 Web 应用。系统完成文本检测、OCR、原文擦除、气泡分组、上下文翻译和多语言排版，并尽量保持原漫画的分镜、气泡轮廓与阅读顺序。
 
 当前版本为本地可运行 MVP：FastAPI 后端 + React/Vite 前端。默认检测与 OCR 路线移植自 `manga-image-translator`，相关代码遵循 GPL-3.0，详见 [THIRD_PARTY.md](THIRD_PARTY.md)。
 
@@ -8,18 +8,19 @@
 
 截至 2026-08-31：
 
-- 单图日语/英语 → 中文主流程已经打通。
-- 支持最多 10 张图片批量创建独立翻译任务、汇总进度，并将成功结果和清单打包为 ZIP。
+- 支持中文、日语、英语之间全部六种翻译方向，单图与批量流程共用同一套语言配置。
+- 支持自动检测源语言，默认行为为“自动检测 → 中文”。
+- 支持最多 100 张图片批量创建独立翻译任务、汇总进度，并将成功结果和清单打包为 ZIP。
 - 默认使用 CTD 检测器与 `mit48+mangaocr` 混合 OCR，PaddleOCR 作为回退方案。
 - 支持 CV 与 LaMa 两种修复引擎；LaMa 采用局部原尺寸推理，减少整页缩放造成的灰色残影。
 - 支持 DeepSeek、OpenAI、DeepL、Google 和 MyMemory，并提供自动回退与质量告警。
-- 横排/竖排中文自适应排版已经实现，竖排支持语义断列、标点保护与原文列序保持。
+- 中文和日语支持横竖排自适应；英语目标采用安全横排并优先在词间换行。
 - 气泡分组同时使用清理图内部区域和原图轮廓，避免修复后轮廓变弱导致相邻气泡误合并。
-- 当前自动化测试共 77 项，全部通过；JoJo 双页回归图识别为 13 个气泡，目标相邻区域稳定拆分为 3 个气泡。
+- 当前自动化测试共 108 项，全部通过；JoJo 双页回归图识别为 13 个气泡，目标相邻区域稳定拆分为 3 个气泡。
 
 ## 主要能力
 
-- 上传 JPG、JPEG、PNG、WebP、BMP，默认单文件上限 10 MB；批量默认最多 10 张、总计 50 MB。
+- 上传 JPG、JPEG、PNG、WebP、BMP，默认单文件上限 10 MB；批量默认最多 100 张、总计 500 MB。
 - 每张批量图片复用独立单图流水线，支持总体/单图进度、部分失败和 ZIP 汇总导出。
 - 批量子任务按顺序进入共享模型流水线，避免 CTD、OCR 和翻译器实例并发造成检测框、掩膜或识别结果污染。
 - CTD/DBNet 漫画文本检测，支持复杂分镜、竖排文字和网点背景。
@@ -29,7 +30,7 @@
 - OCR 多边形、逐像素检测掩膜、Otsu 笔画与注音扩展联合生成擦除掩膜。
 - 白色气泡使用受限局部背景重建，复杂纹理交给 CV TELEA 或 LaMa；修复后执行保守残影检测。
 - 气泡级上下文翻译、页级 DeepSeek 批量翻译、专有名词整词替换。
-- 记录翻译后端与回退原因，并检查原文直出、明显过短译文、残留日文和数字遗漏。
+- 记录请求语言、自动识别结果、实际翻译后端与回退原因，并按语言方向检查原文直出、异常过短、语言残留和数字遗漏。
 - 中文横排均衡换行；竖排按原文阅读顺序分列，并避免拆开常见双字词和闭合标点。
 - 气泡掩膜、有限安全扩展框、紧致文本框、跳过渲染四级回退，降低文字越界和覆盖人物的风险。
 - 实时步骤进度、网页预览、结果下载和图形化专有名词管理。
@@ -94,6 +95,16 @@ MANGA_INPAINT_DEVICE=cpu
 
 如果没有 `.env`，代码级翻译默认值为 Google；`.env.example` 推荐 DeepSeek。未配置或不可用的高质量后端会自动回退到 Google、MyMemory，最后仅应用词典并保留原文。
 
+语言默认配置如下：
+
+```dotenv
+MANGA_DEFAULT_SOURCE_LANG=auto
+MANGA_DEFAULT_TARGET_LANG=zh
+MANGA_AUTO_SOURCE_FALLBACK=ja
+```
+
+自动检测基于整页 OCR 文本：出现假名时优先判为日语，拉丁字母占主导时判为英语，不含假名的汉字文本判为中文。空文本、纯数字和信息不足的短文本使用 `MANGA_AUTO_SOURCE_FALLBACK`，原因与置信度会写入任务元数据。
+
 ### 3. 启动
 
 推荐双击 `start.bat`，或运行：
@@ -142,14 +153,16 @@ Docker 镜像是否包含全部 AI 模型取决于本地权重与构建配置；
 | `MANGA_MIT_OCR_UPSCALE` | 小于该字号的文本先放大识别 | `16` |
 | `MANGA_BUBBLE_FILTER` | `auto` / `on` / `off` | `auto` |
 | `MANGA_TRANSLATOR_BACKEND` | `deepseek` / `openai` / `deepl` / `google` / `mymemory` | `google` |
+| `MANGA_DEEPSEEK_MODEL` | 日语等非英语翻译使用的 DeepSeek 模型 | `deepseek-v4-flash` |
+| `MANGA_DEEPSEEK_ENGLISH_MODEL` | 英语→中文使用的 DeepSeek 模型 | `deepseek-v4-flash` |
 | `MANGA_INPAINTER_BACKEND` | `cv` / `lama` | `cv` |
 | `MANGA_LAMA_MODEL_PATH` | LaMa 权重路径 | 自动搜索 |
 | `MANGA_LAMA_INPAINT_SIZE` | 单个 LaMa 推理区域的最长边上限 | `1024` |
 | `MANGA_INPAINT_DEVICE` | `cpu` / `cuda` | `cpu` |
 | `MANGA_RENDER_PADDING` | 气泡内边距比例 | `0.12` |
 | `MANGA_MAX_UPLOAD_MB` | 上传大小上限 | `10` |
-| `MANGA_BATCH_MAX_FILES` | 单批图片数量上限 | `10` |
-| `MANGA_BATCH_MAX_TOTAL_MB` | 单批总大小上限（MB） | `50` |
+| `MANGA_BATCH_MAX_FILES` | 单批图片数量上限 | `100` |
+| `MANGA_BATCH_MAX_TOTAL_MB` | 单批总大小上限（MB） | `500` |
 
 完整配置见 [.env.example](.env.example) 和 [backend/app/config.py](backend/app/config.py)。
 
@@ -208,6 +221,10 @@ test_image/                 本地回归漫画，不纳入版本库
 | `GET` | `/api/translate/{task_id}/status` | 查询任务进度 |
 | `GET` | `/api/translate/{task_id}/result` | 下载翻译结果 |
 | `DELETE` | `/api/translate/{task_id}` | 删除任务 |
+
+单图接口通过查询参数、批量接口通过表单字段接收 `source_lang` 与 `target_lang`。`source_lang` 支持 `auto`、`zh`、`ja`、`en`，`target_lang` 支持 `zh`、`ja`、`en`；显式选择相同语言会返回 400。旧客户端不传参数时按“自动检测 → 中文”运行。批量中的全部图片使用同一组语言配置，每张图片的实际识别语言、后端和回退信息分别记录。
+
+DeepSeek 与 OpenAI 使用按目标语言生成的漫画提示词；DeepSeek继续提供页级编号上下文和解析失败后的逐条回退。DeepL、Google、MyMemory 通过统一映射层转换语言代码，不支持的代码会失败并进入既有回退链。MIT48 与 manga-ocr 主要针对日语漫画优化；中文源图和复杂英文源图若识别不稳定，建议显式选择语言并使用 PaddleOCR。
 | `GET` / `POST` | `/api/glossary` | 查询或新增词条 |
 | `PUT` / `DELETE` | `/api/glossary/{item_id}` | 修改或删除词条 |
 | `POST` | `/api/glossary/import` | JSON 批量导入词典 |

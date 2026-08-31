@@ -22,6 +22,8 @@ from app.services.pipeline import TextRegion
 # 中文字体候选（Windows / Linux）
 FONT_CANDIDATES = [
     "C:/Windows/Fonts/msyh.ttc",  # 微软雅黑
+    "C:/Windows/Fonts/YuGothR.ttc",  # 游ゴシック
+    "C:/Windows/Fonts/msgothic.ttc",  # MS Gothic
     "C:/Windows/Fonts/msyhbd.ttc",  # 微软雅黑 Bold（无常规字体时回退）
     "C:/Windows/Fonts/simhei.ttf",  # 黑体
     "C:/Windows/Fonts/msjh.ttc",  # 微软正黑（繁中）
@@ -117,7 +119,8 @@ class PILRenderer(BaseRenderer):
             fill, stroke = self._text_colors(group_regions)
             group_overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
             odraw = ImageDraw.Draw(group_overlay)
-            if self._use_vertical(group_regions, bw, bh):
+            target_value = getattr(target_lang, "value", target_lang)
+            if target_value != "en" and self._use_vertical(group_regions, bw, bh):
                 if block:
                     self._render_vertical_bubble_block(
                         odraw, block, bx0, by0, bw, bh, min_font_size, fill=fill, stroke=stroke
@@ -840,6 +843,8 @@ class PILRenderer(BaseRenderer):
 
     def _wrap_text(self, text: str, font: ImageFont.FreeTypeFont, max_width: int) -> list[str]:
         """按宽度均衡换行（适合中文/日文）：每行长度相近，末行不过短"""
+        if " " in text and any(ch.isascii() and ch.isalpha() for ch in text):
+            return self._wrap_latin_text(text, font, max_width)
         # 先宽贪心求最少行数
         greedy = self._greedy_wrap(text, font, max_width)
         if len(greedy) <= 1:
@@ -862,6 +867,28 @@ class PILRenderer(BaseRenderer):
         if not lines:
             lines = [text]
         return lines
+
+    @staticmethod
+    def _wrap_latin_text(text: str, font: ImageFont.FreeTypeFont, max_width: int) -> list[str]:
+        """英文优先在词间换行，单个超长词才安全拆分。"""
+        lines: list[str] = []
+        current = ""
+        for word in text.split():
+            candidate = f"{current} {word}".strip()
+            if current and _text_length(font, candidate) > max_width:
+                lines.append(current)
+                current = word
+            else:
+                current = candidate
+            while current and _text_length(font, current) > max_width:
+                cut = len(current) - 1
+                while cut > 1 and _text_length(font, current[:cut]) > max_width:
+                    cut -= 1
+                lines.append(current[:cut])
+                current = current[cut:]
+        if current:
+            lines.append(current)
+        return lines or [text]
 
     @staticmethod
     def _greedy_wrap(text: str, font: ImageFont.FreeTypeFont, max_width: int) -> list[str]:

@@ -8,7 +8,7 @@ import uuid
 import zipfile
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, Response
 
 from app.config import get_settings
@@ -20,10 +20,14 @@ from app.models.schemas import (
     BatchTranslateResponse,
     TranslateResponse,
     TranslateStatus,
+    SourceLangCode,
+    LangCode,
 )
 from app.services.task_manager import TranslationTaskManager
 
 router = APIRouter(prefix="/api", tags=["translate"])
+_DEFAULT_SOURCE_LANG = get_settings().default_source_lang
+_DEFAULT_TARGET_LANG = get_settings().default_target_lang
 
 
 def get_manager() -> TranslationTaskManager:
@@ -47,10 +51,12 @@ def _validate_upload(file: UploadFile) -> None:
 
 
 def _validate_languages(source_lang: str, target_lang: str) -> None:
-    if source_lang not in ("ja", "en", "zh"):
+    if source_lang not in ("auto", "ja", "en", "zh"):
         raise HTTPException(status_code=400, detail=f"不支持的源语言: {source_lang}")
     if target_lang not in ("ja", "en", "zh"):
         raise HTTPException(status_code=400, detail=f"不支持的目标语言: {target_lang}")
+    if source_lang != "auto" and source_lang == target_lang:
+        raise HTTPException(status_code=400, detail="源语言和目标语言不能相同")
 
 
 def _validate_content(content: bytes) -> None:
@@ -93,14 +99,20 @@ def _batch_status_item(task_id: str, task: dict | None, request_index: int) -> B
         text_count=int(task.get("text_count") or 0),
         duration_ms=int(task.get("duration_ms") or 0),
         error=task.get("error") or None,
+        source_lang=task.get("source_lang") or "auto",
+        target_lang=task.get("target_lang") or "zh",
+        detected_source_lang=meta.get("detected_source_lang"),
+        translation_backends=meta.get("translation_backends") or [],
+        translation_failures=meta.get("translation_failures") or [],
+        quality_warnings=meta.get("quality_warnings") or [],
     )
 
 
 @router.post("/translate", response_model=TranslateResponse)
 async def translate_image(
     file: UploadFile,
-    source_lang: str = "ja",
-    target_lang: str = "zh",
+    source_lang: SourceLangCode = Query(_DEFAULT_SOURCE_LANG, description="源语言：auto 自动检测，或 zh、ja、en"),
+    target_lang: LangCode = Query(_DEFAULT_TARGET_LANG, description="目标语言：zh、ja、en"),
     manager: TranslationTaskManager = Depends(get_manager),
 ):
     _validate_upload(file)
@@ -116,8 +128,8 @@ async def translate_image(
 @router.post("/translate/batch", response_model=BatchTranslateResponse)
 async def translate_batch(
     files: list[UploadFile] = File(..., alias="files[]"),
-    source_lang: str = Form("ja"),
-    target_lang: str = Form("zh"),
+    source_lang: SourceLangCode = Form(_DEFAULT_SOURCE_LANG, description="源语言：auto 自动检测，或 zh、ja、en"),
+    target_lang: LangCode = Form(_DEFAULT_TARGET_LANG, description="目标语言：zh、ja、en"),
     manager: TranslationTaskManager = Depends(get_manager),
 ):
     """校验全部文件后，为每张图片创建独立的现有单图任务。"""
@@ -154,7 +166,13 @@ async def translate_batch(
             target_lang,
             content,
             filename,
-            metadata={"batch_id": batch_id, "filename": filename, "index": index},
+            metadata={
+                "batch_id": batch_id,
+                "filename": filename,
+                "index": index,
+                "requested_source_lang": source_lang,
+                "target_lang": target_lang,
+            },
         )
         items.append(BatchTaskItem(task_id=task_id, filename=filename, index=index))
     return BatchTranslateResponse(total=len(items), items=items)
@@ -204,6 +222,10 @@ async def download_batch_zip(
                     "status": "failed",
                     "text_count": 0,
                     "duration_ms": 0,
+                    "source_lang": None,
+                    "target_lang": None,
+                    "detected_source_lang": None,
+                    "translation_backends": [],
                 })
                 errors.append(f"未知文件（{task_id}）：任务不存在")
                 continue
@@ -235,6 +257,11 @@ async def download_batch_zip(
                 "status": task["status"],
                 "text_count": int(task.get("text_count") or 0),
                 "duration_ms": int(task.get("duration_ms") or 0),
+                "source_lang": task.get("source_lang"),
+                "target_lang": task.get("target_lang"),
+                "detected_source_lang": (task.get("meta") or {}).get("detected_source_lang"),
+                "translation_backends": (task.get("meta") or {}).get("translation_backends") or [],
+                "translation_failures": (task.get("meta") or {}).get("translation_failures") or [],
             })
             if result_name is None:
                 errors.append(f"{_safe_archive_name(original_name)}（{task_id}）：{error}")
@@ -264,6 +291,14 @@ async def get_status(task_id: str, manager: TranslationTaskManager = Depends(get
         message=task.get("error") or None,
         text_count=task.get("text_count", 0),
         duration_ms=task.get("duration_ms", 0),
+        source_lang=task.get("source_lang") or "auto",
+        target_lang=task.get("target_lang") or "zh",
+        detected_source_lang=(task.get("meta") or {}).get("detected_source_lang"),
+        detection_confidence=(task.get("meta") or {}).get("detection_confidence"),
+        detection_reason=(task.get("meta") or {}).get("detection_reason"),
+        translation_backends=(task.get("meta") or {}).get("translation_backends") or [],
+        translation_failures=(task.get("meta") or {}).get("translation_failures") or [],
+        quality_warnings=(task.get("meta") or {}).get("quality_warnings") or [],
     )
 
 

@@ -40,8 +40,8 @@ const STEPS = [
 
 const ALLOWED = '.jpg,.jpeg,.png,.webp,.bmp'
 const MAX_MB = 10
-const MAX_BATCH_FILES = 10
-const MAX_BATCH_MB = 50
+const MAX_BATCH_FILES = 100
+const MAX_BATCH_MB = 500
 
 function stepIndexFromProgress(progress) {
   let acc = 0
@@ -116,7 +116,7 @@ export default function TranslatePanel() {
   const [filePreviewUrl, setFilePreviewUrl] = useState('')
   const [fileError, setFileError] = useState('')
   const [isDragging, setIsDragging] = useState(false)
-  const [sourceLang, setSourceLang] = useState('ja')
+  const [sourceLang, setSourceLang] = useState('auto')
   const [targetLang, setTargetLang] = useState('zh')
 
   const [taskId, setTaskId] = useState(null)
@@ -204,6 +204,11 @@ export default function TranslatePanel() {
 
   async function startTranslate() {
     if (!files.length) return
+    if (sourceLang !== 'auto' && sourceLang === targetLang) {
+      setFileError('源语言和目标语言不能相同')
+      notify('源语言和目标语言不能相同', 'error')
+      return
+    }
     setPhase('submitting')
     setFileError('')
     setErrorMessage('')
@@ -265,6 +270,10 @@ export default function TranslatePanel() {
           originalUrl: filePreviewUrl,
           textCount: status.text_count,
           durationMs: status.duration_ms,
+          sourceLang: status.source_lang,
+          targetLang: status.target_lang,
+          detectedSourceLang: status.detected_source_lang,
+          translationBackends: status.translation_backends || [],
         })
         setPhase('result')
         notify('翻译完成', 'success')
@@ -392,6 +401,8 @@ export default function TranslatePanel() {
                 value={sourceLang}
                 onChange={setSourceLang}
                 options={[
+                  { value: 'auto', label: '自动检测' },
+                  { value: 'zh', label: '中文' },
                   { value: 'ja', label: '日语' },
                   { value: 'en', label: '英语' },
                 ]}
@@ -404,12 +415,26 @@ export default function TranslatePanel() {
                 label="Target"
                 value={targetLang}
                 onChange={setTargetLang}
-                options={[{ value: 'zh', label: '中文' }]}
+                options={[
+                  { value: 'zh', label: '中文' },
+                  { value: 'ja', label: '日语' },
+                  { value: 'en', label: '英语' },
+                ]}
               />
             </div>
+            <p className="mt-3 text-center text-sm text-ink-500">
+              当前方向：{languageLabel(sourceLang)} → {languageLabel(targetLang)}
+            </p>
+            {sourceLang !== 'auto' && sourceLang === targetLang && (
+              <p className="mt-2 text-center text-sm text-danger">源语言和目标语言不能相同</p>
+            )}
 
             <div className="mt-9 flex justify-center">
-              <SpecularButton {...SPECULAR_PRIMARY} disabled={!files.length} onClick={startTranslate}>
+              <SpecularButton
+                {...SPECULAR_PRIMARY}
+                disabled={!files.length || (sourceLang !== 'auto' && sourceLang === targetLang)}
+                onClick={startTranslate}
+              >
                 <Wand2 size={18} />
                 {files.length > 1 ? `开始批量翻译（${files.length} 张）` : '开始翻译'}
               </SpecularButton>
@@ -500,6 +525,10 @@ export default function TranslatePanel() {
                 <p className="mt-1 text-sm text-ink-500">
                   共识别 {result.textCount} 处文字
                   {result.durationMs ? ` · 耗时 ${formatDuration(result.durationMs)}` : ''}
+                </p>
+                <p className="mt-1 text-sm text-ink-500">
+                  {languageLabel(result.detectedSourceLang || result.sourceLang)} → {languageLabel(result.targetLang)}
+                  {result.translationBackends?.length ? ` · ${result.translationBackends.join(' / ')}` : ''}
                 </p>
               </div>
               <SpecularButton
@@ -630,7 +659,7 @@ function Dropzone({ files, previewUrl, isDragging, setIsDragging, onDrop, onSele
             </motion.div>
             <p className="text-[15px] font-medium text-ink-100">点击上传，或拖拽多张图片到此处</p>
             <p className="mt-2 text-[13px] text-ink-500">
-              支持 JPG / PNG / WebP / BMP · 单张 10MB · 最多 10 张 / 共 50MB
+              支持 JPG / PNG / WebP / BMP · 单张 10MB · 最多 100 张 / 共 500MB
             </p>
           </div>
         ) : files.length === 1 ? (
@@ -681,6 +710,10 @@ function Dropzone({ files, previewUrl, isDragging, setIsDragging, onDrop, onSele
       </GlassSurface>
     </div>
   )
+}
+
+function languageLabel(code) {
+  return { auto: '自动检测', zh: '中文', ja: '日语', en: '英语' }[code] || code || '未知语言'
 }
 
 function FileRow({ file, previewUrl, onRemove }) {
@@ -736,6 +769,10 @@ function BatchItems({ items }) {
             />
           </div>
           {item.error && <p className="mt-2 text-xs text-danger">{item.error}</p>}
+          <p className="mt-2 text-xs text-ink-500">
+            {languageLabel(item.detected_source_lang || item.source_lang)} → {languageLabel(item.target_lang)}
+            {item.translation_backends?.length ? ` · ${item.translation_backends.join(' / ')}` : ''}
+          </p>
         </div>
       ))}
     </div>

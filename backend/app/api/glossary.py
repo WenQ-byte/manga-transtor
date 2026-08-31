@@ -23,8 +23,12 @@ async def list_glossary(lang: str = "", search: str = "", q: str = ""):
 
 @router.post("", response_model=GlossaryItem)
 async def create_glossary(item: GlossaryItem):
+    if item.lang == item.target_lang:
+        raise HTTPException(status_code=400, detail="词典源语言和目标语言不能相同")
     service = _get_service()
-    item_id, msg = service.create(item.source, item.target, item.lang, item.note)
+    item_id, msg = service.create(
+        item.source, item.target, item.lang, item.note, item.target_lang
+    )
     if item_id == -1:
         raise HTTPException(status_code=409, detail=msg)
     return GlossaryItem(id=item_id, **item.model_dump(exclude={"id"}))
@@ -32,8 +36,12 @@ async def create_glossary(item: GlossaryItem):
 
 @router.put("/{item_id}", response_model=GlossaryItem)
 async def update_glossary(item_id: int, item: GlossaryItem):
+    if item.lang == item.target_lang:
+        raise HTTPException(status_code=400, detail="词典源语言和目标语言不能相同")
     service = _get_service()
-    ok, msg = service.update(item_id, item.source, item.target, item.lang, item.note)
+    ok, msg = service.update(
+        item_id, item.source, item.target, item.lang, item.note, item.target_lang
+    )
     if not ok:
         raise HTTPException(status_code=404, detail=msg)
     return GlossaryItem(id=item_id, **item.model_dump(exclude={"id"}))

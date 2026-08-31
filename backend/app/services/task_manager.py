@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Optional
 
-from app.models.schemas import LangCode
+from app.models.schemas import LangCode, SourceLangCode
 from app.services.pipeline import PIPELINE_STEPS, TranslationPipeline, create_pipeline
 from app.storage.database import Database
 from app.storage.file_store import FileStore
@@ -40,7 +40,7 @@ class TranslationTaskManager:
 
     def create_task(
         self,
-        source_lang: LangCode,
+        source_lang: SourceLangCode,
         target_lang: LangCode,
         image_bytes: bytes,
         filename: str,
@@ -48,17 +48,20 @@ class TranslationTaskManager:
     ) -> str:
         task_id = uuid.uuid4().hex[:16]
         _, abs_path = self.files.save_upload(image_bytes, filename)
+        task_meta = dict(metadata or {})
+        task_meta.setdefault("requested_source_lang", source_lang)
+        task_meta.setdefault("target_lang", target_lang)
         self.db.task_create(
             task_id,
             source_lang,
             target_lang,
             original_path=abs_path,
-            meta=metadata,
+            meta=task_meta,
         )
         self._executor.submit(self._run, task_id, source_lang, target_lang, abs_path)
         return task_id
 
-    def _run(self, task_id: str, source_lang: LangCode, target_lang: LangCode, image_path: str) -> None:
+    def _run(self, task_id: str, source_lang: SourceLangCode, target_lang: LangCode, image_path: str) -> None:
         step_names = [s for s, _ in PIPELINE_STEPS]
 
         def progress_cb(step_name: str, progress: int) -> None:
@@ -82,24 +85,43 @@ class TranslationTaskManager:
                     progress_cb=progress_cb,
                 )
 
-            if not result.regions:
+            supports_meta = hasattr(self.db, "task_get")
+            task = self.db.task_get(task_id) if supports_meta else {}
+            task = task or {}
+            meta = dict(task.get("meta") or {})
+            meta.update({
+                "detected_source_lang": getattr(result, "detected_source_lang", source_lang),
+                "detection_confidence": getattr(result, "detection_confidence", 1.0),
+                "detection_reason": getattr(result, "detection_reason", "显式指定源语言"),
+                "ocr_backend": getattr(result, "ocr_backend", ""),
+                "translation_backends": sorted(set(getattr(result, "translation_backends", []))),
+                "translation_failures": getattr(result, "translation_failures", []),
+                "quality_warnings": getattr(result, "quality_warnings", []),
+                "translation_skipped": getattr(result, "translation_skipped", False),
+            })
+
+            image_bytes = getattr(result, "image_bytes", None)
+            if not result.regions and not image_bytes:
                 self.db.task_update(
                     task_id, status="completed", progress=100, step="render",
                     text_count=0, duration_ms=result.duration_ms,
+                    **({"meta": meta} if supports_meta else {}),
                 )
                 return
 
-            if result.image_bytes:
-                _, result_rel = self.files.save_result(result.image_bytes, ".png")
+            if image_bytes:
+                _, result_rel = self.files.save_result(image_bytes, ".png")
                 self.db.task_update(
                     task_id, status="completed", progress=100, step="render",
                     result_path=result_rel, text_count=len(result.regions),
                     duration_ms=result.duration_ms,
+                    **({"meta": meta} if supports_meta else {}),
                 )
             else:
                 self.db.task_update(
                     task_id, status="completed", progress=100, step="render",
                     text_count=len(result.regions), duration_ms=result.duration_ms,
+                    **({"meta": meta} if supports_meta else {}),
                 )
         except Exception as e:  # noqa: BLE001
             traceback.print_exc()

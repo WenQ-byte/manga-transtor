@@ -46,13 +46,11 @@ class Database:
                 source TEXT NOT NULL,
                 target TEXT NOT NULL,
                 lang TEXT NOT NULL DEFAULT 'ja',
+                target_lang TEXT NOT NULL DEFAULT 'zh',
                 note TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
                 updated_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_glossary_unique
-                ON glossary (source, target, lang);
-
             CREATE TABLE IF NOT EXISTS tasks (
                 id TEXT PRIMARY KEY,
                 source_lang TEXT NOT NULL,
@@ -71,15 +69,25 @@ class Database:
             );
             """
         )
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(glossary)").fetchall()}
+        if "target_lang" not in columns:
+            conn.execute("ALTER TABLE glossary ADD COLUMN target_lang TEXT NOT NULL DEFAULT 'zh'")
+        conn.execute("DROP INDEX IF EXISTS idx_glossary_unique")
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_glossary_unique "
+            "ON glossary (source, target, lang, target_lang)"
+        )
         conn.commit()
 
     # ---- Glossary ----
-    def glossary_create(self, source: str, target: str, lang: str, note: str) -> int:
+    def glossary_create(
+        self, source: str, target: str, lang: str, note: str, target_lang: str = "zh"
+    ) -> int:
         conn = self._connect()
         try:
             cur = conn.execute(
-                "INSERT INTO glossary (source, target, lang, note) VALUES (?,?,?,?)",
-                (source, target, lang, note),
+                "INSERT INTO glossary (source, target, lang, note, target_lang) VALUES (?,?,?,?,?)",
+                (source, target, lang, note, target_lang),
             )
             conn.commit()
             return cur.lastrowid
@@ -100,12 +108,14 @@ class Database:
         rows = conn.execute(sql, params).fetchall()
         return [dict(r) for r in rows]
 
-    def glossary_update(self, item_id: int, source: str, target: str, lang: str, note: str) -> bool:
+    def glossary_update(
+        self, item_id: int, source: str, target: str, lang: str, note: str, target_lang: str = "zh"
+    ) -> bool:
         conn = self._connect()
         try:
             cur = conn.execute(
-                "UPDATE glossary SET source=?, target=?, lang=?, note=?, updated_at=datetime('now') WHERE id=?",
-                (source, target, lang, note, item_id),
+                "UPDATE glossary SET source=?, target=?, lang=?, note=?, target_lang=?, updated_at=datetime('now') WHERE id=?",
+                (source, target, lang, note, target_lang, item_id),
             )
             conn.commit()
             return cur.rowcount > 0
@@ -118,10 +128,13 @@ class Database:
         conn.commit()
         return cur.rowcount > 0
 
-    def glossary_get_mapping(self, lang: str) -> dict[str, str]:
+    def glossary_get_mapping(self, lang: str, target_lang: str = "zh") -> dict[str, str]:
         """返回 {source: target} 映射，用于翻译时替换专有名词"""
         conn = self._connect()
-        rows = conn.execute("SELECT source, target FROM glossary WHERE lang=?", (lang,)).fetchall()
+        rows = conn.execute(
+            "SELECT source, target FROM glossary WHERE lang=? AND target_lang=?",
+            (lang, target_lang),
+        ).fetchall()
         return {r["source"]: r["target"] for r in rows}
 
     def glossary_import(self, items: list[dict[str, Any]]) -> tuple[int, int]:
@@ -133,6 +146,7 @@ class Database:
                 str(it.get("target", "")).strip(),
                 str(it.get("lang", "ja")),
                 str(it.get("note", "")),
+                str(it.get("target_lang", "zh")),
             )
             if rid == -1:
                 skipped += 1
@@ -167,6 +181,7 @@ class Database:
         result_path: Optional[str] = None,
         text_count: Optional[int] = None,
         duration_ms: Optional[int] = None,
+        meta: Optional[dict] = None,
     ) -> None:
         conn = self._connect()
         fields: list[str] = []
@@ -179,6 +194,7 @@ class Database:
             ("result_path", result_path),
             ("text_count", text_count),
             ("duration_ms", duration_ms),
+            ("meta", json.dumps(meta, ensure_ascii=False) if meta is not None else None),
         ]:
             if val is not None:
                 fields.append(f"{col}=?")

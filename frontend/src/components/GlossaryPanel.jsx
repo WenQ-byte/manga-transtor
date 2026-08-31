@@ -10,8 +10,8 @@ import { SPECULAR_PRIMARY, SPECULAR_SECONDARY } from './specularPresets'
 const LANG = { ja: '日', en: '英', zh: '中' }
 
 const TEMPLATE = [
-  { source: 'ナルト', target: '鸣人', lang: 'ja', note: '火影忍者主角' },
-  { source: 'ルフィ', target: '路飞', lang: 'ja', note: '海贼王主角' },
+  { source: 'ナルト', target: '鸣人', lang: 'ja', target_lang: 'zh', note: '火影忍者主角' },
+  { source: 'ルフィ', target: '路飞', lang: 'ja', target_lang: 'zh', note: '海贼王主角' },
 ]
 
 const listMotion = {
@@ -201,7 +201,7 @@ export default function GlossaryPanel({ onCountChange }) {
                 </div>
                 <div className="flex shrink-0 items-center gap-2">
                   <span className="mr-1 rounded-md border border-line bg-surface-2 px-2 py-0.5 font-mono text-[11px] text-ink-400">
-                    {LANG[item.lang] || item.lang}
+                    {LANG[item.lang] || item.lang}→{LANG[item.target_lang || 'zh'] || item.target_lang}
                   </span>
                   <button
                     onClick={() => openEditor(item)}

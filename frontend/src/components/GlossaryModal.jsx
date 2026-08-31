@@ -8,7 +8,7 @@ import { SPECULAR_PRIMARY, SPECULAR_SECONDARY } from './specularPresets'
 
 export default function GlossaryModal({ open, item, onClose, onSaved }) {
   const notify = useToast()
-  const [form, setForm] = useState({ source: '', target: '', lang: 'ja', note: '' })
+  const [form, setForm] = useState({ source: '', target: '', lang: 'ja', target_lang: 'zh', note: '' })
   const [error, setError] = useState('')
   const [saving, setSaving] = useState(false)
 
@@ -16,8 +16,8 @@ export default function GlossaryModal({ open, item, onClose, onSaved }) {
     if (open) {
       setForm(
         item
-          ? { id: item.id, source: item.source, target: item.target, lang: item.lang, note: item.note || '' }
-          : { id: null, source: '', target: '', lang: 'ja', note: '' },
+          ? { id: item.id, source: item.source, target: item.target, lang: item.lang, target_lang: item.target_lang || 'zh', note: item.note || '' }
+          : { id: null, source: '', target: '', lang: 'ja', target_lang: 'zh', note: '' },
       )
       setError('')
     }
@@ -38,6 +38,10 @@ export default function GlossaryModal({ open, item, onClose, onSaved }) {
     }
     if (!form.target.trim()) {
       setError('target')
+      return
+    }
+    if (form.lang === form.target_lang) {
+      setError('language')
       return
     }
     setSaving(true)
@@ -126,7 +130,10 @@ export default function GlossaryModal({ open, item, onClose, onSaved }) {
                 <div className="relative">
                   <select
                     value={form.lang}
-                    onChange={(e) => setForm((f) => ({ ...f, lang: e.target.value }))}
+                    onChange={(e) => {
+                      setForm((f) => ({ ...f, lang: e.target.value }))
+                      setError('')
+                    }}
                     className="input-base appearance-none px-4 py-3 pr-10"
                   >
                     <option value="ja" className="bg-surface-2">日语</option>
@@ -134,6 +141,24 @@ export default function GlossaryModal({ open, item, onClose, onSaved }) {
                     <option value="zh" className="bg-surface-2">中文</option>
                   </select>
                 </div>
+              </Field>
+
+              <Field label="目标语言">
+                <div className="relative">
+                  <select
+                    value={form.target_lang}
+                    onChange={(e) => {
+                      setForm((f) => ({ ...f, target_lang: e.target.value }))
+                      setError('')
+                    }}
+                    className={`input-base appearance-none px-4 py-3 pr-10 ${error === 'language' ? '!border-danger/60' : ''}`}
+                  >
+                    <option value="zh" className="bg-surface-2">中文</option>
+                    <option value="ja" className="bg-surface-2">日语</option>
+                    <option value="en" className="bg-surface-2">英语</option>
+                  </select>
+                </div>
+                {error === 'language' && <ErrorHint>源语言和目标语言不能相同</ErrorHint>}
               </Field>
 
               <Field label="备注">

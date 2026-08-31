@@ -21,6 +21,10 @@ BUILTIN_GLOSSARY = [
     {"source": "ちゃん", "target": "酱", "lang": "ja", "note": "称呼后缀"},
 ]
 
+BUILTIN_ENGLISH_GLOSSARY = {
+    "Ken Takakura": "高仓健",
+}
+
 
 class GlossaryService:
     """专有名词管理，含内置词库 + 用户自定义"""
@@ -35,32 +39,39 @@ class GlossaryService:
             return
         for item in BUILTIN_GLOSSARY:
             self.db.glossary_create(
-                item["source"], item["target"], item["lang"], item.get("note", "")
+                item["source"], item["target"], item["lang"], item.get("note", ""), "zh"
             )
 
     def list_items(self, lang: Optional[str] = None, search: str = "") -> list[dict]:
         self._ensure_builtin()
         return self.db.glossary_list(lang=lang, search=search)
 
-    def create(self, source: str, target: str, lang: str, note: str = "") -> tuple[int, str]:
+    def create(
+        self, source: str, target: str, lang: str, note: str = "", target_lang: str = "zh"
+    ) -> tuple[int, str]:
         """返回 (id, 消息)。id=-1 表示重复"""
         self._ensure_builtin()
-        item_id = self.db.glossary_create(source, target, lang, note)
+        item_id = self.db.glossary_create(source, target, lang, note, target_lang)
         if item_id == -1:
             return -1, "该词条已存在"
         return item_id, "已添加"
 
-    def update(self, item_id: int, source: str, target: str, lang: str, note: str = "") -> tuple[bool, str]:
-        ok = self.db.glossary_update(item_id, source, target, lang, note)
+    def update(
+        self, item_id: int, source: str, target: str, lang: str, note: str = "", target_lang: str = "zh"
+    ) -> tuple[bool, str]:
+        ok = self.db.glossary_update(item_id, source, target, lang, note, target_lang)
         return ok, "已更新" if ok else "更新失败或词条冲突"
 
     def delete(self, item_id: int) -> bool:
         return self.db.glossary_delete(item_id)
 
-    def get_mapping(self, lang: str) -> dict[str, str]:
+    def get_mapping(self, lang: str, target_lang: str = "zh") -> dict[str, str]:
         """返回 {source: target} 映射（用户词库 + 内置）"""
         self._ensure_builtin()
-        return self.db.glossary_get_mapping(lang)
+        mapping = self.db.glossary_get_mapping(lang, target_lang)
+        if lang == "en" and target_lang == "zh":
+            return {**BUILTIN_ENGLISH_GLOSSARY, **mapping}
+        return mapping
 
     def import_json(self, content: str) -> dict:
         """从 JSON 导入词条：[{source,target,lang,note}, ...]"""
@@ -88,6 +99,7 @@ class GlossaryService:
                     "source": src,
                     "target": tgt,
                     "lang": str(item.get("lang", "ja")),
+                    "target_lang": str(item.get("target_lang", "zh")),
                     "note": str(item.get("note", "")),
                 }
             )

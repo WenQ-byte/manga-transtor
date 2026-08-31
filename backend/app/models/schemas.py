@@ -5,17 +5,18 @@ from typing import Literal, Optional
 
 from pydantic import BaseModel, Field
 
-LangCode = Literal["ja", "en", "zh"]
+LangCode = Literal["zh", "ja", "en"]
+SourceLangCode = Literal["auto", "zh", "ja", "en"]
 
 
 class TranslateRequest(BaseModel):
     """翻译任务请求"""
 
-    source_lang: LangCode = Field(..., description="源语言")
+    source_lang: SourceLangCode = Field("auto", description="源语言：auto、zh、ja、en")
     target_lang: LangCode = Field("zh", description="目标语言")
     # 可选：字体、渲染方向等高级参数（P1）
 
-    model_config = {"json_schema_extra": {"example": {"source_lang": "ja", "target_lang": "zh"}}}
+    model_config = {"json_schema_extra": {"example": {"source_lang": "auto", "target_lang": "zh"}}}
 
 
 class TranslateResponse(BaseModel):
@@ -59,6 +60,12 @@ class BatchStatusItem(BaseModel):
     text_count: int = 0
     duration_ms: int = 0
     error: Optional[str] = None
+    source_lang: str = "auto"
+    target_lang: str = "zh"
+    detected_source_lang: Optional[str] = None
+    translation_backends: list[str] = Field(default_factory=list)
+    translation_failures: list[str] = Field(default_factory=list)
+    quality_warnings: list[str] = Field(default_factory=list)
 
 
 class BatchStatusResponse(BaseModel):
@@ -92,6 +99,14 @@ class TranslateStatus(BaseModel):
     message: Optional[str] = None
     text_count: int = 0
     duration_ms: int = 0
+    source_lang: str = "auto"
+    target_lang: str = "zh"
+    detected_source_lang: Optional[str] = None
+    detection_confidence: Optional[float] = None
+    detection_reason: Optional[str] = None
+    translation_backends: list[str] = Field(default_factory=list)
+    translation_failures: list[str] = Field(default_factory=list)
+    quality_warnings: list[str] = Field(default_factory=list)
 
 
 class TranslateResult(BaseModel):
@@ -113,12 +128,13 @@ class GlossaryItem(BaseModel):
     id: Optional[int] = None
     source: str = Field(..., min_length=1, max_length=100, description="源词")
     target: str = Field(..., min_length=1, max_length=100, description="目标词")
-    lang: str = Field("ja", description="源词语言")
+    lang: LangCode = Field("ja", description="源词语言")
+    target_lang: LangCode = Field("zh", description="译词语言")
     note: str = Field("", max_length=200, description="备注")
 
     model_config = {
         "json_schema_extra": {
-            "example": {"source": "ナルト", "target": "鸣人", "lang": "ja", "note": "火影忍者主角"}
+            "example": {"source": "ナルト", "target": "鸣人", "lang": "ja", "target_lang": "zh", "note": "火影忍者主角"}
         }
     }
 

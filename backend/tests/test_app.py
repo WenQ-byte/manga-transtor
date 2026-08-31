@@ -56,8 +56,11 @@ class TestPipeline(unittest.TestCase):
         self.assertGreater(len(regions), 0)
 
     def test_pipeline_runs(self):
+        from app.services.engines.translator import SmartTranslator
+
         pipe = create_pipeline()
-        result = pipe.translate_image(self.image, "en", "zh")
+        with patch.object(SmartTranslator, "_find_available", return_value=None):
+            result = pipe.translate_image(self.image, "en", "zh")
         self.assertGreater(len(result.regions), 0)
         self.assertGreater(result.duration_ms, 0)
 
@@ -65,9 +68,11 @@ class TestPipeline(unittest.TestCase):
         import io
 
         from app.services.engines import get_engine
+        from app.services.engines.translator import SmartTranslator
 
         pipe = create_pipeline()
-        result = pipe.translate_image(self.image, "en", "zh")
+        with patch.object(SmartTranslator, "_find_available", return_value=None):
+            result = pipe.translate_image(self.image, "en", "zh")
         renderer = get_engine("renderer")
         inpainter = get_engine("inpainter")
         cleaned = inpainter.inpaint(self.image, result.regions)
@@ -143,8 +148,8 @@ class TestBatchTranslateApi(unittest.TestCase):
         values = {
             "allowed_extensions": ".jpg,.jpeg,.png,.webp,.bmp",
             "max_upload_mb": 10,
-            "batch_max_files": 10,
-            "batch_max_total_mb": 50,
+            "batch_max_files": 100,
+            "batch_max_total_mb": 500,
         }
         values.update(overrides)
         return SimpleNamespace(**values)
@@ -188,6 +193,14 @@ class TestBatchTranslateApi(unittest.TestCase):
         self.assertEqual(len(self.manager.created), 2)
         self.assertEqual(self.manager.created[0][4]["filename"], "page-01.png")
 
+    def test_default_language_keeps_auto_to_chinese_behavior(self):
+        response = self.client.post(
+            "/api/translate",
+            files={"file": ("page.png", b"image", "image/png")},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(self.manager.created[-1][0:2], ("auto", "zh"))
+
     def test_unsupported_format_rejects_entire_batch(self):
         response = self.client.post(
             "/api/translate/batch",
@@ -210,10 +223,19 @@ class TestBatchTranslateApi(unittest.TestCase):
     def test_too_many_files_are_rejected(self):
         response = self.client.post(
             "/api/translate/batch",
-            files=self._files(*[f"page-{i}.png" for i in range(11)]),
+            files=self._files(*[f"page-{i}.png" for i in range(101)]),
         )
         self.assertEqual(response.status_code, 400)
         self.assertEqual(self.manager.created, [])
+
+    def test_full_chapter_batch_of_80_files_is_accepted(self):
+        response = self.client.post(
+            "/api/translate/batch",
+            files=self._files(*[f"page-{i:02d}.png" for i in range(1, 81)]),
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["total"], 80)
+        self.assertEqual(len(self.manager.created), 80)
 
     def test_total_size_limit_rejects_entire_batch(self):
         settings = self._settings(max_upload_mb=2, batch_max_total_mb=1)
@@ -594,6 +616,17 @@ class TestGlossary(unittest.TestCase):
         items = self.service.list_items()
         self.assertGreater(len(items), 0)
 
+    def test_english_builtin_name_mapping(self):
+        self.assertEqual(self.service.get_mapping("en")["Ken Takakura"], "高仓健")
+
+    def test_glossary_distinguishes_target_language(self):
+        japanese_id, _ = self.service.create("主角", "主人公", "zh", "", "ja")
+        english_id, _ = self.service.create("主角", "protagonist", "zh", "", "en")
+        self.assertEqual(self.service.get_mapping("zh", "ja")["主角"], "主人公")
+        self.assertEqual(self.service.get_mapping("zh", "en")["主角"], "protagonist")
+        self.service.delete(japanese_id)
+        self.service.delete(english_id)
+
     def test_crud(self):
         item_id, msg = self.service.create("テスト", "测试", "ja", "单元测试")
         self.assertGreater(item_id, 0, msg)
@@ -727,6 +760,124 @@ class TestDeepSeekPrompt(unittest.TestCase):
         self.assertIsNone(parse("<1>你好</1>", 2))
         # 多余尾随文本不影响
         self.assertEqual(parse("译文：<1>好</1><2>行</2> 以上", 2), ["好", "行"])
+
+    def test_english_prompt_has_comic_translation_strategy(self):
+        from app.services.engines.translator import DeepSeekTranslator
+
+        t = DeepSeekTranslator.__new__(DeepSeekTranslator)
+        prompt = t._system_prompt("en", "zh")
+        for phrase in ("口语", "俚语", "角色", "禁止脑补", "只输出译文", "谁都好", "同义成分"):
+            self.assertIn(phrase, prompt)
+
+    def test_english_full_name_glossary_expands_page_alias(self):
+        from app.services.engines.translator import expand_english_glossary_aliases
+
+        texts = [
+            "HE LOOKED LIKE KEN TAKAKURA.",
+            "WILL I NEVER MEET ANOTHER KEN?",
+        ]
+        glossary = expand_english_glossary_aliases(texts, {"Ken Takakura": "高仓健"})
+        self.assertEqual(glossary["Ken"], "高仓健")
+        self.assertNotIn("Takakura", glossary)
+
+    def test_japanese_prompt_does_not_use_english_strategy(self):
+        from app.services.engines.translator import DeepSeekTranslator
+
+        t = DeepSeekTranslator.__new__(DeepSeekTranslator)
+        prompt = t._system_prompt("ja", "zh")
+        self.assertNotIn("英语漫画到中文", prompt)
+        self.assertIn("日语", prompt)
+
+    def test_english_context_prompt_keeps_numbered_segments(self):
+        from app.services.engines.translator import DeepSeekTranslator
+
+        t = DeepSeekTranslator.__new__(DeepSeekTranslator)
+        prompt = t._context_prompt("en", "zh", None, 3)
+        self.assertIn("俚语", prompt)
+        self.assertIn("不要合并、拆分、遗漏或新增", prompt)
+
+    def test_english_context_prompt_tracks_repeated_character_name(self):
+        from app.services.engines.translator import DeepSeekTranslator
+
+        t = DeepSeekTranslator.__new__(DeepSeekTranslator)
+        texts = [
+            "I LIKE TOUGH GUYS LIKE KEN TAKAKURA!",
+            "HE LOOKED LIKE KEN TAKAKURA.",
+            "WILL I NEVER MEET ANOTHER KEN?",
+        ]
+        prompt = t._context_prompt("en", "zh", None, 3, texts=texts)
+        self.assertIn("KEN TAKAKURA", prompt)
+        self.assertIn("同一专名", prompt)
+        self.assertIn("简称", prompt)
+
+    def test_english_uses_separate_model_and_japanese_keeps_original_model(self):
+        from app.services.engines.translator import DeepSeekTranslator
+
+        t = DeepSeekTranslator.__new__(DeepSeekTranslator)
+        t.settings = SimpleNamespace(
+            deepseek_english_model="deepseek-v4-flash",
+            deepseek_model="deepseek-v4-flash",
+        )
+        self.assertEqual(
+            t._model_candidates("en", "zh"),
+            ["deepseek-v4-flash"],
+        )
+        self.assertEqual(t._model_candidates("ja", "zh"), ["deepseek-v4-flash"])
+
+    def test_english_sampling_does_not_change_japanese_parameters(self):
+        from app.services.engines.translator import DeepSeekTranslator
+
+        english = DeepSeekTranslator._sampling_options("deepseek-v4-flash", "en", "zh")
+        japanese = DeepSeekTranslator._sampling_options("deepseek-v4-flash", "ja", "zh")
+        self.assertEqual(english["temperature"], 0.7)
+        self.assertEqual(english["thinking"], {"type": "disabled"})
+        self.assertEqual(japanese["temperature"], 0.3)
+        self.assertEqual(japanese["thinking"], {"type": "disabled"})
+
+    def test_english_output_cleanup_does_not_touch_japanese(self):
+        from app.services.engines.translator import _normalize_english_translation
+
+        raw = "译文：“高仓健”"
+        self.assertEqual(_normalize_english_translation(raw, "en", "zh"), "高仓健")
+        self.assertEqual(_normalize_english_translation(raw, "ja", "zh"), raw)
+
+    def test_parse_segments_rejects_duplicate_numbers(self):
+        from app.services.engines.translator import DeepSeekTranslator
+
+        self.assertIsNone(DeepSeekTranslator._parse_segments("<1>a</1><1>b</1>", 1))
+
+    def test_context_batch_splits_long_page_without_mixing_other_calls(self):
+        from unittest.mock import Mock
+
+        from app.services.engines.translator import DeepSeekTranslator
+
+        t = DeepSeekTranslator.__new__(DeepSeekTranslator)
+        t._translate_context = Mock(side_effect=lambda srcs, *_args: [f"译:{item}" for item in srcs])
+        texts = ["a" * 3000, "b" * 3000, "c"]
+        out = t.translate_batch(texts, "en", "zh")
+        self.assertEqual(out[0], "译:" + texts[0])
+        self.assertEqual(out[1], "译:" + texts[1])
+        self.assertEqual(t._translate_context.call_count, 2)
+
+    def test_context_failure_can_be_handled_by_single_item_fallback(self):
+        from unittest.mock import Mock
+
+        from app.services.engines.translator import DeepSeekTranslator, SmartTranslator
+
+        deepseek = DeepSeekTranslator.__new__(DeepSeekTranslator)
+        deepseek.batch = True
+        deepseek.prompt_glossary = True
+        deepseek.name = "deepseek"
+        deepseek._translate_context = Mock(side_effect=ValueError("格式错误"))
+        deepseek.translate_one = Mock(side_effect=lambda text, *_args, **_kwargs: "单条译文")
+        smart = SmartTranslator.__new__(SmartTranslator)
+        smart._backends = [deepseek]
+        smart._available = deepseek
+        smart.last_backend_names = []
+        smart.last_failures = []
+        smart._last_backend_name = ""
+        self.assertEqual(smart.translate_batch(["hello"], "en", "zh"), ["单条译文"])
+        deepseek.translate_one.assert_called()
 
 
 class TestBubbleGroupMergeBalloon(unittest.TestCase):
@@ -996,6 +1147,68 @@ class TestTranslationQualityGate(unittest.TestCase):
         self.assertEqual(ocr_thresholds("mit48"), (0.20, 0.0))
         self.assertEqual(ocr_thresholds("paddle"), (0.50, 0.50))
 
+    def test_flags_english_residual_but_not_a_single_name_brand_or_abbreviation(self):
+        from app.services.pipeline import assess_translation_quality
+
+        warnings = assess_translation_quality(
+            "Hey, I don't know what happened", "Hey, I don't know what happened", "en", "zh", "deepseek"
+        )
+        self.assertTrue(any("残留大量英文" in item for item in warnings))
+        for text in ("Batman", "OpenAI", "NASA"):
+            warnings = assess_translation_quality(text, text, "en", "zh", "deepseek")
+            self.assertFalse(any("残留大量英文" in item for item in warnings))
+
+    def test_flags_english_number_date_and_unit_omission(self):
+        from app.services.pipeline import assess_translation_quality
+
+        warnings = assess_translation_quality(
+            "Meet me on 2026/08/31 at 5 kg.", "在那天见。", "en", "zh", "deepseek"
+        )
+        self.assertTrue(any("数字可能漏译" in item for item in warnings))
+        self.assertTrue(any("单位可能漏译" in item for item in warnings))
+
+    def test_english_glossary_is_case_insensitive_and_whole_word_only(self):
+        from app.services.engines.translator import SmartTranslator
+
+        self.assertEqual(
+            SmartTranslator._apply_glossary("BATMAN and Batmanish", {"Batman": "蝙蝠侠"}, "en"),
+            "蝙蝠侠 and Batmanish",
+        )
+
+    def test_english_glossary_quality_warning_checks_key_term(self):
+        from app.services.pipeline import assess_translation_quality
+
+        warnings = assess_translation_quality(
+            "Batman is here", "他来了", "en", "zh", "deepseek", {"Batman": "蝙蝠侠"}
+        )
+        self.assertTrue(any("词典术语可能遗漏" in item for item in warnings))
+
+    def test_english_alias_quality_warning_uses_full_name_translation(self):
+        from app.services.engines.translator import expand_english_glossary_aliases
+        from app.services.pipeline import assess_translation_quality
+
+        glossary = expand_english_glossary_aliases(
+            ["HE LOOKED LIKE KEN TAKAKURA.", "ANOTHER KEN?"],
+            {"Ken Takakura": "高仓健"},
+        )
+        warnings = assess_translation_quality(
+            "ANOTHER KEN?", "另一个肯？", "en", "zh", "deepseek", glossary
+        )
+        self.assertTrue(any("词典术语可能遗漏:高仓健" in item for item in warnings))
+
+    def test_english_quality_flags_model_explanation_or_markdown(self):
+        from app.services.pipeline import assess_translation_quality
+
+        warnings = assess_translation_quality(
+            "I am here", "译文：**我在这里**", "en", "zh", "deepseek"
+        )
+        self.assertTrue(any("解释、Markdown" in item for item in warnings))
+
+    def test_japanese_quality_gate_remains_unchanged(self):
+        from app.services.pipeline import assess_translation_quality
+
+        warnings = assess_translation_quality("これはテストです", "这是テストです", "ja", "zh", "deepseek")
+        self.assertTrue(any("仍含较多日文" in item for item in warnings))
 
 class TestNonBubbleClassify(unittest.TestCase):
     """非气泡文字（刊头横条/跨页横带）几何判定 → 保留原文不翻译"""
@@ -1306,6 +1519,88 @@ class TestVerticalColumnOrder(unittest.TestCase):
         cols = r._balance_columns(lines, sum(len(l) for l in lines), avail_h=10000, char_h=30)
         self.assertIsNotNone(cols)
         self.assertEqual(cols, lines, "竖排列应保持原文行序，不应按字数切碎")
+
+
+class TestThreeLanguageTranslation(unittest.TestCase):
+    def test_detects_chinese_japanese_and_english(self):
+        from app.services.language import detect_language
+
+        self.assertEqual(detect_language("你好，今天一起回家吧").language, "zh")
+        self.assertEqual(detect_language("今日は一緒に帰ろう").language, "ja")
+        self.assertEqual(detect_language("Let's go home together!").language, "en")
+
+    def test_detection_handles_mixed_empty_and_numeric_text(self):
+        from app.services.language import detect_language
+
+        self.assertEqual(detect_language("東京へGO!", fallback="zh").language, "ja")
+        self.assertEqual(detect_language("", fallback="ja").language, "ja")
+        self.assertEqual(detect_language("2026?!", fallback="zh").language, "zh")
+        self.assertEqual(detect_language("2026?!", fallback="zh").confidence, 0.0)
+
+    def test_all_six_directions_have_dynamic_prompts(self):
+        from app.services.engines.translator import build_manga_prompt
+
+        directions = (("zh", "ja"), ("zh", "en"), ("ja", "zh"), ("ja", "en"), ("en", "zh"), ("en", "ja"))
+        for source, target in directions:
+            prompt = build_manga_prompt(source, target)
+            self.assertIn("只输出译文", prompt)
+            self.assertIn("原文没有的信息", prompt)
+        self.assertIn("自然的漫画日语", build_manga_prompt("zh", "ja"))
+        self.assertIn("漫画英语", build_manga_prompt("zh", "en"))
+
+    def test_provider_language_maps(self):
+        from app.services.language import provider_language
+
+        self.assertEqual(provider_language("google", "zh"), "zh-CN")
+        self.assertEqual(provider_language("mymemory", "ja"), "ja")
+        self.assertEqual(provider_language("deepl", "en"), "EN")
+
+    def test_language_validation_accepts_six_directions_and_auto(self):
+        from app.api.translate import _validate_languages
+
+        for source, target in (("zh", "ja"), ("zh", "en"), ("ja", "zh"), ("ja", "en"), ("en", "zh"), ("en", "ja"), ("auto", "zh")):
+            _validate_languages(source, target)
+
+    def test_language_validation_rejects_same_language(self):
+        from fastapi import HTTPException
+        from app.api.translate import _validate_languages
+
+        for language in ("zh", "ja", "en"):
+            with self.assertRaises(HTTPException):
+                _validate_languages(language, language)
+
+    def test_target_language_quality_checks(self):
+        from app.services.pipeline import assess_translation_quality
+
+        english = assess_translation_quality("你好世界", "你好世界", "zh", "en", "deepseek")
+        japanese = assess_translation_quality("你好世界", "你好世界", "zh", "ja", "deepseek")
+        self.assertTrue(any("中日文字符" in item for item in english))
+        self.assertTrue(any("只有汉字" in item for item in japanese))
+
+    def test_context_prompt_keeps_numbered_output_for_reverse_direction(self):
+        from app.services.engines.translator import build_manga_prompt
+
+        prompt = build_manga_prompt("zh", "en", context_count=4)
+        self.assertIn("<序号>译文</序号>", prompt)
+        self.assertIn("不要合并、拆分、遗漏或新增", prompt)
+
+    def test_english_target_forces_horizontal_rendering(self):
+        from app.services.engines.renderer import PILRenderer
+        from app.services.pipeline import TextRegion
+
+        source = Path(tempfile.gettempdir()) / "manga_renderer_language_source.png"
+        Image.new("RGB", (180, 220), "white").save(source)
+        region = TextRegion(
+            box=[[60, 20], [120, 20], [120, 200], [60, 200]],
+            text="你好",
+            translated="A very long English sentence",
+            group_translated="A very long English sentence",
+            direction="v",
+        )
+        renderer = PILRenderer()
+        with patch.object(renderer, "_render_vertical_bubble_block") as vertical:
+            renderer.render(source, [region], target_lang="en")
+        vertical.assert_not_called()
 
 
 if __name__ == "__main__":
