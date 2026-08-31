@@ -193,11 +193,25 @@ def _overlap_ratio(a, b) -> float:
     return inter / max(1, min(area_a, area_b))
 
 
-def group_regions_by_bubble(bgr, regions: list[TextRegion], img_w, img_h, overlap=0.15) -> list[dict]:
+def group_regions_by_bubble(
+    bgr,
+    regions: list[TextRegion],
+    img_w,
+    img_h,
+    overlap=0.15,
+    boundary_bgr=None,
+) -> list[dict]:
     """把同气泡的 region 分到一组，组内按阅读顺序排序（横排 y→x，竖排 右→左）
 
     返回 [{bbox, regions}]；同时回填 region.group_bounds（组包围盒）。
     """
+    boundary_gray = None
+    if boundary_bgr is not None and cv2 is not None:
+        boundary_gray = (
+            cv2.cvtColor(boundary_bgr, cv2.COLOR_BGR2GRAY)
+            if boundary_bgr.ndim == 3
+            else boundary_bgr
+        )
     groups: list[dict] = []
     for region in regions:
         bb, container_mask = bubble_with_mask(bgr, region.bounds, img_w, img_h)
@@ -211,6 +225,7 @@ def group_regions_by_bubble(bgr, regions: list[TextRegion], img_w, img_h, overla
                 region,
                 g,
                 overlap,
+                boundary_gray,
             )
             if score > best_ov:
                 best_ov, best_idx = score, i
@@ -236,7 +251,7 @@ def group_regions_by_bubble(bgr, regions: list[TextRegion], img_w, img_h, overla
                 }
             )
 
-    groups = _merge_overlap_groups(groups, overlap)
+    groups = _merge_overlap_groups(groups, overlap, boundary_gray=boundary_gray)
 
     out = []
     for g in groups:
@@ -281,10 +296,22 @@ def _mask_overlap_ratio(a, b) -> float:
     return float((aa & bb).sum()) / float(denom)
 
 
-def _container_merge_score(bb, mask, mask_reliable, region, group, overlap) -> float:
+def _container_merge_score(
+    bb,
+    mask,
+    mask_reliable,
+    region,
+    group,
+    overlap,
+    boundary_gray=None,
+) -> float:
     """容器合并评分：可靠掩膜是硬边界，回退框只允许紧凑近邻合并。"""
     group_mask = group.get("mask")
     group_mask_reliable = bool(group.get("mask_reliable")) and group_mask is not None
+    if boundary_gray is not None and _groups_separated_by_boundary(
+        [region], group.get("regions", []), boundary_gray
+    ):
+        return 0.0
     if mask_reliable and group_mask_reliable:
         mask_ov = _mask_overlap_ratio(mask, group_mask)
         if mask_ov < 0.55:
@@ -362,6 +389,77 @@ def _groups_text_compatible(a_regions, b_regions) -> bool:
         for a in real_a
         for b in real_b
     )
+
+
+def _groups_separated_by_boundary(a_regions, b_regions, gray) -> bool:
+    """原图中若每一对可比较文字框之间都有长轮廓，则它们属于不同气泡。"""
+    comparable = []
+    for a in a_regions:
+        for b in b_regions:
+            separated = _region_boundary_separator(a, b, gray)
+            if separated is not None:
+                comparable.append(separated)
+    return bool(comparable) and all(comparable)
+
+
+def _region_boundary_separator(a, b, gray):
+    """检查两个文字框间隙中的长黑线；无法形成可靠轴向走廊时返回 None。"""
+    if not hasattr(a, "bounds") or not hasattr(b, "bounds"):
+        return None
+    ax0, ay0, ax1, ay1 = a.bounds
+    bx0, by0, bx1, by1 = b.bounds
+    ah, bh = max(1, ay1 - ay0), max(1, by1 - by0)
+    aw, bw = max(1, ax1 - ax0), max(1, bx1 - bx0)
+
+    if ax1 <= bx0 or bx1 <= ax0:
+        left, right = ((ax0, ay0, ax1, ay1), (bx0, by0, bx1, by1))
+        if bx1 <= ax0:
+            left, right = right, left
+        gx0, gx1 = left[2], right[0]
+        gy0, gy1 = max(left[1], right[1]), min(left[3], right[3])
+        overlap_h = gy1 - gy0
+        if overlap_h < max(8, int(0.25 * min(ah, bh))):
+            return None
+        if gx1 - gx0 < 3:
+            return False
+        return _long_barrier_in_gap(gray, gx0, gy0, gx1, gy1, vertical=True)
+
+    if ay1 <= by0 or by1 <= ay0:
+        upper, lower = ((ax0, ay0, ax1, ay1), (bx0, by0, bx1, by1))
+        if by1 <= ay0:
+            upper, lower = lower, upper
+        gy0, gy1 = upper[3], lower[1]
+        gx0, gx1 = max(upper[0], lower[0]), min(upper[2], lower[2])
+        overlap_w = gx1 - gx0
+        if overlap_w < max(8, int(0.25 * min(aw, bw))):
+            return None
+        if gy1 - gy0 < 3:
+            return False
+        return _long_barrier_in_gap(gray, gx0, gy0, gx1, gy1, vertical=False)
+    return False if _text_regions_adjacent(a, b) else None
+
+
+def _long_barrier_in_gap(gray, x0, y0, x1, y1, vertical: bool) -> bool:
+    if cv2 is None:
+        return False
+    h, w = gray.shape[:2]
+    x0, y0 = max(0, int(x0)), max(0, int(y0))
+    x1, y1 = min(w, int(x1)), min(h, int(y1))
+    if x1 - x0 < 2 or y1 - y0 < 2:
+        return False
+    patch = gray[y0:y1, x0:x1]
+    dark = (patch < 150).astype(np.uint8) * 255
+    kernel = np.ones((5, 3) if vertical else (3, 5), np.uint8)
+    dark = cv2.morphologyEx(dark, cv2.MORPH_CLOSE, kernel)
+    count, _, stats, _ = cv2.connectedComponentsWithStats(dark, connectivity=8)
+    required = (patch.shape[0] if vertical else patch.shape[1]) * 0.45
+    for label in range(1, count):
+        _, _, cw, ch, area = stats[label]
+        span = ch if vertical else cw
+        thickness = cw if vertical else ch
+        if span >= max(6, required) and area >= span and thickness <= max(12, span * 0.45):
+            return True
+    return False
 
 
 def _compact_group_ok(members, candidate) -> bool:
@@ -490,7 +588,7 @@ def _balloon_ok(a, b) -> bool:
     return ua <= MERGE_BALLOON_RATIO * (aa + ab)
 
 
-def _merge_overlap_groups(groups, overlap=0.15):
+def _merge_overlap_groups(groups, overlap=0.15, boundary_gray=None):
     changed = True
     while changed:
         changed = False
@@ -503,6 +601,9 @@ def _merge_overlap_groups(groups, overlap=0.15):
                 ra = bool(groups[i].get("mask_reliable")) and ma is not None
                 rb = bool(groups[j].get("mask_reliable")) and mb is not None
                 same_mask = ra and rb and _mask_overlap_ratio(ma, mb) >= 0.55
+                separated = boundary_gray is not None and _groups_separated_by_boundary(
+                    groups[i].get("regions", []), groups[j].get("regions", []), boundary_gray
+                )
                 fallback_ok = (
                     not (ra and rb)
                     and _balloon_ok(a, b)
@@ -518,7 +619,7 @@ def _merge_overlap_groups(groups, overlap=0.15):
                         or _proximity_overlap(a, b)
                     )
                 )
-                if same_mask or fallback_ok:
+                if not separated and (same_mask or fallback_ok):
                     groups[i]["bbox"] = _union(a, b)
                     groups[i]["regions"].extend(groups[j]["regions"])
                     groups[i].setdefault("members", []).extend(groups[j].get("members", []))

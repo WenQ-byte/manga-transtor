@@ -499,6 +499,101 @@ class TestBubbleGroupMergeBalloon(unittest.TestCase):
         )
         self.assertFalse(_text_regions_adjacent(upper, lower))
 
+    def test_original_separator_vetoes_identical_leaked_masks(self):
+        import numpy as np
+
+        from app.services.engines.bubble import _container_merge_score
+        from app.services.pipeline import TextRegion
+
+        left = TextRegion(
+            box=[[40, 30], [70, 30], [70, 170], [40, 170]],
+            text="左侧气泡",
+            direction="v",
+        )
+        right = TextRegion(
+            box=[[130, 30], [160, 30], [160, 170], [130, 170]],
+            text="右侧气泡",
+            direction="v",
+        )
+        gray = np.full((200, 200), 255, np.uint8)
+        gray[20:180, 99:102] = 0
+        leaked = np.full((200, 200), 255, np.uint8)
+        group = {
+            "bbox": (20, 20, 180, 180),
+            "regions": [left],
+            "members": [((20, 20, 180, 180), leaked, True, left)],
+            "mask": leaked,
+            "mask_reliable": True,
+        }
+
+        score = _container_merge_score(
+            (20, 20, 180, 180), leaked, True, right, group, 0.15, gray
+        )
+
+        self.assertEqual(score, 0.0)
+
+    def test_same_bubble_without_separator_keeps_reliable_mask_merge(self):
+        import numpy as np
+
+        from app.services.engines.bubble import _container_merge_score
+        from app.services.pipeline import TextRegion
+
+        left = TextRegion(
+            box=[[40, 30], [70, 30], [70, 170], [40, 170]],
+            text="同一气泡左列",
+            direction="v",
+        )
+        right = TextRegion(
+            box=[[90, 30], [120, 30], [120, 170], [90, 170]],
+            text="同一气泡右列",
+            direction="v",
+        )
+        gray = np.full((200, 200), 255, np.uint8)
+        shared = np.full((200, 200), 255, np.uint8)
+        group = {
+            "bbox": (20, 20, 150, 180),
+            "regions": [left],
+            "members": [((20, 20, 150, 180), shared, True, left)],
+            "mask": shared,
+            "mask_reliable": True,
+        }
+
+        score = _container_merge_score(
+            (20, 20, 150, 180), shared, True, right, group, 0.15, gray
+        )
+
+        self.assertGreater(score, 0.0)
+
+    def test_touching_neighbor_prevents_false_split_from_far_column(self):
+        import numpy as np
+
+        from app.services.engines.bubble import _groups_separated_by_boundary
+        from app.services.pipeline import TextRegion
+
+        candidate = TextRegion(
+            box=[[70, 30], [90, 30], [90, 170], [70, 170]],
+            text="候选列",
+            direction="v",
+        )
+        touching = TextRegion(
+            box=[[90, 30], [112, 30], [112, 170], [90, 170]],
+            text="贴合列",
+            direction="v",
+        )
+        farther = TextRegion(
+            box=[[125, 30], [145, 30], [145, 170], [125, 170]],
+            text="较远列",
+            direction="v",
+        )
+        gray = np.full((200, 200), 255, np.uint8)
+        gray[20:180, 118:121] = 0
+
+        separated = _groups_separated_by_boundary(
+            [candidate], [touching, farther], gray
+        )
+
+        self.assertFalse(separated)
+
 
 class TestBubbleGeometryLeakCap(unittest.TestCase):
     """泛洪掩膜超出组气泡包围盒太多即判泄漏，回退锚定矩形（防整页巨字）"""

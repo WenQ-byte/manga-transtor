@@ -141,7 +141,12 @@ class TranslationPipeline:
         if cb:
             cb(PIPELINE_STEPS[step_index][0], progress)
 
-    def _group_regions(self, image_path: Path, regions: list[TextRegion]) -> list[dict]:
+    def _group_regions(
+        self,
+        image_path: Path,
+        regions: list[TextRegion],
+        boundary_image_path: Path | None = None,
+    ) -> list[dict]:
         """按气泡泛洪填充把 region 分组（组内按阅读顺序），并回填 group_index/group_bounds"""
         from PIL import Image
 
@@ -152,7 +157,18 @@ class TranslationPipeline:
         img = np.array(Image.open(image_path).convert("RGB"))
         bgr = img[:, :, ::-1].copy()
         h, w = bgr.shape[:2]
-        return group_regions_by_bubble(bgr, regions, w, h)
+        boundary_bgr = None
+        if boundary_image_path is not None:
+            boundary = np.array(Image.open(boundary_image_path).convert("RGB"))
+            if boundary.shape[:2] == img.shape[:2]:
+                boundary_bgr = boundary[:, :, ::-1].copy()
+        return group_regions_by_bubble(
+            bgr,
+            regions,
+            w,
+            h,
+            boundary_bgr=boundary_bgr,
+        )
 
     def translate_image(
         self,
@@ -239,7 +255,11 @@ class TranslationPipeline:
         # 4. 按气泡分组（干净图上泛洪，笔画已擦除 → 分组可靠）→ 整块翻译
         glossary = self.glossary.get_mapping(source_lang)
         self._report(progress_cb, 3, 5)
-        groups = self._group_regions(cleaned, text_regions)
+        groups = self._group_regions(
+            cleaned,
+            text_regions,
+            boundary_image_path=image_path,
+        )
         group_texts = ["\n".join(r.text for r in g["regions"] if r.text.strip()) for g in groups]
         translated_blocks = self.translator.translate_batch(
             group_texts,
