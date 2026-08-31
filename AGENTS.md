@@ -14,7 +14,7 @@
   ```
   .venv\Scripts\python.exe backend\tests\test_app.py
   ```
-  当前 62 项测试；测试会设 `MANGA_DATA_DIR` 到临时目录；`test_pipeline_runs` 走真实 OCR 路径，若已装 AI 依赖会加载 PaddleOCR 模型、较慢。
+  当前 77 项测试；测试会设 `MANGA_DATA_DIR` 到临时目录；`test_pipeline_runs` 走真实 OCR 路径，若已装 AI 依赖会加载 PaddleOCR 模型、较慢。
 - 无 linter / typecheck / formatter 配置，不需要跑。
 
 ## 依赖四档
@@ -27,7 +27,7 @@
 
 ## 配置
 
-- pydantic-settings，环境变量前缀 `MANGA_`，读 `.env`（见 `backend/app/config.py`）。如 `MANGA_PIPELINE_MODE`（real/demo）、`MANGA_TRANSLATOR_BACKEND`（deepseek/google/deepl/openai/mymemory）、`MANGA_MAX_UPLOAD_MB`、`MANGA_INPAINTER_BACKEND`（cv/lama）、`MANGA_OCR_BACKEND`（mit48/mangaocr/mit48+mangaocr/paddle）、`MANGA_DETECTOR_BACKEND`（空/cv/manga）、`MANGA_MIT_DETECTOR`（default/ctd）、`MANGA_MIT_MODEL_DIR`/`MANGA_MIT_FALLBACK_DIR`、`MANGA_MIT_DEVICE`（cpu/cuda/mps/auto）、`MANGA_MIT_OCR_UPSCALE`/`MANGA_MIT_OCR_MIX_THRESHOLD`、`MANGA_BUBBLE_FILTER`（auto/on/off）。
+- pydantic-settings，环境变量前缀 `MANGA_`，读 `.env`（见 `backend/app/config.py`）。如 `MANGA_PIPELINE_MODE`（real/demo）、`MANGA_TRANSLATOR_BACKEND`（deepseek/google/deepl/openai/mymemory）、`MANGA_MAX_UPLOAD_MB`、`MANGA_BATCH_MAX_FILES`/`MANGA_BATCH_MAX_TOTAL_MB`、`MANGA_INPAINTER_BACKEND`（cv/lama）、`MANGA_OCR_BACKEND`（mit48/mangaocr/mit48+mangaocr/paddle）、`MANGA_DETECTOR_BACKEND`（空/cv/manga）、`MANGA_MIT_DETECTOR`（default/ctd）、`MANGA_MIT_MODEL_DIR`/`MANGA_MIT_FALLBACK_DIR`、`MANGA_MIT_DEVICE`（cpu/cuda/mps/auto）、`MANGA_MIT_OCR_UPSCALE`/`MANGA_MIT_OCR_MIX_THRESHOLD`、`MANGA_BUBBLE_FILTER`（auto/on/off）。
 - `.env` 已 gitignore；`.env.example` 展示全部可配项。DeepL 免费版 auth key 以 `:fx` 结尾。
 
 ## 架构要点（非文件名能看出的）
@@ -35,6 +35,8 @@
 - 应用代码在 `backend/app`（不是 `backend`），运行/测试都要保证 `backend` 在 `sys.path`。
 - 流水线编排在 `services/pipeline.py`，顺序 detect → ocr → **inpaint → bubble grouping → translate** → quality assessment → render。分组在擦除后的干净图上寻找气泡内部，同时用原图长轮廓否决跨气泡合并；翻译按气泡整块进行。引擎可插拔，统一通过 `services/engines/factory.py` 的 `get_engine(type)` 获取（lru_cache 缓存）。
 - OCR 引擎自带检测（`supports_detection=True`）时，`pipeline.py` 跳过独立 detector，直接用 OCR 检测+识别。
+- **批量翻译**：`POST /api/translate/batch` 仅做全量校验和任务编排，每张图片仍调用 `TranslationTaskManager.create_task` 进入现有单图流水线；原文件名、顺序和批次标识写入 SQLite `meta`。批量状态取子任务平均进度，ZIP 只解析服务端任务记录中的安全结果路径，支持部分成功、重名改名、`manifest.json` 和 `errors.txt`。
+- **批量推理必须串行**：检测、OCR、翻译等引擎由 `get_engine` 全局缓存，CTD/OpenCV DNN 和模型包装含共享可变状态，不能让多个子任务并发进入流水线。`TranslationTaskManager` 默认单 worker，并用 `_pipeline_lock` 双重保护；批量只并发编排，不并发模型推理。
 - OCR 翻译/擦除阈值由 `pipeline.py:ocr_thresholds` 分离：MIT48 路线翻译阈值 0.20、擦除阈值 0.0（检测框和掩膜通常比字符概率可靠）；Paddle/CV 路线保持 0.50/0.50。非空且达到翻译阈值的 region 参与翻译，其余有掩膜的 MIT region 仍可只参与擦除。
 - **非气泡文字判定**（`bubble.py:classify_non_bubble`）：泛洪 bbox 为细长横条（w/h≥8 且高≤4%页高）或跨页宽横带（方向横且宽≥50%页宽且高≤5%页高）→ 判为刊头/拟声词等非气泡，标 `_no_erase`；`pipeline.py:drop_non_bubble_regions` 移出工作集（不擦除、不翻译、不渲染，原文保留），renderer 同跳过（双保险）。默认开启，不依赖旧 `is_ignore` 启发式（后者仅 config≥1 时 opt-in，且对贴字/彩色背景不可靠）。
 - **掩膜整块化**：`mask.py` 优先按文本多边形整块填充（`fillPoly` + 膨胀），**并集 Otsu 笔画候选 + 7×7 膨胀**（poly 常偏紧、pad 缩进会漏掉笔画外缘 → 原文灰影残留）；bbox 以 box∩poly 并集为界。无 poly 才回退 Otsu 笔画。**注音扩展 `_add_furigana_margin`**：竖排汉字旁的小号 furigana 检测器常漏检 → 沿主字 bbox 外扩 16px 拾取带内小连通字形成分并擦除（`FURIGANA_MARGIN` 可调）。非气泡文字（刊头/拟声词）打 `_no_erase` 标记跳过擦除并整体移出翻译/渲染（原文保留）。

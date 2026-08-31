@@ -2,10 +2,11 @@
 from __future__ import annotations
 
 import traceback
+import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from app.models.schemas import LangCode
 from app.services.pipeline import PIPELINE_STEPS, TranslationPipeline, create_pipeline
@@ -25,21 +26,35 @@ STEP_WEIGHTS = {
 class TranslationTaskManager:
     """管理翻译任务的生命周期"""
 
-    def __init__(self, max_workers: int = 2):
+    def __init__(self, max_workers: int = 1):
         self.db = Database.get_instance()
         self.files = FileStore()
         self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="translate")
         self._pipeline: Optional[TranslationPipeline] = None
+        self._pipeline_lock = threading.Lock()
 
     def _get_pipeline(self) -> TranslationPipeline:
         if self._pipeline is None:
             self._pipeline = create_pipeline()
         return self._pipeline
 
-    def create_task(self, source_lang: LangCode, target_lang: LangCode, image_bytes: bytes, filename: str) -> str:
+    def create_task(
+        self,
+        source_lang: LangCode,
+        target_lang: LangCode,
+        image_bytes: bytes,
+        filename: str,
+        metadata: Optional[dict[str, Any]] = None,
+    ) -> str:
         task_id = uuid.uuid4().hex[:16]
         _, abs_path = self.files.save_upload(image_bytes, filename)
-        self.db.task_create(task_id, source_lang, target_lang, original_path=abs_path)
+        self.db.task_create(
+            task_id,
+            source_lang,
+            target_lang,
+            original_path=abs_path,
+            meta=metadata,
+        )
         self._executor.submit(self._run, task_id, source_lang, target_lang, abs_path)
         return task_id
 
@@ -58,13 +73,14 @@ class TranslationTaskManager:
 
         self.db.task_update(task_id, status="processing", progress=5)
         try:
-            pipeline = self._get_pipeline()
-            result = pipeline.translate_image(
-                Path(image_path),
-                source_lang,
-                target_lang,
-                progress_cb=progress_cb,
-            )
+            with self._pipeline_lock:
+                pipeline = self._get_pipeline()
+                result = pipeline.translate_image(
+                    Path(image_path),
+                    source_lang,
+                    target_lang,
+                    progress_cb=progress_cb,
+                )
 
             if not result.regions:
                 self.db.task_update(

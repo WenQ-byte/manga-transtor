@@ -1,9 +1,14 @@
 """后端单元测试"""
 import os
+import io
+import json
 import sys
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 # 测试环境
 os.environ["MANGA_DATA_DIR"] = tempfile.mkdtemp(prefix="manga_test_")
@@ -13,6 +18,8 @@ os.environ["MANGA_DETECTOR_BACKEND"] = "cv"
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from PIL import Image, ImageDraw, ImageFont
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 
 import numpy as np
 
@@ -68,6 +75,286 @@ class TestPipeline(unittest.TestCase):
         img = Image.open(self.image)
         parsed = Image.open(io.BytesIO(out))
         self.assertEqual(parsed.size, img.size)
+
+
+class _BatchTestFiles:
+    def __init__(self, root: Path):
+        self.root = root
+
+    def resolve(self, rel: str):
+        candidate = (self.root / rel).resolve()
+        if self.root.resolve() not in candidate.parents or not candidate.is_file():
+            return None
+        return candidate
+
+
+class _BatchTestManager:
+    def __init__(self, root: Path):
+        self.tasks = {}
+        self.created = []
+        self.files = _BatchTestFiles(root)
+
+    def create_task(self, source_lang, target_lang, content, filename, metadata=None):
+        task_id = f"task-{len(self.created) + 1}"
+        task = {
+            "id": task_id,
+            "status": "queued",
+            "progress": 0,
+            "error": "",
+            "result_path": "",
+            "text_count": 0,
+            "duration_ms": 0,
+            "meta": metadata or {},
+        }
+        self.created.append((source_lang, target_lang, content, filename, metadata))
+        self.tasks[task_id] = task
+        return task_id
+
+    def get_status(self, task_id):
+        return self.tasks.get(task_id)
+
+    def delete_task(self, task_id):
+        return self.tasks.pop(task_id, None) is not None
+
+
+class TestBatchTranslateApi(unittest.TestCase):
+    """批量任务只编排现有单图任务，并安全汇总和导出结果。"""
+
+    def setUp(self):
+        from app.api.translate import get_manager, router
+
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.manager = _BatchTestManager(self.root)
+        api = FastAPI()
+        api.include_router(router)
+        api.dependency_overrides[get_manager] = lambda: self.manager
+        self.client = TestClient(api)
+
+    def tearDown(self):
+        self.client.close()
+        self.tmp.cleanup()
+
+    @staticmethod
+    def _files(*names):
+        return [("files[]", (name, b"image", "image/png")) for name in names]
+
+    def _settings(self, **overrides):
+        values = {
+            "allowed_extensions": ".jpg,.jpeg,.png,.webp,.bmp",
+            "max_upload_mb": 10,
+            "batch_max_files": 10,
+            "batch_max_total_mb": 50,
+        }
+        values.update(overrides)
+        return SimpleNamespace(**values)
+
+    def _set_task(self, task_id, filename, **overrides):
+        task = {
+            "id": task_id,
+            "status": "completed",
+            "progress": 100,
+            "error": "",
+            "result_path": "",
+            "text_count": 12,
+            "duration_ms": 18000,
+            "meta": {"filename": filename, "index": len(self.manager.tasks) + 1},
+        }
+        task.update(overrides)
+        self.manager.tasks[task_id] = task
+        return task
+
+    def _create_result(self, name, content=b"png-result"):
+        path = self.root / name
+        path.write_bytes(content)
+        return name
+
+    def _download_zip(self, task_ids):
+        response = self.client.post("/api/translate/batch/zip", json={"task_ids": task_ids})
+        self.assertEqual(response.status_code, 200, response.text)
+        return zipfile.ZipFile(io.BytesIO(response.content))
+
+    def test_batch_upload_creates_independent_tasks(self):
+        response = self.client.post(
+            "/api/translate/batch",
+            files=self._files("page-01.png", "page-02.jpg"),
+            data={"source_lang": "ja", "target_lang": "zh"},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertEqual(body["total"], 2)
+        self.assertEqual([item["filename"] for item in body["items"]], ["page-01.png", "page-02.jpg"])
+        self.assertEqual([item["index"] for item in body["items"]], [1, 2])
+        self.assertEqual(len(self.manager.created), 2)
+        self.assertEqual(self.manager.created[0][4]["filename"], "page-01.png")
+
+    def test_unsupported_format_rejects_entire_batch(self):
+        response = self.client.post(
+            "/api/translate/batch",
+            files=self._files("ok.png", "bad.txt"),
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(self.manager.created, [])
+
+    def test_oversized_file_rejects_entire_batch(self):
+        settings = self._settings(max_upload_mb=1)
+        files = [
+            ("files[]", ("ok.png", b"ok", "image/png")),
+            ("files[]", ("large.png", b"x" * (1024 * 1024 + 1), "image/png")),
+        ]
+        with patch("app.api.translate.get_settings", return_value=settings):
+            response = self.client.post("/api/translate/batch", files=files)
+        self.assertEqual(response.status_code, 413)
+        self.assertEqual(self.manager.created, [])
+
+    def test_too_many_files_are_rejected(self):
+        response = self.client.post(
+            "/api/translate/batch",
+            files=self._files(*[f"page-{i}.png" for i in range(11)]),
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(self.manager.created, [])
+
+    def test_total_size_limit_rejects_entire_batch(self):
+        settings = self._settings(max_upload_mb=2, batch_max_total_mb=1)
+        files = [
+            ("files[]", ("one.png", b"x" * 600000, "image/png")),
+            ("files[]", ("two.png", b"y" * 600000, "image/png")),
+        ]
+        with patch("app.api.translate.get_settings", return_value=settings):
+            response = self.client.post("/api/translate/batch", files=files)
+        self.assertEqual(response.status_code, 413)
+        self.assertEqual(self.manager.created, [])
+
+    def test_batch_status_calculates_average_progress(self):
+        self._set_task("done", "page-01.png")
+        self._set_task("work", "page-02.png", status="processing", progress=30)
+        response = self.client.post(
+            "/api/translate/batch/status", json={"task_ids": ["done", "work"]}
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertEqual(body["progress"], 65)
+        self.assertEqual((body["completed"], body["processing"], body["failed"]), (1, 1, 0))
+
+    def test_failed_child_does_not_hide_successful_child(self):
+        self._set_task("done", "page-01.png")
+        self._set_task("bad", "page-02.png", status="failed", progress=40, error="识别失败")
+        response = self.client.post(
+            "/api/translate/batch/status", json={"task_ids": ["done", "bad"]}
+        )
+        body = response.json()
+        self.assertEqual((body["completed"], body["failed"]), (1, 1))
+        self.assertEqual([item["status"] for item in body["items"]], ["completed", "failed"])
+
+    def test_zip_contains_successful_image(self):
+        result = self._create_result("result.png")
+        self._set_task("done", "page-01.png", result_path=result)
+        with self._download_zip(["done"]) as bundle:
+            names = bundle.namelist()
+            self.assertIn("translated_images/01_page-01_translated.png", names)
+
+    def test_zip_manifest_contains_task_metadata(self):
+        result = self._create_result("result.png")
+        self._set_task("done", "page-01.png", result_path=result)
+        with self._download_zip(["done"]) as bundle:
+            manifest = json.loads(bundle.read("manifest.json"))
+        self.assertEqual(manifest[0]["original_filename"], "page-01.png")
+        self.assertEqual(manifest[0]["task_id"], "done")
+        self.assertEqual(manifest[0]["text_count"], 12)
+        self.assertEqual(manifest[0]["duration_ms"], 18000)
+
+    def test_partial_failure_generates_errors_file(self):
+        result = self._create_result("result.png")
+        self._set_task("done", "page-01.png", result_path=result)
+        self._set_task("bad", "page-02.png", status="failed", error="翻译服务不可用")
+        with self._download_zip(["done", "bad"]) as bundle:
+            errors = bundle.read("errors.txt").decode("utf-8")
+            self.assertIn("page-02.png", errors)
+            self.assertIn("翻译服务不可用", errors)
+
+    def test_duplicate_names_do_not_overwrite(self):
+        first = self._create_result("first.png", b"first")
+        second = self._create_result("second.png", b"second")
+        self._set_task("one", "page.png", result_path=first)
+        self._set_task("two", "page.png", result_path=second)
+        with self._download_zip(["one", "two"]) as bundle:
+            image_names = [name for name in bundle.namelist() if name.startswith("translated_images/")]
+            self.assertEqual(len(image_names), 2)
+            self.assertEqual(len(set(image_names)), 2)
+            self.assertIn("translated_images/02_page_2_translated.png", image_names)
+
+    def test_path_traversal_filename_is_sanitized(self):
+        result = self._create_result("result.png")
+        self._set_task("done", "../../secret.png", result_path=result)
+        with self._download_zip(["done"]) as bundle:
+            image_names = [name for name in bundle.namelist() if name.startswith("translated_images/")]
+        self.assertEqual(image_names, ["translated_images/01_secret_translated.png"])
+        self.assertTrue(all(".." not in name for name in image_names))
+
+    def test_single_image_endpoint_still_creates_task(self):
+        response = self.client.post(
+            "/api/translate?source_lang=en&target_lang=zh",
+            files={"file": ("single.png", b"image", "image/png")},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["status"], "queued")
+        self.assertEqual(self.manager.created[0][3], "single.png")
+
+
+class TestTaskPipelineIsolation(unittest.TestCase):
+    """共享模型流水线不能被多个批量子任务同时调用。"""
+
+    def test_default_worker_count_is_serial(self):
+        import inspect
+
+        from app.services.task_manager import TranslationTaskManager
+
+        parameter = inspect.signature(TranslationTaskManager).parameters["max_workers"]
+        self.assertEqual(parameter.default, 1)
+
+    def test_pipeline_lock_prevents_concurrent_inference(self):
+        import threading
+        import time
+        from concurrent.futures import ThreadPoolExecutor
+        from types import SimpleNamespace
+
+        from app.services.task_manager import TranslationTaskManager
+
+        class FakeDatabase:
+            def task_update(self, *args, **kwargs):
+                return None
+
+        class FakePipeline:
+            def __init__(self):
+                self.active = 0
+                self.max_active = 0
+                self.lock = threading.Lock()
+
+            def translate_image(self, *args, **kwargs):
+                with self.lock:
+                    self.active += 1
+                    self.max_active = max(self.max_active, self.active)
+                time.sleep(0.03)
+                with self.lock:
+                    self.active -= 1
+                return SimpleNamespace(regions=[], duration_ms=30)
+
+        manager = TranslationTaskManager.__new__(TranslationTaskManager)
+        manager.db = FakeDatabase()
+        manager._pipeline_lock = threading.Lock()
+        pipeline = FakePipeline()
+        manager._get_pipeline = lambda: pipeline
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [
+                executor.submit(manager._run, f"task-{index}", "ja", "zh", "unused.png")
+                for index in range(2)
+            ]
+            for future in futures:
+                future.result()
+
+        self.assertEqual(pipeline.max_active, 1)
 
 
 class TestMitEngines(unittest.TestCase):

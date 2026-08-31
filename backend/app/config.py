@@ -22,6 +22,8 @@ class Settings(BaseSettings):
 
     # 文件限制
     max_upload_mb: int = 10
+    batch_max_files: int = 10
+    batch_max_total_mb: int = 50
     allowed_extensions: str = ".jpg,.jpeg,.png,.webp,.bmp"
 
     # 流水线引擎选择: demo | real

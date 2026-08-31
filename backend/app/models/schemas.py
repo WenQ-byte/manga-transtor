@@ -26,6 +26,52 @@ class TranslateResponse(BaseModel):
     message: str = ""
 
 
+class BatchTaskItem(BaseModel):
+    """批量任务中的单图任务。"""
+
+    task_id: str
+    filename: str
+    index: int
+    status: Literal["queued", "processing", "completed", "failed"] = "queued"
+
+
+class BatchTranslateResponse(BaseModel):
+    """批量创建任务响应。"""
+
+    total: int
+    items: list[BatchTaskItem]
+
+
+class BatchStatusRequest(BaseModel):
+    """批量状态或导出请求。"""
+
+    task_ids: list[str] = Field(..., min_length=1)
+
+
+class BatchStatusItem(BaseModel):
+    """批量状态中的单图进度。"""
+
+    task_id: str
+    filename: str
+    index: int
+    status: Literal["queued", "processing", "completed", "failed"]
+    progress: int = 0
+    text_count: int = 0
+    duration_ms: int = 0
+    error: Optional[str] = None
+
+
+class BatchStatusResponse(BaseModel):
+    """批量任务汇总状态。"""
+
+    total: int
+    completed: int
+    processing: int
+    failed: int
+    progress: int
+    items: list[BatchStatusItem]
+
+
 class PipelineStep(BaseModel):
     """流水线步骤进度"""
 

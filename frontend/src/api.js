@@ -22,9 +22,33 @@ async function request(path, options = {}) {
 export function createTranslateTask(file, sourceLang, targetLang) {
   const form = new FormData()
   form.append('file', file)
+  const query = new URLSearchParams({ source_lang: sourceLang, target_lang: targetLang })
+  return request(`/translate?${query}`, { method: 'POST', body: form })
+}
+
+export function createBatchTranslateTask(files, sourceLang, targetLang) {
+  const form = new FormData()
+  files.forEach((file) => form.append('files[]', file))
   form.append('source_lang', sourceLang)
   form.append('target_lang', targetLang)
-  return request('/translate', { method: 'POST', body: form })
+  return request('/translate/batch', { method: 'POST', body: form })
+}
+
+export function getBatchTaskStatus(taskIds) {
+  return request('/translate/batch/status', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ task_ids: taskIds }),
+  })
+}
+
+export async function downloadBatchZip(taskIds) {
+  const response = await request('/translate/batch/zip', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ task_ids: taskIds }),
+  })
+  return response.blob()
 }
 
 export function getTaskStatus(taskId) {

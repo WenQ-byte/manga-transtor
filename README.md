@@ -9,16 +9,19 @@
 截至 2026-08-31：
 
 - 单图日语/英语 → 中文主流程已经打通。
+- 支持最多 10 张图片批量创建独立翻译任务、汇总进度，并将成功结果和清单打包为 ZIP。
 - 默认使用 CTD 检测器与 `mit48+mangaocr` 混合 OCR，PaddleOCR 作为回退方案。
 - 支持 CV 与 LaMa 两种修复引擎；LaMa 采用局部原尺寸推理，减少整页缩放造成的灰色残影。
 - 支持 DeepSeek、OpenAI、DeepL、Google 和 MyMemory，并提供自动回退与质量告警。
 - 横排/竖排中文自适应排版已经实现，竖排支持语义断列、标点保护与原文列序保持。
 - 气泡分组同时使用清理图内部区域和原图轮廓，避免修复后轮廓变弱导致相邻气泡误合并。
-- 当前自动化测试共 62 项，全部通过；JoJo 双页回归图识别为 13 个气泡，目标相邻区域稳定拆分为 3 个气泡。
+- 当前自动化测试共 77 项，全部通过；JoJo 双页回归图识别为 13 个气泡，目标相邻区域稳定拆分为 3 个气泡。
 
 ## 主要能力
 
-- 上传 JPG、JPEG、PNG、WebP、BMP，默认单文件上限 10 MB。
+- 上传 JPG、JPEG、PNG、WebP、BMP，默认单文件上限 10 MB；批量默认最多 10 张、总计 50 MB。
+- 每张批量图片复用独立单图流水线，支持总体/单图进度、部分失败和 ZIP 汇总导出。
+- 批量子任务按顺序进入共享模型流水线，避免 CTD、OCR 和翻译器实例并发造成检测框、掩膜或识别结果污染。
 - CTD/DBNet 漫画文本检测，支持复杂分镜、竖排文字和网点背景。
 - MIT 48px OCR 与 manga-ocr 混合识别；manga-ocr 只补救 MIT 完全未识别的空行，避免覆盖低置信度但正确的结果。
 - MIT OCR 的翻译阈值与擦除阈值分离：可读低置信度文本继续翻译，有检测掩膜的低置信度文字仍可擦除。
@@ -145,6 +148,8 @@ Docker 镜像是否包含全部 AI 模型取决于本地权重与构建配置；
 | `MANGA_INPAINT_DEVICE` | `cpu` / `cuda` | `cpu` |
 | `MANGA_RENDER_PADDING` | 气泡内边距比例 | `0.12` |
 | `MANGA_MAX_UPLOAD_MB` | 上传大小上限 | `10` |
+| `MANGA_BATCH_MAX_FILES` | 单批图片数量上限 | `10` |
+| `MANGA_BATCH_MAX_TOTAL_MB` | 单批总大小上限（MB） | `50` |
 
 完整配置见 [.env.example](.env.example) 和 [backend/app/config.py](backend/app/config.py)。
 
@@ -197,6 +202,9 @@ test_image/                 本地回归漫画，不纳入版本库
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | `POST` | `/api/translate` | 上传图片并创建翻译任务 |
+| `POST` | `/api/translate/batch` | 批量上传并创建多个独立单图任务 |
+| `POST` | `/api/translate/batch/status` | 汇总多个子任务的状态与平均进度 |
+| `POST` | `/api/translate/batch/zip` | 导出成功图片、清单与失败说明 ZIP |
 | `GET` | `/api/translate/{task_id}/status` | 查询任务进度 |
 | `GET` | `/api/translate/{task_id}/result` | 下载翻译结果 |
 | `DELETE` | `/api/translate/{task_id}` | 删除任务 |
@@ -213,11 +221,11 @@ test_image/                 本地回归漫画，不纳入版本库
 
 测试使用标准库 `unittest`，不是 pytest。部分测试会加载真实 PaddleOCR 模型，因此首次执行可能较慢。
 
-当前覆盖重点包括 API 与流水线、OCR 适配、掩膜与残影清理、LaMa 局部推理、气泡分组与原图边界校验、气泡几何回退、中文布局、翻译回退和质量告警。
+当前覆盖重点包括单图/批量 API、ZIP 安全导出与流水线，以及 OCR 适配、掩膜与残影清理、LaMa 局部推理、气泡分组与原图边界校验、气泡几何回退、中文布局、翻译回退和质量告警。
 
 ## 当前限制
 
-- 当前以单张图片为主，尚未交付批量上传、ZIP 导出和章节级任务。
+- 批量功能是对独立单图任务的编排与汇总，尚无可恢复的章节级持久队列、暂停/续跑和批次历史管理。
 - 暂无用户账户、历史任务同步、人工校对编辑器和团队协作。
 - MIT、manga-ocr 与 LaMa 模型体积较大，首次准备环境需要额外下载时间和磁盘空间。
 - CPU 可运行，但 CTD、manga-ocr 和 LaMa 的整页处理速度明显慢于 GPU。
