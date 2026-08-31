@@ -274,6 +274,9 @@ export default function TranslatePanel() {
           targetLang: status.target_lang,
           detectedSourceLang: status.detected_source_lang,
           translationBackends: status.translation_backends || [],
+          ocrBackend: status.ocr_backend || '',
+          renderFont: status.render_font || '',
+          regionDiagnostics: status.region_diagnostics || [],
         })
         setPhase('result')
         notify('翻译完成', 'success')
@@ -530,6 +533,11 @@ export default function TranslatePanel() {
                   {languageLabel(result.detectedSourceLang || result.sourceLang)} → {languageLabel(result.targetLang)}
                   {result.translationBackends?.length ? ` · ${result.translationBackends.join(' / ')}` : ''}
                 </p>
+                <p className="mt-1 text-xs text-ink-600">
+                  OCR：{result.ocrBackend || '按区域路由'}
+                  {result.renderFont ? ` · 字体：${result.renderFont.split(/[\\/]/).pop()}` : ''}
+                  {result.regionDiagnostics?.length ? ` · 区域：${result.regionDiagnostics.length}` : ''}
+                </p>
               </div>
               <SpecularButton
                 {...SPECULAR_PRIMARY}
@@ -773,6 +781,11 @@ function BatchItems({ items }) {
             {languageLabel(item.detected_source_lang || item.source_lang)} → {languageLabel(item.target_lang)}
             {item.translation_backends?.length ? ` · ${item.translation_backends.join(' / ')}` : ''}
           </p>
+          {(item.ocr_backend || item.render_font) && (
+            <p className="mt-1 truncate text-[11px] text-ink-600">
+              OCR：{item.ocr_backend || '按区域路由'}{item.render_font ? ` · 字体：${item.render_font.split(/[\\/]/).pop()}` : ''}
+            </p>
+          )}
         </div>
       ))}
     </div>

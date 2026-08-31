@@ -30,6 +30,17 @@
 - pydantic-settings，环境变量前缀 `MANGA_`，读 `.env`（见 `backend/app/config.py`）。如 `MANGA_PIPELINE_MODE`（real/demo）、`MANGA_TRANSLATOR_BACKEND`（deepseek/google/deepl/openai/mymemory）、`MANGA_MAX_UPLOAD_MB`、`MANGA_BATCH_MAX_FILES`/`MANGA_BATCH_MAX_TOTAL_MB`、`MANGA_INPAINTER_BACKEND`（cv/lama）、`MANGA_OCR_BACKEND`（mit48/mangaocr/mit48+mangaocr/paddle）、`MANGA_DETECTOR_BACKEND`（空/cv/manga）、`MANGA_MIT_DETECTOR`（default/ctd）、`MANGA_MIT_MODEL_DIR`/`MANGA_MIT_FALLBACK_DIR`、`MANGA_MIT_DEVICE`（cpu/cuda/mps/auto）、`MANGA_MIT_OCR_UPSCALE`/`MANGA_MIT_OCR_MIX_THRESHOLD`、`MANGA_BUBBLE_FILTER`（auto/on/off）。
 - `.env` 已 gitignore；`.env.example` 展示全部可配项。DeepL 免费版 auth key 以 `:fx` 结尾。
 
+## 当前升级路线（给后续 Codex）
+
+当前目标不是一次性堆功能，而是先把项目从“能跑的漫画翻译 MVP”提升成“可演示、可解释、可继续扩展”的作品。用户已经讨论并确认过的大方向见 `docs/阶段升级路线图.md`，后续 Codex 接任务前应先阅读该文档。
+
+- **第一优先级：体验闭环**。把翻译任务做成接近 ChatGPT 的任务对话界面：目前先只支持图片输入；用户在底部上传/粘贴图片并提交，界面以对话/任务流形式输出每张图片的进度、预览、重新翻译和下载入口。每张图片完成后应立即可预览；不满意时可对单张重新翻译；可下载单张，也保留批量 ZIP。
+- **侧边栏信息架构**。侧边栏使用“侧边栏图标 - 翻译任务：……”作为任务入口；“翻译任务”和“专有名词库”同级。点击“专有名词库”后，主区域从对话界面切换为词库编辑界面，而不是把词库塞进翻译表单里。
+- **第二优先级：性能与英文 OCR**。当前主要速度瓶颈是 PaddleOCR 对每个文字区域执行完整 `predict()`，尤其英文/中文路径会更明显。优先让 PaddleOCR 使用 GPU（如 `MANGA_PADDLE_DEVICE=gpu:0`），GPU 不可用时回退 CPU；不要承诺固定加速倍数。随后再考虑减少低置信度重复候选、懒加载语言模型、减少重复读图。
+- **第三优先级：翻译质量扩展**。六条翻译路径已具备基础能力，但用户目前重点优化的是日→中和英→中。不要为了“六路径全都完美”拖慢体验改造；中/日/英互译可以保留为框架能力，质量优化按真实样例逐条推进。
+- **后续增强**：历史翻译记录、文件夹上传、更多专有名词库、参考大模型的自定义翻译风格、AI 对话式翻译风格设置。这些功能有展示价值，但应在第一阶段体验闭环稳定后推进。
+- **重要约束**：检测、OCR、翻译等模型推理仍需串行；不要移除 `TranslationTaskManager` 的单 worker 和 `_pipeline_lock`。不要通过并发整条流水线换速度。
+
 ## 架构要点（非文件名能看出的）
 
 - 应用代码在 `backend/app`（不是 `backend`），运行/测试都要保证 `backend` 在 `sys.path`。

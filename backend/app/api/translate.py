@@ -105,6 +105,10 @@ def _batch_status_item(task_id: str, task: dict | None, request_index: int) -> B
         translation_backends=meta.get("translation_backends") or [],
         translation_failures=meta.get("translation_failures") or [],
         quality_warnings=meta.get("quality_warnings") or [],
+        ocr_backend=meta.get("ocr_backend") or "",
+        render_font=meta.get("render_font") or "",
+        region_diagnostics=meta.get("region_diagnostics") or [],
+        performance=meta.get("performance") or {},
     )
 
 
@@ -299,6 +303,10 @@ async def get_status(task_id: str, manager: TranslationTaskManager = Depends(get
         translation_backends=(task.get("meta") or {}).get("translation_backends") or [],
         translation_failures=(task.get("meta") or {}).get("translation_failures") or [],
         quality_warnings=(task.get("meta") or {}).get("quality_warnings") or [],
+        ocr_backend=(task.get("meta") or {}).get("ocr_backend") or "",
+        render_font=(task.get("meta") or {}).get("render_font") or "",
+        region_diagnostics=(task.get("meta") or {}).get("region_diagnostics") or [],
+        performance=(task.get("meta") or {}).get("performance") or {},
     )
 
 

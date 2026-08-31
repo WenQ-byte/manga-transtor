@@ -67,7 +67,7 @@ cd ..
 依赖分为四档：
 
 - `requirements.txt`：FastAPI、Pillow、OpenCV、httpx 等核心依赖；只有这一档时可运行 Demo 流程。
-- `requirements-ai.txt`：PaddleOCR 3.x。
+- `requirements-ai.txt`：PaddleOCR 3.x + PaddlePaddle GPU 3.3.1（cu130；CPU 环境可改装同版本 `paddlepaddle`）。
 - `requirements-inpaint.txt`：PyTorch 与 LaMa 修复。
 - `requirements-mit.txt`：MIT 检测/OCR、manga-ocr 及几何依赖；使用默认 OCR 路线时需要安装。
 
@@ -86,6 +86,7 @@ MANGA_TRANSLATOR_BACKEND=deepseek
 MANGA_DEEPSEEK_API_KEY=sk-xxxx
 
 MANGA_OCR_BACKEND=mit48+mangaocr
+MANGA_PADDLE_DEVICE=gpu:0
 MANGA_MIT_DETECTOR=ctd
 MANGA_MIT_DEVICE=auto
 
@@ -103,7 +104,7 @@ MANGA_DEFAULT_TARGET_LANG=zh
 MANGA_AUTO_SOURCE_FALLBACK=ja
 ```
 
-自动检测基于整页 OCR 文本：出现假名时优先判为日语，拉丁字母占主导时判为英语，不含假名的汉字文本判为中文。空文本、纯数字和信息不足的短文本使用 `MANGA_AUTO_SOURCE_FALLBACK`，原因与置信度会写入任务元数据。
+自动检测优先按文字区域比较 MIT48 与 PaddleOCR 候选：出现平假名/片假名时判为日语，拉丁字母占主导时判为英语，不含假名的汉字文本按中文处理。空文本、纯数字和信息不足的短文本使用 `MANGA_AUTO_SOURCE_FALLBACK`；每个区域的语言、引擎、置信度和回退都会写入任务元数据。
 
 ### 3. 启动
 
@@ -146,11 +147,16 @@ Docker 镜像是否包含全部 AI 模型取决于本地权重与构建配置；
 |---|---|---|
 | `MANGA_PIPELINE_MODE` | `real` / `demo` | `real` |
 | `MANGA_OCR_BACKEND` | `mit48+mangaocr` / `mit48` / `mangaocr` / `paddle` | `mit48+mangaocr` |
+| `MANGA_PADDLE_DEVICE` | PaddleOCR 3.x 设备：`gpu:0`、`gpu:N` 或 `cpu`；GPU 失败自动回退 CPU | `gpu:0` |
 | `MANGA_DETECTOR_BACKEND` | 空值自动选择，或 `cv` / `manga` | 空值 |
 | `MANGA_MIT_DETECTOR` | `ctd` / `default` | `ctd` |
 | `MANGA_MIT_DEVICE` | `auto` / `cpu` / `cuda` / `mps` | `auto` |
 | `MANGA_MIT_MODEL_DIR` | MIT 模型目录 | `backend/data/models/mit` |
 | `MANGA_MIT_OCR_UPSCALE` | 小于该字号的文本先放大识别 | `16` |
+| `MANGA_OCR_ZH/EN_TRANSLATE_THRESHOLD` | 中文/英文进入翻译的 Paddle 置信度阈值 | `0.55` |
+| `MANGA_OCR_ZH/EN_ERASE_THRESHOLD` | 中文/英文擦除阈值（可靠区域仍可擦除） | `0.25` |
+| `MANGA_OCR_EN_UPSCALE` | 英文小区域放大倍数（极小字自动 3x） | `2.0` |
+| `MANGA_OCR_ZH_UPSCALE` | 中文区域温和放大倍数 | `1.5` |
 | `MANGA_BUBBLE_FILTER` | `auto` / `on` / `off` | `auto` |
 | `MANGA_TRANSLATOR_BACKEND` | `deepseek` / `openai` / `deepl` / `google` / `mymemory` | `google` |
 | `MANGA_DEEPSEEK_MODEL` | 日语等非英语翻译使用的 DeepSeek 模型 | `deepseek-v4-flash` |
@@ -224,7 +230,7 @@ test_image/                 本地回归漫画，不纳入版本库
 
 单图接口通过查询参数、批量接口通过表单字段接收 `source_lang` 与 `target_lang`。`source_lang` 支持 `auto`、`zh`、`ja`、`en`，`target_lang` 支持 `zh`、`ja`、`en`；显式选择相同语言会返回 400。旧客户端不传参数时按“自动检测 → 中文”运行。批量中的全部图片使用同一组语言配置，每张图片的实际识别语言、后端和回退信息分别记录。
 
-DeepSeek 与 OpenAI 使用按目标语言生成的漫画提示词；DeepSeek继续提供页级编号上下文和解析失败后的逐条回退。DeepL、Google、MyMemory 通过统一映射层转换语言代码，不支持的代码会失败并进入既有回退链。MIT48 与 manga-ocr 主要针对日语漫画优化；中文源图和复杂英文源图若识别不稳定，建议显式选择语言并使用 PaddleOCR。
+DeepSeek 与 OpenAI 使用按目标语言生成的漫画提示词；DeepSeek继续提供页级编号上下文和解析失败后的逐条回退。DeepL、Google、MyMemory 通过统一映射层转换语言代码，不支持的代码会失败并进入既有回退链。默认路由为日语 MIT48（仅空区域由 manga-ocr 救空）、中文/英文 PaddleOCR；自动模式按区域选择，中文和英文不会交给 manga-ocr。所有批量子任务仍共享单 worker 和流水线锁。
 | `GET` / `POST` | `/api/glossary` | 查询或新增词条 |
 | `PUT` / `DELETE` | `/api/glossary/{item_id}` | 修改或删除词条 |
 | `POST` | `/api/glossary/import` | JSON 批量导入词典 |

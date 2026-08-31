@@ -66,6 +66,10 @@ class BatchStatusItem(BaseModel):
     translation_backends: list[str] = Field(default_factory=list)
     translation_failures: list[str] = Field(default_factory=list)
     quality_warnings: list[str] = Field(default_factory=list)
+    ocr_backend: str = ""
+    render_font: str = ""
+    region_diagnostics: list[dict] = Field(default_factory=list)
+    performance: dict = Field(default_factory=dict)
 
 
 class BatchStatusResponse(BaseModel):
@@ -107,6 +111,10 @@ class TranslateStatus(BaseModel):
     translation_backends: list[str] = Field(default_factory=list)
     translation_failures: list[str] = Field(default_factory=list)
     quality_warnings: list[str] = Field(default_factory=list)
+    ocr_backend: str = ""
+    render_font: str = ""
+    region_diagnostics: list[dict] = Field(default_factory=list)
+    performance: dict = Field(default_factory=dict)
 
 
 class TranslateResult(BaseModel):

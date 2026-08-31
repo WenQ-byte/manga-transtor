@@ -45,6 +45,16 @@ class TextRegion:
     group_mask_reliable: bool = field(default=False, repr=False, compare=False)
     translation_backend: str = ""
     quality_warnings: list[str] = field(default_factory=list)
+    # 语言路由诊断：保留最终采用的引擎/语言和候选回退信息，便于排查中英文效果。
+    source_lang: str = ""
+    ocr_engine: str = ""
+    ocr_fallback: bool = False
+    ocr_fallback_reason: str = ""
+    ocr_candidates: list[dict] = field(default_factory=list, repr=False, compare=False)
+    ocr_route_reason: str = ""
+    ocr_attempted_models: list[str] = field(default_factory=list)
+    ocr_preprocess_variants: list[str] = field(default_factory=list)
+    render_font: str = ""
 
     # 内部：MIT 检测器附加的 Quadrilateral、OCR 附加的内部状态
     _quad: Optional[object] = field(default=None, repr=False, compare=False)
@@ -87,6 +97,9 @@ class PipelineResult:
     detection_reason: str = "显式指定源语言"
     translation_failures: list[str] = field(default_factory=list)
     translation_skipped: bool = False
+    region_diagnostics: list[dict] = field(default_factory=list)
+    render_font: str = ""
+    performance: dict = field(default_factory=dict)
 
 
 _JA_RE = re.compile(r"[\u3040-\u30ff]")
@@ -234,11 +247,44 @@ def assess_translation_quality(
     return [f"[{direction}]{warning}" for warning in dict.fromkeys(warnings)]
 
 
-def ocr_thresholds(ocr_name: str) -> tuple[float, float]:
-    """MIT 检测框可靠但字符置信度偏保守；翻译与擦除使用不同阈值。"""
-    if "mit48" in (ocr_name or "").lower():
-        return 0.20, 0.0
+def ocr_thresholds(ocr_name: str, source_lang: str | None = None) -> tuple[float, float]:
+    """按识别器和语言分离翻译/擦除阈值；MIT 日文保持原有低阈值。"""
+    from app.config import get_settings
+
+    settings = get_settings()
+    lang = _language_value(source_lang or "")
+    if "mit48" in (ocr_name or "").lower() and lang not in {"zh", "en"}:
+        return float(settings.ocr_ja_translate_threshold), float(settings.ocr_ja_erase_threshold)
+    values = {
+        "zh": (settings.ocr_zh_translate_threshold, settings.ocr_zh_erase_threshold),
+        "en": (settings.ocr_en_translate_threshold, settings.ocr_en_erase_threshold),
+    }
+    if lang in values:
+        return tuple(float(v) for v in values[lang])
     return 0.50, 0.50
+
+
+def region_diagnostics(regions: list[TextRegion]) -> list[dict]:
+    """返回可写入任务 meta 的轻量区域诊断，不包含图像或完整原文。"""
+    return [
+        {
+            "index": index,
+            "source_lang": r.source_lang or "",
+            "ocr_engine": r.ocr_engine or "",
+            "confidence": round(float(r.confidence or 0.0), 4),
+            "ocr_fallback": bool(r.ocr_fallback),
+            "fallback_reason": r.ocr_fallback_reason or "",
+            "text": (r.text or "")[:160],
+            "candidate_count": len(r.ocr_candidates or []),
+            "route_reason": r.ocr_route_reason or "",
+            "attempted_models": list(r.ocr_attempted_models or []),
+            "preprocess_variants": list(r.ocr_preprocess_variants or []),
+            "bounds": list(r.bounds),
+            "group_index": r.group_index,
+            "group_bounds": list(r.group_bounds) if r.group_bounds else None,
+        }
+        for index, r in enumerate(regions, start=1)
+    ]
 
 
 class TranslationPipeline:
@@ -267,6 +313,41 @@ class TranslationPipeline:
     def _report(self, cb: Optional[ProgressCallback], step_index: int, progress: int) -> None:
         if cb:
             cb(PIPELINE_STEPS[step_index][0], progress)
+
+    def _ensure_ocr_metadata(self, regions: list[TextRegion], fallback_lang: str) -> None:
+        engine = getattr(self.ocr, "name", type(self.ocr).__name__)
+        for region in regions:
+            if not region.source_lang or region.source_lang == "auto":
+                region.source_lang = fallback_lang
+            if not region.ocr_engine:
+                region.ocr_engine = engine
+
+    def _performance_snapshot(self, stage_ms, total_ms, translation_perf=None) -> dict:
+        ocr_perf = dict(getattr(self.ocr, "last_performance", {}) or {})
+        translation_perf = dict(translation_perf or {})
+        measured = sum(int(stage_ms.get(name, 0)) for name in (
+            "detection_ms", "ocr_ms", "inpaint_ms", "grouping_ms", "translation_ms", "render_ms"
+        ))
+        return {
+            **{name: int(value) for name, value in stage_ms.items()},
+            "model_load_ms": int(ocr_perf.get("model_load_ms", 0)),
+            "ocr_inference_ms": int(ocr_perf.get("inference_ms", 0)),
+            "ocr_call_count": int(ocr_perf.get("call_count", 0)),
+            "ocr_models": list(ocr_perf.get("models", [])),
+            "ocr_preprocess_variants": list(ocr_perf.get("variants", [])),
+            "ocr_model_reuse_count": int(ocr_perf.get("model_reuse_count", 0)),
+            "ocr_fallback_count": int(ocr_perf.get("fallback_count", 0)),
+            "ocr_requested_device": str(ocr_perf.get("requested_device", "")),
+            "ocr_device": str(ocr_perf.get("device", "")),
+            "ocr_device_fallback": bool(ocr_perf.get("device_fallback", False)),
+            "ocr_device_fallback_reason": str(ocr_perf.get("device_fallback_reason", "")),
+            "translation_request_count": int(translation_perf.get("request_count", 0)),
+            "translation_cache_hits": int(translation_perf.get("cache_hits", 0)),
+            "translation_fallback": bool(translation_perf.get("fallback", False)),
+            "translation_backends_attempted": list(translation_perf.get("backends_attempted", [])),
+            "other_ms": max(0, int(total_ms) - measured),
+            "total_ms": int(total_ms),
+        }
 
     def _group_regions(
         self,
@@ -307,9 +388,27 @@ class TranslationPipeline:
         from app.config import get_settings
 
         start = time.monotonic()
+        stage_ms = {
+            "detection_ms": 0,
+            "ocr_ms": 0,
+            "inpaint_ms": 0,
+            "grouping_ms": 0,
+            "translation_ms": 0,
+            "render_ms": 0,
+        }
+        translation_perf = {
+            "request_count": 0,
+            "cache_hits": 0,
+            "fallback": False,
+            "backends_attempted": [],
+        }
         settings = get_settings()
         requested_source = _language_value(source_lang)
-        ocr_source = settings.auto_source_fallback if requested_source == "auto" else requested_source
+        # 新路由器需要收到 auto 才能做区域级候选比较；旧版单语言 OCR 仍使用稳定回退。
+        if requested_source == "auto" and getattr(self.ocr, "supports_language_routing", False):
+            ocr_source = "auto"
+        else:
+            ocr_source = settings.auto_source_fallback if requested_source == "auto" else requested_source
 
         def empty_result(actual: str | None = None, confidence: float | None = None, reason: str | None = None):
             if requested_source == "auto" and actual is None:
@@ -317,13 +416,15 @@ class TranslationPipeline:
                 actual = empty_detection.language
                 confidence = empty_detection.confidence
                 reason = empty_detection.reason
+            total_ms = int((time.monotonic() - start) * 1000)
             return PipelineResult(
                 regions=[],
-                duration_ms=int((time.monotonic() - start) * 1000),
+                duration_ms=total_ms,
                 ocr_backend=getattr(self.ocr, "name", type(self.ocr).__name__),
                 detected_source_lang=actual or requested_source,
                 detection_confidence=1.0 if confidence is None else confidence,
                 detection_reason=reason or "显式指定源语言",
+                performance=self._performance_snapshot(stage_ms, total_ms, translation_perf),
             )
 
         # 1. 检测（OCR 引擎自带检测时，直接由 OCR 完成检测+识别）
@@ -331,13 +432,18 @@ class TranslationPipeline:
             self._report(progress_cb, 0, 100)
             regions: list[TextRegion] = []
             self._report(progress_cb, 1, 10)
+            phase_started = time.monotonic()
             self.ocr.recognize(image_path, regions, ocr_source)
+            stage_ms["ocr_ms"] += int((time.monotonic() - phase_started) * 1000)
+            self._ensure_ocr_metadata(regions, ocr_source)
             self._report(progress_cb, 1, 100)
             if not regions:
                 return empty_result()
         else:
             self._report(progress_cb, 0, 10)
+            phase_started = time.monotonic()
             regions = self.detector.detect(image_path)
+            stage_ms["detection_ms"] += int((time.monotonic() - phase_started) * 1000)
             self._report(progress_cb, 0, 100)
 
             if not regions:
@@ -345,49 +451,50 @@ class TranslationPipeline:
 
             # 2. OCR
             self._report(progress_cb, 1, 10)
+            phase_started = time.monotonic()
             self.ocr.recognize(image_path, regions, ocr_source)
+            stage_ms["ocr_ms"] += int((time.monotonic() - phase_started) * 1000)
+            self._ensure_ocr_metadata(regions, ocr_source)
             self._report(progress_cb, 1, 100)
 
         if requested_source == "auto":
-            detection = detect_language(
-                "\n".join(r.text for r in regions if r.text.strip()),
-                fallback=settings.auto_source_fallback,
-            )
-            actual_source = detection.language
-            if (
-                actual_source != ocr_source
-                and detection.confidence >= 0.55
-                and getattr(self.ocr, "supports_detection", False)
-            ):
-                rerun_regions: list[TextRegion] = []
-                self.ocr.recognize(image_path, rerun_regions, actual_source)
-                if any(r.text.strip() for r in rerun_regions):
-                    regions = rerun_regions
-                    rerun_detection = detect_language(
-                        "\n".join(r.text for r in regions if r.text.strip()),
-                        fallback=actual_source,
-                    )
-                    if rerun_detection.language == actual_source:
-                        detection = LanguageDetection(
-                            actual_source,
-                            max(detection.confidence, rerun_detection.confidence),
-                            f"{detection.reason}，已按识别语言重新执行 OCR",
-                        )
+            # 路由器已经给出区域级语言；以置信度加权多数作为页面翻译方向，
+            # 同时保留每个区域的 source_lang，避免整页一次判断吞掉混合语言信息。
+            nonempty = [r for r in regions if r.text.strip()]
+            weighted: dict[str, float] = {}
+            for region in nonempty:
+                lang = region.source_lang or detect_language(region.text, settings.auto_source_fallback).language
+                weighted[lang] = weighted.get(lang, 0.0) + max(0.05, float(region.confidence or 0.0))
+            if weighted:
+                actual_source = max(weighted, key=weighted.get)
+                detection = LanguageDetection(
+                    actual_source,
+                    max(0.45, min(0.99, weighted[actual_source] / max(0.1, sum(weighted.values())) + 0.35)),
+                    f"区域级 OCR 路由：{actual_source}（{len(nonempty)} 个区域）",
+                )
+            else:
+                detection = detect_language("", fallback=settings.auto_source_fallback)
+                actual_source = detection.language
         else:
             actual_source = requested_source
             detection = None
 
         detection_confidence = detection.confidence if detection else 1.0
         detection_reason = detection.reason if detection else "显式指定源语言"
-        if actual_source == _language_value(target_lang):
+        target_value = _language_value(target_lang)
+        auto_has_other_language = requested_source == "auto" and any(
+            r.text.strip() and r.source_lang and r.source_lang != target_value for r in regions
+        )
+        if actual_source == target_value and not auto_has_other_language:
             from PIL import Image
             import io
 
             output = io.BytesIO()
             Image.open(image_path).convert("RGB").save(output, format="PNG")
+            total_ms = int((time.monotonic() - start) * 1000)
             return PipelineResult(
                 regions=[],
-                duration_ms=int((time.monotonic() - start) * 1000),
+                duration_ms=total_ms,
                 image_bytes=output.getvalue(),
                 ocr_backend=getattr(self.ocr, "name", type(self.ocr).__name__),
                 quality_warnings=[f"[{LANGUAGE_NAMES.get(actual_source)}→{LANGUAGE_NAMES.get(target_lang)}]源语言与目标语言相同，已保留原图"],
@@ -395,20 +502,30 @@ class TranslationPipeline:
                 detection_confidence=detection_confidence,
                 detection_reason=detection_reason,
                 translation_skipped=True,
+                performance=self._performance_snapshot(stage_ms, total_ms, translation_perf),
             )
 
         # 1.4 翻译与擦除阈值解耦：MIT 检测框/逐像素 mask 很可靠，但字符概率常仅 0.2~0.6；
         # 低概率行仍需擦除，并保留可读文本参与整块翻译。Paddle/CV 继续使用保守阈值。
-        translate_threshold, erase_threshold = ocr_thresholds(getattr(self.ocr, "name", ""))
         text_regions = [
-            r for r in regions if r.confidence >= translate_threshold and r.text.strip()
+            r for r in regions
+            if not (requested_source == "auto" and r.source_lang == target_value)
+            and r.confidence >= ocr_thresholds(
+                r.ocr_engine or getattr(self.ocr, "name", ""),
+                r.source_lang or actual_source,
+            )[0]
+            and r.text.strip()
         ]
         text_region_ids = {id(r) for r in text_regions}
         erase_only_regions = [
             r
             for r in regions
             if id(r) not in text_region_ids
-            and r.confidence >= erase_threshold
+            and not (requested_source == "auto" and r.source_lang == target_value)
+            and r.confidence >= ocr_thresholds(
+                r.ocr_engine or getattr(self.ocr, "name", ""),
+                r.source_lang or actual_source,
+            )[1]
             and (r.mask is not None or not r.text.strip())
         ]
 
@@ -435,7 +552,10 @@ class TranslationPipeline:
         bgr0 = img0[:, :, ::-1].copy()
         h0, w0 = bgr0.shape[:2]
         for r in text_regions + erase_only_regions:
-            if preserve_latin_label(r, actual_source) or classify_non_bubble(bgr0, r, w0, h0):
+            region_source = r.source_lang or actual_source
+            if preserve_latin_label(r, region_source) or classify_non_bubble(
+                bgr0, r, w0, h0, source_lang=region_source
+            ):
                 r._no_erase = True
         text_regions = drop_non_bubble_regions(text_regions)
         erase_only_regions = drop_non_bubble_regions(erase_only_regions)
@@ -445,33 +565,79 @@ class TranslationPipeline:
 
         # 3. 图像修复（擦除原文）—— 提前到翻译前，使气泡分组可在干净图上进行
         self._report(progress_cb, 2, 10)
+        phase_started = time.monotonic()
         cleaned = self.inpainter.inpaint(image_path, erase_regions)
+        stage_ms["inpaint_ms"] += int((time.monotonic() - phase_started) * 1000)
         self._report(progress_cb, 2, 100)
 
         # 4. 按气泡分组（干净图上泛洪，笔画已擦除 → 分组可靠）→ 整块翻译
-        glossary = self.glossary.get_mapping(actual_source, _language_value(target_lang))
         self._report(progress_cb, 3, 5)
+        phase_started = time.monotonic()
         groups = self._group_regions(
             cleaned,
             text_regions,
             boundary_image_path=image_path,
         )
+        stage_ms["grouping_ms"] += int((time.monotonic() - phase_started) * 1000)
         group_texts = ["\n".join(r.text for r in g["regions"] if r.text.strip()) for g in groups]
-        if actual_source == "en" and _language_value(target_lang) == "zh":
-            from app.services.engines.translator import expand_english_glossary_aliases
+        group_languages: list[str] = []
+        for group in groups:
+            weights: dict[str, float] = {}
+            for region in group["regions"]:
+                lang = region.source_lang or actual_source
+                weights[lang] = weights.get(lang, 0.0) + max(0.05, float(region.confidence or 0.0))
+            group_languages.append(max(weights, key=weights.get) if weights else actual_source)
 
-            glossary = expand_english_glossary_aliases(group_texts, glossary)
-        translated_blocks = self.translator.translate_batch(
-            group_texts,
-            actual_source,
-            target_lang,
-            glossary=glossary,
-            progress_cb=lambda p: self._report(progress_cb, 3, 5 + int(p * 0.95)),
-        )
-        backend_names = list(getattr(self.translator, "last_backend_names", []))
-        if len(backend_names) != len(groups):
+        translated_blocks = [""] * len(groups)
+        backend_names = [""] * len(groups)
+        group_glossaries: list[dict[str, str]] = [{} for _ in groups]
+        translation_failures: list[str] = []
+        language_buckets: dict[str, list[int]] = {}
+        for index, language in enumerate(group_languages):
+            # auto 混排中与目标语言相同的气泡无需擦除/回写；保留原文最安全。
+            if requested_source == "auto" and language == target_value:
+                translated_blocks[index] = group_texts[index]
+                backend_names[index] = "original"
+                continue
+            language_buckets.setdefault(language, []).append(index)
+
+        bucket_items = list(language_buckets.items())
+        phase_started = time.monotonic()
+        for bucket_pos, (language, indices) in enumerate(bucket_items):
+            texts = [group_texts[index] for index in indices]
+            glossary = self.glossary.get_mapping(language, target_value)
+            if language == "en" and target_value == "zh":
+                from app.services.engines.translator import expand_english_glossary_aliases
+
+                glossary = expand_english_glossary_aliases(texts, glossary)
+            for index in indices:
+                group_glossaries[index] = glossary
+            start_progress = bucket_pos / max(1, len(bucket_items))
+            span = 1 / max(1, len(bucket_items))
+            outputs = self.translator.translate_batch(
+                texts,
+                language,
+                target_lang,
+                glossary=glossary,
+                progress_cb=lambda p, start_progress=start_progress, span=span: self._report(
+                    progress_cb, 3, 5 + int((start_progress + p * span) * 0.95)
+                ),
+            )
+            bucket_perf = dict(getattr(self.translator, "last_performance", {}) or {})
+            translation_perf["request_count"] += int(bucket_perf.get("request_count", 0))
+            translation_perf["cache_hits"] += int(bucket_perf.get("cache_hits", 0))
+            translation_perf["fallback"] = bool(translation_perf["fallback"] or bucket_perf.get("fallback", False))
+            for attempted in bucket_perf.get("backends_attempted", []):
+                if attempted not in translation_perf["backends_attempted"]:
+                    translation_perf["backends_attempted"].append(attempted)
+            names = list(getattr(self.translator, "last_backend_names", []))
             fallback_name = getattr(self.translator, "name", type(self.translator).__name__)
-            backend_names = [fallback_name] * len(groups)
+            if len(names) != len(indices):
+                names = [fallback_name] * len(indices)
+            for local_index, group_index in enumerate(indices):
+                translated_blocks[group_index] = outputs[local_index] if local_index < len(outputs) else ""
+                backend_names[group_index] = names[local_index]
+            translation_failures.extend(getattr(self.translator, "last_failures", []))
         page_warnings: list[str] = []
         for group_idx, (g, block) in enumerate(zip(groups, translated_blocks)):
             block = block or ""
@@ -483,10 +649,10 @@ class TranslationPipeline:
             warnings = assess_translation_quality(
                 source_block,
                 block,
-                actual_source,
+                group_languages[group_idx],
                 target_lang,
                 backend_name,
-                glossary=glossary,
+                glossary=group_glossaries[group_idx],
             )
             page_warnings.extend(f"气泡{group_idx + 1}:{warning}" for warning in warnings)
             lines = block.split("\n")
@@ -496,11 +662,14 @@ class TranslationPipeline:
                 r.translated = lines[i] if i < len(lines) else last
                 r.translation_backend = backend_name
                 r.quality_warnings = list(warnings)
+        stage_ms["translation_ms"] += int((time.monotonic() - phase_started) * 1000)
         self._report(progress_cb, 3, 100)
 
         # 5. 渲染译文
         self._report(progress_cb, 4, 10)
+        phase_started = time.monotonic()
         result_bytes = self.renderer.render(cleaned, text_regions, target_lang=target_lang)
+        stage_ms["render_ms"] += int((time.monotonic() - phase_started) * 1000)
         self._report(progress_cb, 4, 100)
 
         duration = int((time.monotonic() - start) * 1000)
@@ -520,7 +689,10 @@ class TranslationPipeline:
             detected_source_lang=actual_source,
             detection_confidence=detection_confidence,
             detection_reason=detection_reason,
-            translation_failures=list(getattr(self.translator, "last_failures", [])),
+            translation_failures=translation_failures,
+            region_diagnostics=region_diagnostics(regions),
+            render_font=next((r.render_font for r in text_regions if r.render_font), ""),
+            performance=self._performance_snapshot(stage_ms, duration, translation_perf),
         )
 
 

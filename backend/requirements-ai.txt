@@ -1,4 +1,6 @@
 # 真实 OCR 依赖（可选，安装后启用真实文字识别）
 # 安装：pip install -r requirements-ai.txt
-paddlepaddle==3.3.1
+# 默认使用 CUDA 13 GPU 构建；CPU 环境可改为 paddlepaddle==3.3.1
+--extra-index-url https://www.paddlepaddle.org.cn/packages/stable/cu130/
+paddlepaddle-gpu==3.3.1
 paddleocr==3.7.0

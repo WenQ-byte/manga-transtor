@@ -82,6 +82,8 @@ def build_region_mask(img: np.ndarray, region: TextRegion, pad: int = 2) -> Opti
     import cv2
 
     h, w = img.shape[:2]
+    pad = _language_mask_pad(region, pad)
+    lang = getattr(region, "source_lang", "")
 
     # bbox：以 box 与 poly 的并集为界（poly 常偏紧包不住笔画外缘，box 更完整）
     pts = region.poly if region.poly else region.box
@@ -99,11 +101,20 @@ def build_region_mask(img: np.ndarray, region: TextRegion, pad: int = 2) -> Opti
         y0 = min(y0, int(min(bys)))
         y1 = max(y1, int(max(bys)))
 
-    # 缩进，避免覆盖气泡边框
-    x0 = max(0, x0 + pad)
-    y0 = max(0, y0 + pad)
-    x1 = min(w, x1 - pad)
-    y1 = min(h, y1 - pad)
+    # 中英文检测多边形通常贴着字形外缘。向内缩会直接漏掉大写字母、标点和
+    # 汉字边缘笔画，因此对已有 poly 的中英文改为向外留安全边带；日文维持
+    # 原行为，避免改变现有 MIT48 样例。
+    expand_poly = bool(region.poly) and lang in {"en", "zh"}
+    if expand_poly:
+        x0 = max(0, x0 - pad)
+        y0 = max(0, y0 - pad)
+        x1 = min(w, x1 + pad)
+        y1 = min(h, y1 + pad)
+    else:
+        x0 = max(0, x0 + pad)
+        y0 = max(0, y0 + pad)
+        x1 = min(w, x1 - pad)
+        y1 = min(h, y1 - pad)
     if x1 - x0 < 6 or y1 - y0 < 6:
         return None
 
@@ -122,11 +133,21 @@ def build_region_mask(img: np.ndarray, region: TextRegion, pad: int = 2) -> Opti
             cand = poly_filled
         if not complex_bg and strokes is not None and strokes.any():
             cand = np.maximum(cand, strokes)
-        kernel_size = 3 if complex_bg else 7
+        if complex_bg:
+            kernel_size = 3
+        else:
+            char_height = max(4, min(x1 - x0, y1 - y0))
+            if lang in {"en", "zh"}:
+                ratio = {"en": 0.16, "zh": 0.10}[lang]
+                radius = max(1, min(4, int(round(char_height * ratio / 2))))
+                kernel_size = max(3, 2 * radius + 1)
+            else:
+                # 日文和旧数据保持历史 7x7 膨胀，避免既有样例出现笔画残留。
+                kernel_size = 7
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_size, kernel_size))
         cand = cv2.dilate(cand, kernel, iterations=1)
         # 把 pad 缩进丢掉的边带补回掩膜（覆盖到 box/poly 边界），防边缘笔画残留
-        if pad > 0:
+        if pad > 0 and not expand_poly:
             x0 = max(0, x0 - pad)
             y0 = max(0, y0 - pad)
             x1 = min(w, x1 + pad)
@@ -158,6 +179,17 @@ def build_region_mask(img: np.ndarray, region: TextRegion, pad: int = 2) -> Opti
     cand = cv2.morphologyEx(cand, cv2.MORPH_CLOSE, kernel, iterations=1)
     cand = cv2.dilate(cand, kernel, iterations=1)
     return (x0, y0, x1, y1, cand)
+
+
+def _language_mask_pad(region: TextRegion, base: int) -> int:
+    """按字符高度给英文稍大的抗锯齿安全边距，中文保持谨慎，日文沿用旧值。"""
+    lang = getattr(region, "source_lang", "")
+    if lang not in {"en", "zh"}:
+        return int(base)
+    x0, y0, x1, y1 = region.bounds
+    char_height = max(4, min(abs(x1 - x0), abs(y1 - y0)))
+    ratio = {"en": 0.14, "zh": 0.08}[lang]
+    return max(int(base), min(8, int(round(char_height * ratio))))
 
 
 def _complex_background(patch_gray: np.ndarray) -> bool:

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import traceback
 import threading
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -77,13 +78,20 @@ class TranslationTaskManager:
         self.db.task_update(task_id, status="processing", progress=5)
         try:
             with self._pipeline_lock:
+                had_pipeline = getattr(self, "_pipeline", None) is not None
+                load_started = time.monotonic()
                 pipeline = self._get_pipeline()
+                pipeline_load_ms = 0 if had_pipeline else int((time.monotonic() - load_started) * 1000)
                 result = pipeline.translate_image(
                     Path(image_path),
                     source_lang,
                     target_lang,
                     progress_cb=progress_cb,
                 )
+                performance = dict(getattr(result, "performance", {}) or {})
+                performance["model_load_ms"] = int(performance.get("model_load_ms", 0)) + pipeline_load_ms
+                performance["total_ms"] = int(getattr(result, "duration_ms", 0)) + pipeline_load_ms
+                result.performance = performance
 
             supports_meta = hasattr(self.db, "task_get")
             task = self.db.task_get(task_id) if supports_meta else {}
@@ -98,6 +106,9 @@ class TranslationTaskManager:
                 "translation_failures": getattr(result, "translation_failures", []),
                 "quality_warnings": getattr(result, "quality_warnings", []),
                 "translation_skipped": getattr(result, "translation_skipped", False),
+                "region_diagnostics": getattr(result, "region_diagnostics", []),
+                "render_font": getattr(result, "render_font", ""),
+                "performance": getattr(result, "performance", {}),
             })
 
             image_bytes = getattr(result, "image_bytes", None)

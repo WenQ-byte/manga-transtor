@@ -34,8 +34,21 @@ class Settings(BaseSettings):
     auto_source_fallback: str = "ja"
     # OCR 支持语言
     ocr_langs: str = "ja,en,ch"
+    # 分语言 OCR 阈值：MIT 日文保持低阈值；Paddle 中英文使用更保守的翻译门槛
+    ocr_ja_translate_threshold: float = 0.20
+    ocr_ja_erase_threshold: float = 0.0
+    ocr_zh_translate_threshold: float = 0.55
+    ocr_zh_erase_threshold: float = 0.25
+    ocr_en_translate_threshold: float = 0.55
+    ocr_en_erase_threshold: float = 0.25
+    ocr_candidate_fallback_threshold: float = 0.45
+    # 中英文区域预处理：英文小字默认 2x，极小区域可到 3x；中文保持温和增强
+    ocr_en_upscale: float = 2.0
+    ocr_zh_upscale: float = 1.5
     # OCR 引擎（默认混合最准）: mit48+mangaocr（默认，48px + manga-ocr 补识别） | mit48 | mangaocr | paddle（回退）
     ocr_backend: str = "mit48+mangaocr"
+    # PaddleOCR 推理设备: gpu:0（默认优先） | gpu:N | cpu；GPU 不可用时自动回退 CPU
+    paddle_device: str = "gpu:0"
     # 检测引擎: cv（OpenCV 启发式） | paddle（PaddleOCR 自带检测） | manga（MIT DBNet/ctd）
     # 空字符串 = 自动：OCR 用 mit 系列时选 manga，否则 cv
     detector_backend: str = ""
@@ -73,6 +86,8 @@ class Settings(BaseSettings):
     openai_base_url: str = "https://api.openai.com/v1"
     openai_model: str = "gpt-4o-mini"
     google_translate_base: str = "https://translate.googleapis.com/translate_a/single"
+    # 进程内安全译文缓存条目数；键包含源/目标语言、完整批次文本和词库内容
+    translation_cache_size: int = 512
 
     # 图像修复引擎: cv（无模型，轻量） | lama（神经网络，需 torch + 权重）
     inpainter_backend: str = "cv"
@@ -88,6 +103,9 @@ class Settings(BaseSettings):
     render_padding: float = 0.12
     # 竖排判定：气泡高宽比需超过该值且方向以竖排为主时才竖排
     render_vertical_min_ratio: float = 1.2
+    render_en_line_spacing: float = 0.22
+    render_zh_line_spacing: float = 0.32
+    render_ja_line_spacing: float = 0.30
 
     class Config:
         env_prefix = "MANGA_"

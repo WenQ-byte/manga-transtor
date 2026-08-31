@@ -32,6 +32,31 @@ FONT_CANDIDATES = [
     "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
 ]
 
+FONT_CANDIDATES_BY_LANG = {
+    "zh": [
+        "C:/Windows/Fonts/msyh.ttc",
+        "C:/Windows/Fonts/msyhbd.ttc",
+        "C:/Windows/Fonts/simhei.ttf",
+        "C:/Windows/Fonts/msjh.ttc",
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+    ],
+    "ja": [
+        "C:/Windows/Fonts/YuGothR.ttc",
+        "C:/Windows/Fonts/msgothic.ttc",
+        "C:/Windows/Fonts/msyh.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+    ],
+    "en": [
+        "C:/Windows/Fonts/segoeui.ttf",
+        "C:/Windows/Fonts/arial.ttf",
+        "C:/Windows/Fonts/calibri.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    ],
+}
+
 # 竖排字距系数（字号 * 该系数 = 相邻字符垂直间距）
 VERTICAL_CHAR_RATIO = 1.15
 # 竖排列宽占列间距比例（留出描边与间隔，防相邻列文字重叠）
@@ -71,32 +96,92 @@ class PILRenderer(BaseRenderer):
     name = "pil"
 
     def __init__(self):
-        self._font_cache: dict[int, ImageFont.FreeTypeFont] = {}
-        self._font_path = self._find_font()
+        self._font_cache: dict[tuple[str, int], ImageFont.FreeTypeFont] = {}
+        self._glyph_cache: dict[str, set[int] | None] = {}
+        self._font_paths = {lang: self._find_font(lang) for lang in FONT_CANDIDATES_BY_LANG}
+        self._font_path = self._font_paths.get("zh") or self._find_font("zh")
+        self._active_target_lang = "zh"
+        self._active_font_path = self._font_path
+        self.last_font_path = self._font_path or ""
         s = get_settings()
         self.pad_ratio = max(0.02, float(s.render_padding))
         self.vertical_min_ratio = max(1.0, float(s.render_vertical_min_ratio))
 
-    def _find_font(self) -> str | None:
-        for p in FONT_CANDIDATES:
+    def _find_font(self, target_lang: str = "zh") -> str | None:
+        candidates = FONT_CANDIDATES_BY_LANG.get(target_lang, FONT_CANDIDATES)
+        for p in candidates:
             if Path(p).exists():
                 return p
         return None
 
-    def _get_font(self, size: int) -> ImageFont.FreeTypeFont:
+    def _get_font(self, size: int, target_lang: str | None = None) -> ImageFont.FreeTypeFont:
+        target_lang = target_lang or self._active_target_lang
         size = max(1, int(size))
-        if size in self._font_cache:
-            return self._font_cache[size]
-        if self._font_path:
-            font = ImageFont.truetype(self._font_path, size)
+        path = self._active_font_path if target_lang == self._active_target_lang else self._font_paths.get(target_lang)
+        path = path or self._font_path
+        key = (path or target_lang, size)
+        if key in self._font_cache:
+            return self._font_cache[key]
+        if path:
+            font = ImageFont.truetype(path, size)
         else:
             font = ImageFont.load_default()
-        self._font_cache[size] = font
+        self._font_cache[key] = font
         return font
+
+    def _select_font_for_text(self, target_lang: str, text: str) -> str | None:
+        """选择实际存在且覆盖页面字符的字体；无法读取 cmap 时退回首个可用字体。"""
+        existing = [path for path in FONT_CANDIDATES_BY_LANG.get(target_lang, FONT_CANDIDATES) if Path(path).exists()]
+        for path in existing:
+            glyphs = self._font_glyphs(path)
+            if glyphs is None or all(ch.isspace() or ord(ch) in glyphs for ch in text):
+                return path
+        return existing[0] if existing else self._font_path
+
+    def _font_glyphs(self, path: str) -> set[int] | None:
+        if path in self._glyph_cache:
+            return self._glyph_cache[path]
+        glyphs: set[int] = set()
+        try:
+            from fontTools.ttLib import TTCollection, TTFont
+
+            if Path(path).suffix.lower() == ".ttc":
+                collection = TTCollection(path, lazy=True)
+                fonts = collection.fonts
+            else:
+                collection = None
+                fonts = [TTFont(path, lazy=True)]
+            for font in fonts:
+                for table in font["cmap"].tables:
+                    glyphs.update(table.cmap)
+                font.close()
+            if collection is not None:
+                collection.close()
+            self._glyph_cache[path] = glyphs
+        except Exception:  # noqa: BLE001
+            self._glyph_cache[path] = None
+        return self._glyph_cache[path]
+
+    def _line_spacing(self) -> float:
+        settings = get_settings()
+        return {
+            "zh": float(settings.render_zh_line_spacing),
+            "ja": float(settings.render_ja_line_spacing),
+            "en": float(settings.render_en_line_spacing),
+        }.get(self._active_target_lang, LINE_SPACING_RATIO)
 
     def render(self, cleaned_image_path: Path, regions: list[TextRegion], target_lang: LangCode) -> bytes:
         img = Image.open(cleaned_image_path).convert("RGB")
         img_w, img_h = img.size
+        target_value = getattr(target_lang, "value", target_lang)
+        self._active_target_lang = target_value if target_value in FONT_CANDIDATES_BY_LANG else "zh"
+        render_text = "\n".join(
+            (region.group_translated or region.translated or "") for region in regions
+        )
+        self._active_font_path = self._select_font_for_text(self._active_target_lang, render_text)
+        self.last_font_path = self._active_font_path or ""
+        for region in regions:
+            region.render_font = self.last_font_path
         min_font_size = max(1, round((img_w + img_h) / 200))
 
         bgr = np.array(img)[:, :, ::-1].copy()
@@ -117,43 +202,40 @@ class PILRenderer(BaseRenderer):
             block = self._group_block_text(group_regions)
             block = self._layout_block_text(block, target_lang)
             fill, stroke = self._text_colors(group_regions)
-            group_overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
+            group_overlay = Image.new("RGBA", (bw, bh), (0, 0, 0, 0))
             odraw = ImageDraw.Draw(group_overlay)
-            target_value = getattr(target_lang, "value", target_lang)
             if target_value != "en" and self._use_vertical(group_regions, bw, bh):
                 if block:
                     self._render_vertical_bubble_block(
-                        odraw, block, bx0, by0, bw, bh, min_font_size, fill=fill, stroke=stroke
+                        odraw, block, 0, 0, bw, bh, min_font_size, fill=fill, stroke=stroke
                     )
                 else:
                     self._render_vertical_bubble(
-                        odraw, group_regions, bx0, by0, bw, bh, min_font_size, fill=fill, stroke=stroke
+                        odraw, group_regions, 0, 0, bw, bh, min_font_size, fill=fill, stroke=stroke
                     )
             else:
                 self._render_horizontal_bubble(
-                    odraw, group_regions, bx0, by0, bw, bh, min_font_size, block=block, fill=fill, stroke=stroke
+                    odraw, group_regions, 0, 0, bw, bh, min_font_size, block=block, fill=fill, stroke=stroke
                 )
 
             group_alpha = np.array(group_overlay.getchannel("A"))
             drawn = group_alpha > 0
             if not drawn.any():
                 continue
-            group_clip = np.zeros((img_h, img_w), np.uint8)
+            group_clip = np.full((bh, bw), 255, np.uint8)
 
             if mask is not None:
                 # 可靠容器是硬边界；覆盖不足说明排版/几何不可信，宁可跳过也不放行到人物背景。
-                coverage = float((drawn & (mask > 0)).sum()) / float(drawn.sum())
+                mask_crop = mask[by0:by1, bx0:bx1]
+                if mask_crop.shape != group_alpha.shape:
+                    continue
+                coverage = float((drawn & (mask_crop > 0)).sum()) / float(drawn.sum())
                 if coverage < 0.5:
                     continue
-                group_clip = mask
-            else:
-                cx0, cy0 = max(0, bx0), max(0, by0)
-                cx1, cy1 = min(img_w, bx1), min(img_h, by1)
-                if cx1 > cx0 and cy1 > cy0:
-                    group_clip[cy0:cy1, cx0:cx1] = 255
+                group_clip = mask_crop
             keep = np.minimum(group_alpha, group_clip).astype(np.uint8)
             group_overlay.putalpha(Image.fromarray(keep, "L"))
-            overlay = Image.alpha_composite(overlay, group_overlay)
+            overlay.alpha_composite(group_overlay, dest=(bx0, by0))
 
         base = img.convert("RGBA")
         merged = Image.alpha_composite(base, overlay).convert("RGB")
@@ -551,7 +633,7 @@ class PILRenderer(BaseRenderer):
 
         font = self._get_font(font_size)
         sw = max(1, int(font_size * STROKE_RATIO))
-        spacing = max(1, int(font_size * LINE_SPACING_RATIO))
+        spacing = max(1, int(font_size * self._line_spacing()))
         wrapped = self._wrap_paragraph(text, font, avail_w)
         joined = "\n".join(wrapped)
         bbox = draw.multiline_textbbox(
@@ -825,7 +907,7 @@ class PILRenderer(BaseRenderer):
     def _fits_in(self, draw, text, font_size, max_w, max_h) -> bool:
         font = self._get_font(font_size)
         sw = max(1, int(font_size * STROKE_RATIO))
-        spacing = max(1, int(font_size * LINE_SPACING_RATIO))
+        spacing = max(1, int(font_size * self._line_spacing()))
         wrapped = self._wrap_paragraph(text, font, max_w)
         joined = "\n".join(wrapped)
         bbox = draw.multiline_textbbox(
@@ -866,28 +948,57 @@ class PILRenderer(BaseRenderer):
             lines.append(current)
         if not lines:
             lines = [text]
-        return lines
+        return self._protect_cjk_line_boundaries(lines, font, max_width)
+
+    @staticmethod
+    def _protect_cjk_line_boundaries(lines, font, max_width):
+        """闭合标点不置于行首，开标点不留在行尾。"""
+        lines = list(lines)
+        closing = set("，。！？；：、）》】」』〕〉…％%")
+        opening = set("（《【「『〔〈")
+        for index in range(1, len(lines)):
+            while lines[index] and lines[index][0] in closing and lines[index - 1]:
+                mark = lines[index][0]
+                if _text_length(font, lines[index - 1] + mark) <= max_width:
+                    lines[index - 1] += mark
+                    lines[index] = lines[index][1:]
+                elif len(lines[index - 1]) > 1:
+                    lines[index] = lines[index - 1][-1] + lines[index]
+                    lines[index - 1] = lines[index - 1][:-1]
+                else:
+                    break
+            while lines[index - 1] and lines[index - 1][-1] in opening:
+                lines[index] = lines[index - 1][-1] + lines[index]
+                lines[index - 1] = lines[index - 1][:-1]
+        return [line for line in lines if line]
 
     @staticmethod
     def _wrap_latin_text(text: str, font: ImageFont.FreeTypeFont, max_width: int) -> list[str]:
         """英文优先在词间换行，单个超长词才安全拆分。"""
         lines: list[str] = []
         current = ""
-        for word in text.split():
-            candidate = f"{current} {word}".strip()
-            if current and _text_length(font, candidate) > max_width:
-                lines.append(current)
-                current = word
+        import re
+
+        for token in re.findall(r"\s+|\S+", text):
+            if token.isspace():
+                if current:
+                    current += token
+                continue
+            candidate = current + token
+            if current and _text_length(font, candidate.rstrip()) > max_width:
+                lines.append(current.rstrip())
+                current = token
             else:
                 current = candidate
-            while current and _text_length(font, current) > max_width:
-                cut = len(current) - 1
-                while cut > 1 and _text_length(font, current[:cut]) > max_width:
+            while current and _text_length(font, current.rstrip()) > max_width:
+                cut = len(current.rstrip()) - 1
+                compact = current.rstrip()
+                while cut > 1 and _text_length(font, compact[:cut]) > max_width:
                     cut -= 1
-                lines.append(current[:cut])
-                current = current[cut:]
+                lines.append(compact[:cut])
+                current = compact[cut:]
         if current:
-            lines.append(current)
+            lines.append(current.rstrip())
         return lines or [text]
 
     @staticmethod

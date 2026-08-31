@@ -63,6 +63,11 @@ class TestPipeline(unittest.TestCase):
             result = pipe.translate_image(self.image, "en", "zh")
         self.assertGreater(len(result.regions), 0)
         self.assertGreater(result.duration_ms, 0)
+        self.assertTrue({
+            "detection_ms", "ocr_ms", "inpaint_ms", "grouping_ms",
+            "translation_ms", "render_ms", "total_ms", "ocr_call_count",
+            "translation_request_count",
+        }.issubset(result.performance))
 
     def test_render_preserves_size(self):
         import io
@@ -681,6 +686,653 @@ class TestMocrConfidence(unittest.TestCase):
         self.assertGreaterEqual(q.prob, 0.85)
 
 
+class TestMultilingualOcrRouting(unittest.TestCase):
+    """三语 OCR 路由和候选比较的无模型回归。"""
+
+    def _region(self):
+        from app.services.pipeline import TextRegion
+
+        return TextRegion(box=[[20, 20], [180, 20], [180, 60], [20, 60]])
+
+    def test_language_hints_distinguish_chinese_japanese_and_english(self):
+        from app.services.language import detect_language, region_language_hint
+
+        self.assertEqual(detect_language("这是中文对白").language, "zh")
+        self.assertEqual(detect_language("これは日本語です").language, "ja")
+        self.assertEqual(detect_language("Don't re-enter!").language, "en")
+        self.assertEqual(region_language_hint("纯汉字短句").language, "zh")
+
+    def test_explicit_english_uses_paddle_route_only(self):
+        from app.services.engines.ocr import LanguageRoutingOCREngine
+
+        class FakePaddle:
+            def recognize_regions(self, _path, regions, source_lang):
+                regions[0].text = "Don't re-enter!"
+                regions[0].confidence = 0.91
+                regions[0].source_lang = source_lang
+                regions[0].ocr_engine = "paddle"
+
+        router = LanguageRoutingOCREngine.__new__(LanguageRoutingOCREngine)
+        router._get_paddle = lambda: FakePaddle()
+        router._get_ja = lambda: (_ for _ in ()).throw(AssertionError("英文不应访问日文 OCR"))
+        region = self._region()
+        router.recognize(Path("unused.png"), [region], "en")
+        self.assertEqual(region.source_lang, "en")
+        self.assertEqual(region.ocr_engine, "paddle")
+        self.assertEqual(region.text, "Don't re-enter!")
+
+    def test_candidate_score_prefers_text_matching_language(self):
+        from app.services.engines.ocr import LanguageRoutingOCREngine
+        from app.services.language import region_language_hint
+
+        candidates = [
+            {"engine": "paddle", "lang": "en", "text": "Hello world", "confidence": 0.72},
+            {"engine": "paddle", "lang": "zh", "text": "你好世界", "confidence": 0.70},
+        ]
+        chosen = LanguageRoutingOCREngine._choose_candidate(candidates, region_language_hint("Hello world"))
+        self.assertEqual(chosen["lang"], "en")
+
+    def test_english_preprocess_keeps_upscale_and_binary_candidates(self):
+        from app.services.engines.ocr import PaddleOCREngine
+
+        engine = PaddleOCREngine.__new__(PaddleOCREngine)
+        engine.settings = SimpleNamespace(ocr_en_upscale=2.0, ocr_zh_upscale=1.5)
+        variants = engine._preprocess_variants(np.ones((12, 50, 3), dtype=np.uint8) * 230, "en")
+        self.assertEqual([name for name, _ in variants], ["original", "gray-contrast", "adaptive-binary"])
+        self.assertGreater(variants[0][1].shape[0], 12)
+
+    def test_cross_balloon_english_line_finds_wide_internal_gutter(self):
+        from app.services.engines.ocr import _horizontal_ink_split_boxes
+        from app.services.pipeline import TextRegion
+
+        image = np.ones((60, 260, 3), dtype=np.uint8) * 255
+        image[15:32, 20:72] = 0
+        image[15:32, 82:122] = 0
+        image[15:32, 164:218] = 0
+        region = TextRegion(
+            box=[[10, 10], [230, 10], [230, 38], [10, 38]],
+            text="HAVE ANY NERD CRAP!",
+            direction="h",
+            source_lang="en",
+        )
+        boxes = _horizontal_ink_split_boxes(image, region)
+        self.assertEqual(len(boxes), 2)
+        self.assertLess(boxes[0][2], boxes[1][0])
+
+    def test_bridge_split_rejects_single_word_side(self):
+        from app.services.engines.ocr import LanguageRoutingOCREngine
+        from app.services.pipeline import TextRegion
+
+        image = Path(tempfile.gettempdir()) / "manga_bridge_single_word.png"
+        pixels = np.ones((60, 260, 3), dtype=np.uint8) * 255
+        pixels[15:32, 20:72] = 0
+        pixels[15:32, 82:122] = 0
+        pixels[15:32, 164:218] = 0
+        Image.fromarray(pixels).save(image)
+        original = TextRegion(
+            box=[[10, 10], [230, 10], [230, 38], [10, 38]],
+            text="I'M NOT IN",
+            confidence=1.0,
+            direction="h",
+            source_lang="en",
+        )
+
+        class FakePaddle:
+            def recognize_regions(self, _path, regions, _lang):
+                for region, text in zip(regions, ["I'M", "NOT IN"]):
+                    region.text = text
+                    region.confidence = 1.0
+                    region.ocr_engine = "paddle"
+
+        router = LanguageRoutingOCREngine.__new__(LanguageRoutingOCREngine)
+        regions = [original]
+        router._split_english_bridge_regions(image, regions, FakePaddle())
+
+        self.assertEqual(regions, [original])
+
+    def test_language_thresholds_are_separate(self):
+        from app.services.pipeline import ocr_thresholds
+
+        self.assertEqual(ocr_thresholds("mit48", "ja"), (0.2, 0.0))
+        self.assertEqual(ocr_thresholds("paddle", "zh"), (0.55, 0.25))
+        self.assertEqual(ocr_thresholds("paddle", "en"), (0.55, 0.25))
+
+    def test_auto_mixed_page_translates_each_bubble_with_its_language(self):
+        from app.services.pipeline import TextRegion, TranslationPipeline
+
+        class Detector:
+            name = "fake"
+
+            def detect(self, _path):
+                return [
+                    TextRegion(box=[[20, 20], [90, 20], [90, 60], [20, 60]]),
+                    TextRegion(box=[[110, 20], [190, 20], [190, 60], [110, 60]]),
+                ]
+
+        class OCR:
+            name = "language-router"
+            supports_detection = False
+            supports_language_routing = True
+
+            def recognize(self, _path, regions, source_lang):
+                self.requested = source_lang
+                regions[0].text, regions[0].confidence = "你好", 0.9
+                regions[0].source_lang, regions[0].ocr_engine = "zh", "paddle"
+                regions[1].text, regions[1].confidence = "Hello!", 0.9
+                regions[1].source_lang, regions[1].ocr_engine = "en", "paddle"
+
+        class Translator:
+            name = "fake-translator"
+
+            def __init__(self):
+                self.calls = []
+                self.last_failures = []
+
+            def translate_batch(self, texts, source_lang, _target_lang, glossary=None, progress_cb=None):
+                self.calls.append((source_lang, list(texts)))
+                self.last_backend_names = ["fake"] * len(texts)
+                if progress_cb:
+                    progress_cb(1.0)
+                return [f"译:{text}" for text in texts]
+
+        class Inpainter:
+            def inpaint(self, path, _regions):
+                return path
+
+        class Renderer:
+            def render(self, _path, regions, target_lang):
+                for region in regions:
+                    region.render_font = "fake.ttf"
+                return b"png"
+
+        image = Path(tempfile.gettempdir()) / "manga_auto_mixed.png"
+        Image.new("RGB", (220, 100), "white").save(image)
+        translator = Translator()
+        pipeline = TranslationPipeline(
+            detector=Detector(), ocr=OCR(), translator=translator,
+            inpainter=Inpainter(), renderer=Renderer(),
+        )
+        pipeline._bubble_on = False
+        pipeline._group_regions = lambda _path, regions, boundary_image_path=None: [
+            {"regions": [region], "bbox": region.bounds} for region in regions
+        ]
+        with patch("app.services.engines.bubble.classify_non_bubble", return_value=False):
+            result = pipeline.translate_image(image, "auto", "ja")
+        self.assertEqual(pipeline.ocr.requested, "auto")
+        self.assertEqual({source for source, _ in translator.calls}, {"zh", "en"})
+        self.assertEqual({item["source_lang"] for item in result.region_diagnostics}, {"zh", "en"})
+        self.assertTrue(all("bounds" in item and "group_bounds" in item for item in result.region_diagnostics))
+
+
+class TestPerformanceOptimizations(unittest.TestCase):
+    def _paddle_engine(self):
+        from app.services.engines.ocr import PaddleOCREngine
+
+        engine = PaddleOCREngine.__new__(PaddleOCREngine)
+        engine.settings = SimpleNamespace(
+            ocr_en_upscale=2.0,
+            ocr_zh_upscale=1.5,
+            ocr_candidate_fallback_threshold=0.45,
+            paddle_device="cpu",
+        )
+        engine._ocrs = {}
+        engine._device_by_lang = {}
+        engine._device_fallback_reasons = []
+        engine._requested_device = "cpu"
+        engine._preferred_device = "cpu"
+        engine._lang_map = {"ja": "japan", "en": "en", "zh": "ch"}
+        engine._PaddleOCR = object()
+        engine._cached_image_path = None
+        engine._cached_image = None
+        engine.reset_performance()
+        return engine
+
+    def test_paddle_models_are_lazy_and_each_language_loads_once(self):
+        import types
+
+        from app.services.engines.ocr import PaddleOCREngine
+
+        created = []
+
+        class FakePaddle:
+            def __init__(self, **kwargs):
+                created.append(kwargs)
+
+        with (
+            patch.object(PaddleOCREngine, "_paddle_cuda_status", return_value=(False, 0)),
+            patch.dict(sys.modules, {"paddleocr": types.SimpleNamespace(PaddleOCR=FakePaddle)}),
+        ):
+            engine = PaddleOCREngine()
+            self.assertEqual(created, [])
+            first = engine._get_ocr("en")
+            second = engine._get_ocr("en")
+
+        self.assertIs(first, second)
+        self.assertEqual([item["lang"] for item in created], ["en"])
+        self.assertNotIn("japan", engine._ocrs)
+        self.assertEqual(engine.last_performance["model_reuse_count"], 1)
+
+    def test_paddle_gpu_device_is_passed_with_required_3x_options(self):
+        import types
+
+        from app.services.engines.ocr import PaddleOCREngine
+
+        created = []
+
+        class FakePaddleOCR:
+            def __init__(self, **kwargs):
+                created.append(kwargs)
+
+        settings = SimpleNamespace(paddle_device="gpu:1")
+        with (
+            patch("app.services.engines.ocr.get_settings", return_value=settings),
+            patch.object(PaddleOCREngine, "_paddle_cuda_status", return_value=(True, 2)),
+            patch.dict(sys.modules, {"paddleocr": types.SimpleNamespace(PaddleOCR=FakePaddleOCR)}),
+        ):
+            engine = PaddleOCREngine()
+            engine._get_ocr("en")
+
+        self.assertEqual(created[0]["device"], "gpu:1")
+        self.assertFalse(created[0]["enable_mkldnn"])
+        self.assertFalse(created[0]["use_doc_orientation_classify"])
+        self.assertFalse(created[0]["use_doc_unwarping"])
+        self.assertTrue(created[0]["use_textline_orientation"])
+        self.assertNotIn("use_gpu", created[0])
+        self.assertEqual(engine.last_performance["device"], "gpu:1")
+
+    def test_paddle_cpu_device_is_supported(self):
+        import types
+
+        from app.services.engines.ocr import PaddleOCREngine
+
+        created = []
+
+        class FakePaddleOCR:
+            def __init__(self, **kwargs):
+                created.append(kwargs)
+
+        settings = SimpleNamespace(paddle_device="cpu")
+        with (
+            patch("app.services.engines.ocr.get_settings", return_value=settings),
+            patch.dict(sys.modules, {
+                "paddleocr": types.SimpleNamespace(PaddleOCR=FakePaddleOCR),
+            }),
+        ):
+            engine = PaddleOCREngine()
+            engine._get_ocr("zh")
+
+        self.assertEqual(created[0]["device"], "cpu")
+        self.assertFalse(engine.last_performance["device_fallback"])
+
+    def test_paddle_unavailable_gpu_falls_back_to_cpu(self):
+        import types
+
+        from app.services.engines.ocr import PaddleOCREngine
+
+        created = []
+
+        class FakePaddleOCR:
+            def __init__(self, **kwargs):
+                created.append(kwargs)
+
+        settings = SimpleNamespace(paddle_device="gpu:0")
+        with (
+            patch("app.services.engines.ocr.get_settings", return_value=settings),
+            patch.object(PaddleOCREngine, "_paddle_cuda_status", return_value=(False, 0)),
+            patch.dict(sys.modules, {"paddleocr": types.SimpleNamespace(PaddleOCR=FakePaddleOCR)}),
+        ):
+            engine = PaddleOCREngine()
+            first = engine._get_ocr("en")
+            second = engine._get_ocr("en")
+
+        self.assertIs(first, second)
+        self.assertEqual([item["device"] for item in created], ["cpu"])
+        self.assertTrue(engine.last_performance["device_fallback"])
+        self.assertIn("未编译 CUDA", engine.last_performance["device_fallback_reason"])
+        self.assertEqual(engine.last_performance["model_reuse_count"], 1)
+
+    def test_paddle_gpu_model_load_failure_retries_cpu_once(self):
+        import types
+
+        from app.services.engines.ocr import PaddleOCREngine
+
+        created = []
+
+        class FakePaddleOCR:
+            def __init__(self, **kwargs):
+                created.append(kwargs["device"])
+                if kwargs["device"].startswith("gpu"):
+                    raise RuntimeError("CUDA out of memory")
+
+        settings = SimpleNamespace(paddle_device="gpu:0")
+        with (
+            patch("app.services.engines.ocr.get_settings", return_value=settings),
+            patch.object(PaddleOCREngine, "_paddle_cuda_status", return_value=(True, 1)),
+            patch.dict(sys.modules, {"paddleocr": types.SimpleNamespace(PaddleOCR=FakePaddleOCR)}),
+        ):
+            engine = PaddleOCREngine()
+            first = engine._get_ocr("en")
+            second = engine._get_ocr("en")
+
+        self.assertIs(first, second)
+        self.assertEqual(created, ["gpu:0", "cpu"])
+        self.assertEqual(engine.last_performance["device"], "cpu")
+        self.assertTrue(engine.last_performance["device_fallback"])
+
+    def test_paddle_gpu_oom_during_predict_reloads_cpu_and_reuses_it(self):
+        engine = self._paddle_engine()
+
+        class FailingGpuOCR:
+            def predict(self, _value):
+                raise RuntimeError("CUDA out of memory")
+
+        class CpuOCR:
+            def __init__(self):
+                self.calls = 0
+
+            def predict(self, _value):
+                self.calls += 1
+                return [{"rec_texts": ["SAFE"], "rec_scores": [0.9]}]
+
+        cpu_ocr = CpuOCR()
+        created = []
+
+        def create_cpu(**kwargs):
+            created.append(kwargs["device"])
+            return cpu_ocr
+
+        gpu_ocr = FailingGpuOCR()
+        engine._PaddleOCR = create_cpu
+        engine._requested_device = "gpu:0"
+        engine._preferred_device = "gpu:0"
+        engine._ocrs["en"] = gpu_ocr
+        engine._device_by_lang["en"] = "gpu:0"
+
+        first = engine._predict(gpu_ocr, object(), "en", "original")
+        second = engine._predict(gpu_ocr, object(), "en", "original")
+
+        self.assertEqual(first, second)
+        self.assertEqual(created, ["cpu"])
+        self.assertEqual(cpu_ocr.calls, 2)
+        self.assertEqual(engine.last_performance["call_count"], 3)
+        self.assertEqual(engine.last_performance["device"], "cpu")
+        self.assertIn("out of memory", engine.last_performance["device_fallback_reason"])
+
+    def test_pipeline_performance_records_actual_ocr_device(self):
+        from app.services.pipeline import TranslationPipeline
+
+        pipeline = TranslationPipeline.__new__(TranslationPipeline)
+        pipeline.ocr = SimpleNamespace(last_performance={
+            "requested_device": "gpu:0",
+            "device": "cpu",
+            "device_fallback": True,
+            "device_fallback_reason": "当前 PaddlePaddle 未编译 CUDA 支持",
+        })
+        performance = pipeline._performance_snapshot({}, 10)
+
+        self.assertEqual(performance["ocr_requested_device"], "gpu:0")
+        self.assertEqual(performance["ocr_device"], "cpu")
+        self.assertTrue(performance["ocr_device_fallback"])
+        self.assertIn("CUDA", performance["ocr_device_fallback_reason"])
+
+    def test_high_confidence_original_stops_preprocess_cascade(self):
+        from app.services.pipeline import TextRegion
+
+        engine = self._paddle_engine()
+
+        class FakeOCR:
+            def __init__(self):
+                self.calls = 0
+
+            def predict(self, _value):
+                self.calls += 1
+                return [{"rec_texts": ["Don't stop!"], "rec_scores": [0.98]}]
+
+        ocr = FakeOCR()
+        image = Image.new("RGB", (220, 80), "white")
+        region = TextRegion(box=[[20, 20], [200, 20], [200, 60], [20, 60]])
+        result = engine._recognize_region_candidates(image, region, ocr, "en")
+
+        self.assertEqual(result["variant"], "original")
+        self.assertEqual(ocr.calls, 1)
+        self.assertEqual(engine.last_performance["call_count"], 1)
+
+    def test_low_confidence_only_then_runs_contrast_fallback(self):
+        from app.services.pipeline import TextRegion
+
+        engine = self._paddle_engine()
+
+        class FakeOCR:
+            def __init__(self):
+                self.scores = iter([0.20, 0.92])
+                self.calls = 0
+
+            def predict(self, _value):
+                self.calls += 1
+                return [{"rec_texts": ["HELLO WORLD"], "rec_scores": [next(self.scores)]}]
+
+        ocr = FakeOCR()
+        image = Image.new("RGB", (220, 80), "white")
+        region = TextRegion(box=[[20, 20], [200, 20], [200, 60], [20, 60]])
+        result = engine._recognize_region_candidates(image, region, ocr, "en")
+
+        self.assertEqual(result["variant"], "gray-contrast")
+        self.assertEqual(ocr.calls, 2)
+        self.assertEqual(engine.last_performance["fallback_count"], 1)
+
+    def test_region_recognition_preserves_order_and_coordinates(self):
+        from app.services.pipeline import TextRegion
+
+        engine = self._paddle_engine()
+        regions = [
+            TextRegion(box=[[10, 10], [110, 10], [110, 50], [10, 50]]),
+            TextRegion(box=[[130, 10], [230, 10], [230, 50], [130, 50]]),
+        ]
+        original_bounds = [region.bounds for region in regions]
+        original_ids = [id(region) for region in regions]
+        engine._get_ocr = lambda _lang: object()
+        engine._get_image = lambda _path: Image.new("RGB", (250, 70), "white")
+        values = iter(["FIRST LINE", "SECOND LINE"])
+        engine._recognize_region_candidates = lambda *_args: {
+            "text": (text := next(values)),
+            "score": 0.91,
+            "variant": "original",
+            "candidates": [{
+                "engine": "paddle",
+                "lang": "en",
+                "variant": "original",
+                "text": text,
+                "confidence": 0.91,
+            }],
+        }
+        engine.recognize_regions(Path("unused.png"), regions, "en")
+
+        self.assertEqual([id(region) for region in regions], original_ids)
+        self.assertEqual([region.bounds for region in regions], original_bounds)
+        self.assertEqual([region.text for region in regions], ["FIRST LINE", "SECOND LINE"])
+
+    def test_auto_obvious_english_does_not_try_all_paddle_languages(self):
+        from app.services.engines.ocr import LanguageRoutingOCREngine
+        from app.services.pipeline import TextRegion
+
+        class FakeMit:
+            available = True
+
+            def recognize(self, _path, regions, _lang):
+                regions[0].text = "HELLO WORLD"
+                regions[0].confidence = 0.8
+
+        class FakePaddle:
+            available = True
+            last_performance = {}
+
+            def __init__(self):
+                self.langs = []
+
+            def reset_performance(self):
+                return None
+
+            def _get_image(self, _path):
+                return Image.new("RGB", (200, 80), "white")
+
+            def _get_ocr(self, lang):
+                self.langs.append(lang)
+                return object()
+
+            def _recognize_region_candidates(self, _image, _region, _ocr, lang):
+                return {
+                    "text": "HELLO WORLD",
+                    "score": 0.95,
+                    "variant": "original",
+                    "candidates": [{"engine": "paddle", "lang": lang, "variant": "original", "text": "HELLO WORLD", "confidence": 0.95}],
+                }
+
+            def _candidate_sufficient(self, _text, score, _lang):
+                return score >= 0.45
+
+        router = LanguageRoutingOCREngine.__new__(LanguageRoutingOCREngine)
+        router.settings = SimpleNamespace(auto_source_fallback="ja", ocr_candidate_fallback_threshold=0.45)
+        router._mit48 = FakeMit()
+        router._ja = None
+        router._manga = None
+        router._load_errors = []
+        paddle = FakePaddle()
+        router._paddle = paddle
+        region = TextRegion(box=[[10, 10], [180, 10], [180, 50], [10, 50]])
+        router.recognize(Path("unused.png"), [region], "auto")
+
+        self.assertEqual(paddle.langs, ["en"])
+        self.assertEqual(region.source_lang, "en")
+
+    def test_translation_cache_keeps_language_directions_separate(self):
+        from app.services.engines.translator import SmartTranslator
+
+        class FakeBackend:
+            name = "fake"
+            batch = False
+            prompt_glossary = False
+
+            def __init__(self):
+                self.calls = 0
+                self._request_count = 0
+
+            def translate_one(self, text, source, target):
+                self.calls += 1
+                self._request_count += 1
+                return f"{source}>{target}:{text}"
+
+        backend = FakeBackend()
+        smart = SmartTranslator.__new__(SmartTranslator)
+        smart.settings = SimpleNamespace(translation_cache_size=32)
+        smart._backends = [backend]
+        smart._available_by_direction = {("en", "zh"): backend, ("ja", "zh"): backend}
+        smart._translation_cache = __import__("collections").OrderedDict()
+        smart._last_backend_name = ""
+
+        first = smart.translate_batch(["same"], "en", "zh")
+        second = smart.translate_batch(["same"], "en", "zh")
+        japanese = smart.translate_batch(["same"], "ja", "zh")
+
+        self.assertEqual(first, second)
+        self.assertNotEqual(first, japanese)
+        self.assertEqual(backend.calls, 2)
+        self.assertEqual(smart.last_performance["request_count"], 1)
+
+    def test_partial_batch_failure_retries_only_failed_item(self):
+        from app.services.engines.translator import SmartTranslator
+
+        class FakeBatchBackend:
+            name = "fake-batch"
+            batch = True
+            prompt_glossary = False
+
+            def __init__(self):
+                self.single_calls = []
+                self._request_count = 0
+
+            def translate_batch(self, texts, *_args, **_kwargs):
+                self._request_count += 1
+                self.last_failed_indices = [1]
+                self.last_batch_failures = ["第二项失败"]
+                return ["译一", texts[1], "译三"]
+
+            def translate_one(self, text, *_args):
+                self._request_count += 1
+                self.single_calls.append(text)
+                return "译二"
+
+        backend = FakeBatchBackend()
+        smart = SmartTranslator.__new__(SmartTranslator)
+        smart.settings = SimpleNamespace(translation_cache_size=32)
+        smart._backends = [backend]
+        smart._available_by_direction = {("en", "zh"): backend}
+        smart._translation_cache = __import__("collections").OrderedDict()
+        smart._last_backend_name = ""
+
+        out = smart.translate_batch(["one", "two", "three"], "en", "zh")
+
+        self.assertEqual(out, ["译一", "译二", "译三"])
+        self.assertEqual(backend.single_calls, ["two"])
+        self.assertEqual(smart.last_performance["request_count"], 2)
+
+
+class TestMultilingualRenderAndMask(unittest.TestCase):
+    def test_english_wrap_preserves_word_boundaries_and_punctuation(self):
+        from app.services.engines.renderer import PILRenderer
+
+        renderer = PILRenderer()
+        font = renderer._get_font(16, "en")
+        lines = renderer._wrap_latin_text("Don't re-enter -- wait!", font, 90)
+        self.assertTrue(all(line.strip() for line in lines))
+        self.assertTrue(any("Don't" in line for line in lines))
+        self.assertTrue(any("!" in line for line in lines))
+
+    def test_renderer_selects_target_language_font_and_records_it(self):
+        from app.services.engines.renderer import PILRenderer
+        from app.services.pipeline import TextRegion
+
+        renderer = PILRenderer()
+        self.assertTrue(renderer._font_paths["zh"])
+        self.assertTrue(renderer._font_paths["ja"])
+        self.assertTrue(renderer._font_paths["en"])
+        region = TextRegion(
+            box=[[30, 30], [170, 30], [170, 80], [30, 80]],
+            translated="Hello world",
+            group_translated="Hello world",
+            source_lang="ja",
+        )
+        source = Path(tempfile.gettempdir()) / "manga_renderer_font_source.png"
+        Image.new("RGB", (200, 120), "white").save(source)
+        renderer.render(source, [region], target_lang="en")
+        self.assertEqual(region.render_font, renderer._font_paths["en"])
+
+    def test_mask_uses_region_language_without_disabling_polygon_fill(self):
+        from app.services.engines.mask import build_region_mask
+        from app.services.pipeline import TextRegion
+
+        img = np.ones((100, 180, 3), dtype=np.uint8) * 255
+        region = TextRegion(
+            box=[[20, 30], [160, 30], [160, 65], [20, 65]],
+            poly=[[20, 30], [160, 30], [160, 65], [20, 65]],
+            source_lang="en",
+        )
+        result = build_region_mask(img, region)
+        self.assertIsNotNone(result)
+        self.assertTrue(result[4].any())
+
+    def test_chinese_closing_punctuation_never_starts_a_line(self):
+        from app.services.engines.renderer import PILRenderer
+
+        renderer = PILRenderer()
+        font = renderer._get_font(20, "zh")
+        lines = renderer._protect_cjk_line_boundaries(
+            ["UAP的存在", "，并重组为", "太空军！"], font, 200
+        )
+
+        self.assertTrue(all(not line.startswith("，") for line in lines))
+        self.assertIn("，", "".join(lines))
+
+
 class TestPunctuationMerge(unittest.TestCase):
     def test_question_mark_merges_into_neighbor(self):
         from app.services.engines.bubble import merge_punctuation_regions
@@ -904,6 +1556,102 @@ class TestBubbleGroupMergeBalloon(unittest.TestCase):
         ]
         out = _merge_overlap_groups(groups)
         self.assertEqual(len(out), 1)
+
+    def test_touching_balloons_with_side_by_side_english_stacks_split(self):
+        import numpy as np
+
+        from app.services.engines.bubble import _split_side_by_side_text_groups
+        from app.services.pipeline import TextRegion
+
+        def region(x0, y0, x1, y1, text):
+            return TextRegion(
+                box=[[x0, y0], [x1, y0], [x1, y1], [x0, y1]],
+                text=text,
+                direction="h",
+                source_lang="en",
+            )
+
+        left = [
+            region(206, 992, 268, 1008, "THIS IS"),
+            region(199, 1011, 277, 1027, "WHY YOU"),
+            region(206, 1028, 269, 1048, "DON'T"),
+            region(193, 1042, 278, 1067, "HAVE ANY"),
+            region(198, 1071, 278, 1083, "FRIENDS!"),
+        ]
+        right = [
+            region(306, 877, 410, 893, "I'M NOT IN"),
+            region(308, 898, 407, 914, "THE MOOD"),
+            region(303, 940, 413, 956, "NONSENSE!"),
+            region(309, 1004, 406, 1020, "PUSHIN' IT"),
+            region(303, 1042, 420, 1067, "NERD CRAP!"),
+        ]
+        shared_mask = np.full((1168, 802), 255, np.uint8)
+        group = {
+            "bbox": (180, 850, 440, 1110),
+            "regions": left + right,
+            "mask": shared_mask,
+            "mask_reliable": True,
+            "members": [],
+        }
+
+        out = _split_side_by_side_text_groups([group], 802, 1168)
+
+        self.assertEqual(len(out), 2)
+        self.assertEqual(
+            {frozenset(r.text for r in item["regions"]) for item in out},
+            {frozenset(r.text for r in left), frozenset(r.text for r in right)},
+        )
+        self.assertTrue(all(item["mask"] is None for item in out))
+        self.assertTrue(all(not item["mask_reliable"] for item in out))
+
+    def test_centered_english_lines_in_one_balloon_stay_together(self):
+        from app.services.engines.bubble import _split_side_by_side_text_groups
+        from app.services.pipeline import TextRegion
+
+        regions = [
+            TextRegion(box=[[300, 20], [420, 20], [420, 40], [300, 40]], text="ONE LINE", direction="h", source_lang="en"),
+            TextRegion(box=[[310, 45], [410, 45], [410, 65], [310, 65]], text="SECOND", direction="h", source_lang="en"),
+            TextRegion(box=[[320, 70], [400, 70], [400, 90], [320, 90]], text="THIRD", direction="h", source_lang="en"),
+            TextRegion(box=[[305, 95], [415, 95], [415, 115], [305, 115]], text="LAST LINE", direction="h", source_lang="en"),
+        ]
+        group = {"bbox": (280, 0, 440, 135), "regions": regions, "mask": None, "mask_reliable": False}
+
+        out = _split_side_by_side_text_groups([group], 800, 1200)
+
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["regions"], regions)
+
+    def test_conjunction_columns_in_one_balloon_stay_together(self):
+        from app.services.engines.bubble import _split_side_by_side_text_groups
+        from app.services.pipeline import TextRegion
+
+        def region(x0, y0, x1, y1, text):
+            return TextRegion(
+                box=[[x0, y0], [x1, y0], [x1, y1], [x0, y1]],
+                text=text,
+                direction="h",
+                source_lang="en",
+            )
+
+        regions = [
+            region(75, 710, 166, 728, "AND"),
+            region(55, 735, 168, 753, "SKINWALKER"),
+            region(82, 760, 158, 778, "RANCH!"),
+            region(195, 700, 238, 718, "AND"),
+            region(188, 725, 285, 743, "STUFF ABOUT"),
+            region(190, 750, 292, 768, "LIEUTENANT"),
+        ]
+        group = {
+            "bbox": (45, 680, 305, 800),
+            "regions": regions,
+            "mask": np.full((1168, 802), 255, np.uint8),
+            "mask_reliable": True,
+        }
+
+        out = _split_side_by_side_text_groups([group], 802, 1168)
+
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["regions"], regions)
 
     def test_overlapping_boxes_with_distinct_masks_do_not_merge(self):
         import numpy as np
@@ -1228,6 +1976,34 @@ class TestNonBubbleClassify(unittest.TestCase):
 
         self.assertFalse(_is_strip_bbox((300, 400, 600, 520), 1921, 1412, "h"))
 
+    def test_long_english_bubble_line_not_mistaken_for_banner(self):
+        from app.services.engines.bubble import classify_non_bubble
+        from app.services.pipeline import TextRegion
+
+        region = TextRegion(
+            box=[[245, 100], [370, 100], [370, 116], [245, 116]],
+            text="WRONG WITH",
+            direction="h",
+            source_lang="en",
+        )
+        # 真实失败样例：泛洪回退框宽高比 8.12、高度仅占页面 2.22%。
+        with patch("app.services.engines.bubble.detect_bubble", return_value=(202, 95, 413, 121)):
+            self.assertFalse(classify_non_bubble(np.zeros((1168, 802, 3), np.uint8), region, 802, 1168, "en"))
+            self.assertTrue(classify_non_bubble(np.zeros((1168, 802, 3), np.uint8), region, 802, 1168, "ja"))
+
+    def test_english_page_wide_band_still_classified(self):
+        from app.services.engines.bubble import classify_non_bubble
+        from app.services.pipeline import TextRegion
+
+        region = TextRegion(
+            box=[[40, 20], [700, 20], [700, 50], [40, 50]],
+            text="CHAPTER TITLE",
+            direction="h",
+            source_lang="en",
+        )
+        with patch("app.services.engines.bubble.detect_bubble", return_value=(30, 15, 760, 55)):
+            self.assertTrue(classify_non_bubble(np.zeros((1168, 802, 3), np.uint8), region, 802, 1168, "en"))
+
     def test_drop_non_bubble_regions(self):
         from app.services.pipeline import TextRegion, drop_non_bubble_regions
 
@@ -1325,6 +2101,29 @@ class TestMaskCoverage(unittest.TestCase):
         sub = mask_full[cby0:cby1, cbx0:cbx1] > 0
         cov = float((sub & dark).sum()) / float(dark.sum())
         self.assertGreaterEqual(cov, 0.95, f"掩膜只覆盖了 {cov:.2%} 暗像素，会残留原文")
+
+    def test_english_polygon_expands_instead_of_leaving_zero_border(self):
+        from app.services.engines.mask import build_region_mask
+        from app.services.pipeline import TextRegion
+
+        img = np.full((80, 180, 3), 255, dtype=np.uint8)
+        img[24:44, 30:150] = 0
+        region = TextRegion(
+            box=[[30, 24], [150, 24], [150, 44], [30, 44]],
+            poly=[[30, 24], [150, 24], [150, 44], [30, 44]],
+            text="WIDE ENGLISH!",
+            direction="h",
+            source_lang="en",
+        )
+
+        x0, y0, x1, y1, patch = build_region_mask(img, region, pad=2)
+        full = np.zeros(img.shape[:2], dtype=np.uint8)
+        full[y0:y1, x0:x1] = patch
+        dark = img.mean(axis=2) < 120
+
+        self.assertLess(x0, 30)
+        self.assertLess(y0, 24)
+        self.assertTrue((full[dark] > 0).all())
 
 
 class TestBackgroundComplexity(unittest.TestCase):

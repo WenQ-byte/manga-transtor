@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import re
+from collections import OrderedDict
 from typing import Optional
 
 import httpx
@@ -232,6 +233,10 @@ class BaseRemoteTranslator(BaseTranslator):
             self._client = httpx.Client(timeout=6, headers={"User-Agent": "Mozilla/5.0"})
         return self._client
 
+    def _request(self, method: str, url: str, **kwargs):
+        self._request_count = int(getattr(self, "_request_count", 0)) + 1
+        return self.get_client().request(method, url, **kwargs)
+
     def translate_batch(self, texts, source_lang, target_lang, glossary=None, progress_cb=None):
         out = []
         total = len(texts)
@@ -273,7 +278,8 @@ class GoogleTranslator(BaseRemoteTranslator):
         for client in self._CLIENTS:
             params = {**base_params, "client": client}
             try:
-                resp = self.get_client().get(
+                resp = self._request(
+                    "GET",
                     self.settings.google_translate_base, params=params
                 )
                 if resp.status_code == 429:
@@ -308,7 +314,7 @@ class MyMemoryTranslator(BaseRemoteTranslator):
             return text
         langpair = f"{provider_language('mymemory', source)}|{provider_language('mymemory', target)}"
         try:
-            resp = self.get_client().get(self.url, params={"q": text, "langpair": langpair})
+            resp = self._request("GET", self.url, params={"q": text, "langpair": langpair})
             resp.raise_for_status()
             data = resp.json()
             result = data.get("responseData", {}).get("translatedText", "")
@@ -338,7 +344,7 @@ class DeepLTranslator(BaseRemoteTranslator):
         if source != target:
             payload["source_lang"] = provider_language("deepl", source)
         try:
-            resp = httpx.post(
+            resp = self._request("POST",
                 self.endpoint,
                 json=payload,
                 headers={"Authorization": f"DeepL-Auth-Key {self.settings.deepl_auth_key}"},
@@ -363,13 +369,16 @@ class DeepLTranslator(BaseRemoteTranslator):
             indices.append(i)
             payload_texts.append(t)
         if not payload_texts:
+            self.last_failed_indices = []
+            self.last_batch_failures = []
             return result
+        self.last_batch_failures = []
         target_deepl = provider_language("deepl", target)
         payload = {"text": payload_texts, "target_lang": target_deepl}
         if source != target:
             payload["source_lang"] = provider_language("deepl", source)
         try:
-            resp = httpx.post(
+            resp = self._request("POST",
                 self.endpoint,
                 json=payload,
                 headers={"Authorization": f"DeepL-Auth-Key {self.settings.deepl_auth_key}"},
@@ -377,11 +386,15 @@ class DeepLTranslator(BaseRemoteTranslator):
             )
             resp.raise_for_status()
             data = resp.json()
+            succeeded = set()
             for j, item in enumerate(data.get("translations") or []):
                 if j < len(indices) and item.get("text"):
                     result[indices[j]] = item["text"]
-        except Exception:
-            pass
+                    succeeded.add(indices[j])
+            self.last_failed_indices = [index for index in indices if index not in succeeded]
+        except Exception as exc:
+            self.last_failed_indices = list(indices)
+            self.last_batch_failures.append(str(exc))
         return result
 
 
@@ -475,7 +488,7 @@ class DeepSeekTranslator(BaseRemoteTranslator):
                     ],
                     **self._sampling_options(model, source, target),
                 }
-                resp = httpx.post(
+                resp = self._request("POST",
                     f"{base}/chat/completions",
                     headers={"Authorization": f"Bearer {self.settings.deepseek_api_key}"},
                     json=payload,
@@ -492,9 +505,11 @@ class DeepSeekTranslator(BaseRemoteTranslator):
         raise last_error or RuntimeError("DeepSeek 请求失败")
 
     def translate_batch(self, texts, source_lang, target_lang, glossary=None, progress_cb=None):
-        """页级上下文批量：按安全大小分块；失败抛出由 SmartTranslator 逐条回退"""
+        """页级上下文批量：按安全大小分块；只把失败分块交给 SmartTranslator 回退。"""
         idx_map = [i for i, t in enumerate(texts) if t.strip() and not KEEP_PATTERN.match(t)]
         if not idx_map:
+            self.last_failed_indices = []
+            self.last_batch_failures = []
             return list(texts)
         srcs = [texts[i] for i in idx_map]
         chunks: list[list[str]] = []
@@ -514,15 +529,27 @@ class DeepSeekTranslator(BaseRemoteTranslator):
         if current:
             chunks.append(current)
 
-        translated: list[str] = []
+        out = list(texts)
+        self.last_failed_indices = []
+        self.last_batch_failures = []
+        source_offset = 0
         for index, chunk in enumerate(chunks):
-            translated.extend(self._translate_context(chunk, source_lang, target_lang, glossary))
+            chunk_indices = idx_map[source_offset:source_offset + len(chunk)]
+            source_offset += len(chunk)
+            try:
+                translated = self._translate_context(chunk, source_lang, target_lang, glossary)
+                if len(translated) != len(chunk):
+                    raise ValueError(f"段数不匹配: 期望 {len(chunk)} 段")
+                for original_index, value in zip(chunk_indices, translated):
+                    if value.strip():
+                        out[original_index] = value
+                    else:
+                        self.last_failed_indices.append(original_index)
+            except Exception as exc:
+                self.last_failed_indices.extend(chunk_indices)
+                self.last_batch_failures.append(str(exc))
             if progress_cb:
                 progress_cb((index + 1) / len(chunks))
-        out = list(texts)
-        for i, t in zip(idx_map, translated):
-            if t.strip():
-                out[i] = t
         return out
 
     def translate_one(self, text: str, source: LangCode, target: LangCode, glossary=None) -> str:
@@ -544,7 +571,7 @@ class DeepSeekTranslator(BaseRemoteTranslator):
                     ],
                     **self._sampling_options(model, source, target),
                 }
-                resp = httpx.post(
+                resp = self._request("POST",
                     f"{base}/chat/completions",
                     headers={"Authorization": f"Bearer {self.settings.deepseek_api_key}"},
                     json=payload,
@@ -582,7 +609,7 @@ class OpenAITranslator(BaseRemoteTranslator):
         if not text.strip() or KEEP_PATTERN.match(text):
             return text
         try:
-            resp = httpx.post(
+            resp = self._request("POST",
                 f"{self.settings.openai_base_url}/chat/completions",
                 headers={"Authorization": f"Bearer {self.settings.openai_api_key}"},
                 json={
@@ -620,9 +647,12 @@ class SmartTranslator(BaseTranslator):
         self.settings = get_settings()
         self._backends: list[BaseRemoteTranslator] = []
         self._available_by_direction: dict[tuple[str, str], BaseRemoteTranslator] = {}
+        self._translation_cache = OrderedDict()
         self.last_backend_names: list[str] = []
         self.last_failures: list[str] = []
+        self.last_performance: dict = {}
         self._last_backend_name = ""
+        self._attempted_current: list[str] = []
         self._build_chain()
 
     def _build_chain(self) -> None:
@@ -646,33 +676,102 @@ class SmartTranslator(BaseTranslator):
         """应用词典：CJK 最长匹配；拉丁词仍用整词边界"""
         return _apply_glossary_text(text, glossary, source_lang)
 
-    def translate_batch(self, texts, source_lang, target_lang, glossary=None, progress_cb=None):
-        self.last_backend_names = []
-        self.last_failures = []
-        # 找出第一个可用的后端（发送探针，结果缓存）
-        direction = (str(source_lang), str(target_lang))
+    def _ensure_runtime_state(self) -> None:
+        if not hasattr(self, "settings"):
+            self.settings = get_settings()
+        if not hasattr(self, "_translation_cache"):
+            self._translation_cache = OrderedDict()
         if not hasattr(self, "_available_by_direction"):
             self._available_by_direction = {}
             legacy_backend = getattr(self, "_available", None)
             if legacy_backend is not None:
-                self._available_by_direction[direction] = legacy_backend
+                self._available_by_direction[("en", "zh")] = legacy_backend
+
+    @staticmethod
+    def _glossary_fingerprint(glossary) -> tuple:
+        return tuple(sorted((str(key), str(value)) for key, value in (glossary or {}).items()))
+
+    def _cache_key(self, texts, source, target, glossary, backend) -> tuple:
+        return (
+            str(source), str(target), tuple(str(text) for text in texts),
+            self._glossary_fingerprint(glossary),
+        )
+
+    def _cache_get(self, key):
+        value = self._translation_cache.get(key)
+        if value is None:
+            return None
+        self._translation_cache.move_to_end(key)
+        return list(value[0]), list(value[1])
+
+    def _cache_put(self, key, out, names) -> None:
+        limit = max(0, int(getattr(self.settings, "translation_cache_size", 512)))
+        if limit <= 0 or any(name in {"original", "glossary"} for name in names):
+            return
+        self._translation_cache[key] = (tuple(out), tuple(names))
+        self._translation_cache.move_to_end(key)
+        while len(self._translation_cache) > limit:
+            self._translation_cache.popitem(last=False)
+
+    def _request_total(self) -> int:
+        return sum(int(getattr(backend, "_request_count", 0)) for backend in self._backends)
+
+    def _attempt(self, backend) -> None:
+        name = getattr(backend, "name", type(backend).__name__)
+        if name not in self._attempted_current:
+            self._attempted_current.append(name)
+
+    def _finish_performance(self, request_before, cache_hits=0) -> None:
+        primary_name = self._attempted_current[0] if self._attempted_current else ""
+        self.last_performance = {
+            "request_count": max(0, self._request_total() - request_before),
+            "cache_hits": int(cache_hits),
+            "fallback": bool(
+                self.last_failures
+                or len(self._attempted_current) > 1
+                or any(name not in {primary_name, "keep"} for name in self.last_backend_names)
+            ),
+            "backends_attempted": list(self._attempted_current),
+        }
+
+    def translate_batch(self, texts, source_lang, target_lang, glossary=None, progress_cb=None):
+        self._ensure_runtime_state()
+        self.last_backend_names = []
+        self.last_failures = []
+        self._attempted_current = []
+        request_before = self._request_total()
+        # 找出第一个可用的后端（发送探针，结果缓存）
+        direction = (str(source_lang), str(target_lang))
+        legacy_backend = getattr(self, "_available", None)
+        if legacy_backend is not None and direction not in self._available_by_direction:
+            self._available_by_direction[direction] = legacy_backend
         if direction not in self._available_by_direction:
             available = self._find_available(source_lang, target_lang)
-            if available is not None:
-                self._available_by_direction[direction] = available
+            self._available_by_direction[direction] = available
         backend = self._available_by_direction.get(direction)
         if backend is None:
             # 全部失败：仅应用词典
             self.last_backend_names = ["glossary"] * len(texts)
-            return self._apply_glossary_only(texts, glossary, source_lang)
+            out = self._apply_glossary_only(texts, glossary, source_lang)
+            self._finish_performance(request_before)
+            return out
 
         use_prompt = getattr(backend, "prompt_glossary", False)
         srcs = list(texts) if use_prompt else [
             self._apply_glossary(t, glossary, source_lang) for t in texts
         ]
+        cache_key = self._cache_key(texts, source_lang, target_lang, glossary, backend)
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            out, self.last_backend_names = cached
+            if progress_cb:
+                progress_cb(1.0)
+            self._finish_performance(request_before, cache_hits=len(out))
+            return out
 
         # 支持批量 API 的后端（DeepL 数组 / DeepSeek 页级上下文）一次请求完成
         if getattr(backend, "batch", False):
+            self._attempt(backend)
             try:
                 out = backend.translate_batch(
                     srcs,
@@ -681,14 +780,29 @@ class SmartTranslator(BaseTranslator):
                     glossary=glossary if use_prompt else None,
                     progress_cb=progress_cb,
                 )
+                for failure in getattr(backend, "last_batch_failures", []) or []:
+                    self.last_failures.append(f"{getattr(backend, 'name', 'unknown')}: {failure}")
                 if out and len(out) == len(srcs):
                     out = [
                         _normalize_english_translation(item, source_lang, target_lang)
                         for item in out
                     ]
-                    self.last_backend_names = [getattr(backend, "name", type(backend).__name__)] * len(srcs)
+                    backend_name = getattr(backend, "name", type(backend).__name__)
+                    self.last_backend_names = [backend_name] * len(srcs)
+                    failed_indices = sorted(set(getattr(backend, "last_failed_indices", []) or []))
+                    for failed_index in failed_indices:
+                        if not (0 <= failed_index < len(srcs)):
+                            continue
+                        result = self._translate_with_fallback(
+                            srcs[failed_index], source_lang, target_lang, backend,
+                            glossary=glossary if use_prompt else None,
+                        )
+                        out[failed_index] = result
+                        self.last_backend_names[failed_index] = self._last_backend_name or "original"
                     if progress_cb:
                         progress_cb(1.0)
+                    self._cache_put(cache_key, out, self.last_backend_names)
+                    self._finish_performance(request_before)
                     return out
             except Exception as e:  # noqa: BLE001
                 self.last_failures.append(f"{getattr(backend, 'name', 'unknown')}: {e}")
@@ -708,7 +822,14 @@ class SmartTranslator(BaseTranslator):
                 progress_cb((i + 1) / total)
         # 整批全部失败（输出等于原文）→ 清除缓存的后端，下次任务重新探测
         if srcs and all(o == s for o, s in zip(out, srcs)):
-            self._available_by_direction.pop(direction, None)
+            self._available_by_direction[direction] = None
+        else:
+            successful = next((name for name in self.last_backend_names if name not in {"original", "keep"}), "")
+            replacement = next((item for item in self._backends if getattr(item, "name", "") == successful), None)
+            if replacement is not None:
+                self._available_by_direction[direction] = replacement
+        self._cache_put(cache_key, out, self.last_backend_names)
+        self._finish_performance(request_before)
         return out
 
     def _translate_with_fallback(self, text: str, source, target, primary, glossary=None) -> str:
@@ -718,6 +839,7 @@ class SmartTranslator(BaseTranslator):
                 self._last_backend_name = "keep"
                 return text
             try:
+                self._attempt(backend)
                 if getattr(backend, "prompt_glossary", False):
                     result = backend.translate_one(text, source, target, glossary=glossary)
                 else:
@@ -736,6 +858,7 @@ class SmartTranslator(BaseTranslator):
     def _find_available(self, source, target):
         for backend in self._backends:
             try:
+                self._attempt(backend)
                 probe = {"ja": "こんにちは", "en": "hello", "zh": "你好"}.get(source, "hello")
                 result = backend.translate_one(probe, source, target)
                 if result:

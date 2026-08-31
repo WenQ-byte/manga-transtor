@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import numpy as np
@@ -98,9 +99,25 @@ def _is_strip_bbox(bb, img_w, img_h, direction) -> bool:
     return False
 
 
-def classify_non_bubble(bgr, region, img_w, img_h) -> bool:
-    """判定 region 是否为非气泡文字（刊头/拟声词等）：泛洪 bbox 命中细横条/跨页横带"""
+def _is_page_band_bbox(bb, img_w, img_h, direction) -> bool:
+    """保守判定真正的跨页横带；用于中英文，避免把气泡内的长文本行误删。"""
+    bw = bb[2] - bb[0]
+    bh = bb[3] - bb[1]
+    return (
+        bw > 0
+        and bh > 0
+        and direction == "h"
+        and bw >= BAND_W_RATIO * img_w
+        and bh <= BAND_H_RATIO * img_h
+    )
+
+
+def classify_non_bubble(bgr, region, img_w, img_h, source_lang=None) -> bool:
+    """判定非气泡文字；中英文仅过滤跨页横带，日文保持原细横条规则。"""
     bb = detect_bubble(bgr, region.bounds, img_w, img_h)
+    lang = getattr(source_lang, "value", source_lang) or getattr(region, "source_lang", "")
+    if lang in {"en", "zh"}:
+        return _is_page_band_bbox(bb, img_w, img_h, getattr(region, "direction", None))
     return _is_strip_bbox(bb, img_w, img_h, getattr(region, "direction", None))
 
 
@@ -252,6 +269,7 @@ def group_regions_by_bubble(
             )
 
     groups = _merge_overlap_groups(groups, overlap, boundary_gray=boundary_gray)
+    groups = _split_side_by_side_text_groups(groups, img_w, img_h)
 
     out = []
     for g in groups:
@@ -632,3 +650,91 @@ def _merge_overlap_groups(groups, overlap=0.15, boundary_gray=None):
                     j += 1
             i += 1
     return groups
+
+
+def _split_side_by_side_text_groups(groups, img_w, img_h):
+    """拆开共享连通掩膜中的并排中英文文本栈。
+
+    两个相接气泡可能没有完整分割线，泛洪会得到同一白色容器。只有当左右两侧
+    都至少形成两行、文字框互不重叠且纵向范围明显重合时才拆分，避免拆散普通
+    单气泡中的居中长短行。
+    """
+    output = []
+    pending = list(groups)
+    while pending:
+        group = pending.pop(0)
+        regions = [r for r in group.get("regions", []) if hasattr(r, "bounds")]
+        langs = {getattr(r, "source_lang", "") for r in regions}
+        horizontal = [r for r in regions if getattr(r, "direction", None) in {None, "h"}]
+        if len(regions) < 4 or len(horizontal) != len(regions) or not (langs & {"en", "zh"}):
+            output.append(group)
+            continue
+        ordered = sorted(regions, key=lambda r: (r.bounds[0] + r.bounds[2]) / 2)
+        heights = [max(1, r.bounds[3] - r.bounds[1]) for r in ordered]
+        median_h = float(np.median(heights))
+        best = None
+        for cut in range(2, len(ordered) - 1):
+            left, right = ordered[:cut], ordered[cut:]
+            left_x1 = max(r.bounds[2] for r in left)
+            right_x0 = min(r.bounds[0] for r in right)
+            gutter = right_x0 - left_x1
+            if gutter < max(6, 0.30 * median_h):
+                continue
+            left_y0, left_y1 = min(r.bounds[1] for r in left), max(r.bounds[3] for r in left)
+            right_y0, right_y1 = min(r.bounds[1] for r in right), max(r.bounds[3] for r in right)
+            y_overlap = _axis_overlap(left_y0, left_y1, right_y0, right_y1)
+            left_center = float(np.median([(r.bounds[0] + r.bounds[2]) / 2 for r in left]))
+            right_center = float(np.median([(r.bounds[0] + r.bounds[2]) / 2 for r in right]))
+            center_gap = right_center - left_center
+            if y_overlap < 0.30 or center_gap < max(3.0 * median_h, gutter * 1.5):
+                continue
+            if _looks_like_continuation_columns(left, right):
+                continue
+            score = gutter + center_gap * 0.25 + y_overlap * median_h
+            if best is None or score > best[0]:
+                best = (score, left, right)
+        if best is None:
+            output.append(group)
+            continue
+        _, left, right = best
+        pending = [
+            _text_stack_group(left, img_w, img_h),
+            _text_stack_group(right, img_w, img_h),
+            *pending,
+        ]
+    return output
+
+
+def _looks_like_continuation_columns(left, right) -> bool:
+    """两列都以连接词开头时更像同一气泡为避让画面而形成的续排。"""
+    conjunctions = {"AND", "BUT", "OR", "SO", "THEN", "ALSO"}
+
+    def leading(regions):
+        first = min(regions, key=lambda r: (r.bounds[1], r.bounds[0]))
+        match = re.search(r"[A-Za-z]+", first.text or "")
+        return match.group(0).upper() if match else ""
+
+    return leading(left) in conjunctions and leading(right) in conjunctions
+
+
+def _text_stack_group(regions, img_w, img_h):
+    x0 = min(r.bounds[0] for r in regions)
+    y0 = min(r.bounds[1] for r in regions)
+    x1 = max(r.bounds[2] for r in regions)
+    y1 = max(r.bounds[3] for r in regions)
+    pad_x = max(4, int(round((x1 - x0) * 0.22)))
+    pad_y = max(4, int(round((y1 - y0) * 0.18)))
+    bbox = (
+        max(0, x0 - pad_x),
+        max(0, y0 - pad_y),
+        min(img_w, x1 + pad_x),
+        min(img_h, y1 + pad_y),
+    )
+    return {
+        "bbox": bbox,
+        "regions": list(regions),
+        # 原可靠掩膜覆盖两个相接气泡，拆分后不能继续复用。
+        "mask": None,
+        "mask_reliable": False,
+        "members": [(bbox, None, False, region) for region in regions],
+    }
