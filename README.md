@@ -1,159 +1,235 @@
 # 漫译 · 漫画多语言智能翻译系统
 
-一键翻译漫画气泡文字，保持原排版不改变。支持 **日语/英语 → 中文**，专有名词自定义词典。
+面向日语/英语漫画的中文翻译 Web 应用。系统完成文本检测、OCR、原文擦除、气泡分组、上下文翻译和中文排版，并尽量保持原漫画的分镜、气泡轮廓与阅读顺序。
 
-## 功能
+当前版本为本地可运行 MVP：FastAPI 后端 + React/Vite 前端。默认检测与 OCR 路线移植自 `manga-image-translator`，相关代码遵循 GPL-3.0，详见 [THIRD_PARTY.md](THIRD_PARTY.md)。
 
-- 上传漫画图片（JPG / PNG / WebP / BMP，≤10MB）
-- 真实 OCR 文字识别，**默认 manga-image-translator 检测/OCR 引擎**（漫画专训模型，复杂漫画/艺术字/竖排/网点底识别更准；GPL-3.0，见 `THIRD_PARTY.md`），PaddleOCR 为可切回退（`MANGA_OCR_BACKEND=paddle`）
-- 默认 **ctd 检测器**（ComicTextDetector，复杂页召回强；可切 DBNet `MANGA_MIT_DETECTOR=default`）+ **mit48+manga-ocr 混合识别**（最准），置信度 ≥0.5 过滤噪声
-- 翻译流水线：文本检测 → OCR → **图像修复** → 翻译 → 渲染
-- **按气泡整块翻译**：同气泡对话多行合并成一次翻译请求，译文更地道；分组在擦除后的干净图上进行，同一气泡必成一组
-- **整块擦除**：按文本多边形整块填充掩膜（零残留），背景由 cv / LaMa 重建
-- 可选 **manga-ocr 识别**（`MANGA_OCR_BACKEND=mangaocr`/`mit48+mangaocr`）与**小字放大**（`MANGA_MIT_OCR_UPSCALE`），增强风格化字体/小字召回
-- 横排 / 竖排自适应排版：整块均衡分列/分行（列长、行长相近），气泡内居中，文字不越界不丢失（掩膜不可信时回退矩形裁剪）
-- 分步进度条实时反馈（检测/识别/修复/翻译/渲染）
-- 网页预览 + 下载翻译结果
-- 专有名词管理：内置词库 + 图形化录入 + JSON 批量导入（整词匹配）
-- 玻璃拟态前端质感（GlassSurface / SpecularButton / ParticleText 等组件）
+## 当前进度
+
+截至 2026-08-31：
+
+- 单图日语/英语 → 中文主流程已经打通。
+- 默认使用 CTD 检测器与 `mit48+mangaocr` 混合 OCR，PaddleOCR 作为回退方案。
+- 支持 CV 与 LaMa 两种修复引擎；LaMa 采用局部原尺寸推理，减少整页缩放造成的灰色残影。
+- 支持 DeepSeek、OpenAI、DeepL、Google 和 MyMemory，并提供自动回退与质量告警。
+- 横排/竖排中文自适应排版已经实现，竖排支持语义断列、标点保护与原文列序保持。
+- 气泡分组同时使用清理图内部区域和原图轮廓，避免修复后轮廓变弱导致相邻气泡误合并。
+- 当前自动化测试共 62 项，全部通过；JoJo 双页回归图识别为 13 个气泡，目标相邻区域稳定拆分为 3 个气泡。
+
+## 主要能力
+
+- 上传 JPG、JPEG、PNG、WebP、BMP，默认单文件上限 10 MB。
+- CTD/DBNet 漫画文本检测，支持复杂分镜、竖排文字和网点背景。
+- MIT 48px OCR 与 manga-ocr 混合识别；manga-ocr 只补救 MIT 完全未识别的空行，避免覆盖低置信度但正确的结果。
+- MIT OCR 的翻译阈值与擦除阈值分离：可读低置信度文本继续翻译，有检测掩膜的低置信度文字仍可擦除。
+- 非气泡刊头、拟声词和高比例拉丁标签可保留原样，不参与擦除、翻译和渲染。
+- OCR 多边形、逐像素检测掩膜、Otsu 笔画与注音扩展联合生成擦除掩膜。
+- 白色气泡使用受限局部背景重建，复杂纹理交给 CV TELEA 或 LaMa；修复后执行保守残影检测。
+- 气泡级上下文翻译、页级 DeepSeek 批量翻译、专有名词整词替换。
+- 记录翻译后端与回退原因，并检查原文直出、明显过短译文、残留日文和数字遗漏。
+- 中文横排均衡换行；竖排按原文阅读顺序分列，并避免拆开常见双字词和闭合标点。
+- 气泡掩膜、有限安全扩展框、紧致文本框、跳过渲染四级回退，降低文字越界和覆盖人物的风险。
+- 实时步骤进度、网页预览、结果下载和图形化专有名词管理。
+
+## 技术栈
+
+| 层级 | 技术 |
+|---|---|
+| 后端 | Python、FastAPI、Pydantic Settings、Pillow、OpenCV、httpx |
+| 前端 | React 18、Vite 6、Tailwind CSS v4、Framer Motion、GSAP、Lucide |
+| 检测/OCR | CTD、DBNet/ResNet34、MIT 48px OCR、manga-ocr、PaddleOCR 3.x |
+| 图像修复 | OpenCV TELEA、局部背景重建、LaMa FFC |
+| 翻译 | DeepSeek、OpenAI、DeepL、Google、MyMemory、专有名词词典 |
+| 存储 | SQLite、文件系统 |
 
 ## 快速开始
 
-### 方式一：一键启动（推荐）
+### 1. 创建环境并安装依赖
 
-安装依赖后，双击 `start.bat`（或运行 `.venv\Scripts\python.exe start.py`），按交互菜单选择启动后端 / 前端 / 前后端：
-
-```bash
-# 安装依赖
-pip install -r backend/requirements.txt          # 核心
-pip install -r backend/requirements-ai.txt       # 真实 OCR（PaddleOCR）
-pip install -r backend/requirements-inpaint.txt  # LaMa 神经修复（可选，效果更好）
-cd frontend && npm install
-```
-
-随后打开 `start.bat` 选择 `[1]` 启动后端，访问 http://localhost:8000；选择 `[3]` 同时启动前后端（Vite 开发模式 http://localhost:5173）。
-
-### 方式二：手动启动
-
-```bash
-# 1. 后端（基础依赖）
+```powershell
 python -m venv .venv
-.venv\Scripts\activate          # Windows
+.\.venv\Scripts\Activate.ps1
+
 pip install -r backend/requirements.txt
-
-# 2. 真实 OCR（可选但推荐）
 pip install -r backend/requirements-ai.txt
-
-# 3. LaMa 神经修复（可选，效果更好）
 pip install -r backend/requirements-inpaint.txt
+pip install -r backend/requirements-mit.txt
 
-# 4. 前端
 cd frontend
-npm install
-npm run build
+npm.cmd install
 cd ..
-
-# 5. 启动
-.venv\Scripts\python -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --app-dir backend
 ```
 
-> 注：`--app-dir backend` 必须保留（模块是 `app.main:app`）。
+依赖分为四档：
 
-### 方式三：Docker
+- `requirements.txt`：FastAPI、Pillow、OpenCV、httpx 等核心依赖；只有这一档时可运行 Demo 流程。
+- `requirements-ai.txt`：PaddleOCR 3.x。
+- `requirements-inpaint.txt`：PyTorch 与 LaMa 修复。
+- `requirements-mit.txt`：MIT 检测/OCR、manga-ocr 及几何依赖；使用默认 OCR 路线时需要安装。
 
-```bash
+MIT 与 LaMa 权重不提交到 Git。MIT 权重默认放在 `backend/data/models/mit/`，LaMa 权重默认放在 `backend/data/models/lama_large_512px.ckpt`，也可通过环境变量指定其他位置。
+
+### 2. 配置
+
+```powershell
+Copy-Item .env.example .env
+```
+
+建议至少配置一个高质量翻译后端：
+
+```dotenv
+MANGA_TRANSLATOR_BACKEND=deepseek
+MANGA_DEEPSEEK_API_KEY=sk-xxxx
+
+MANGA_OCR_BACKEND=mit48+mangaocr
+MANGA_MIT_DETECTOR=ctd
+MANGA_MIT_DEVICE=auto
+
+MANGA_INPAINTER_BACKEND=lama
+MANGA_INPAINT_DEVICE=cpu
+```
+
+如果没有 `.env`，代码级翻译默认值为 Google；`.env.example` 推荐 DeepSeek。未配置或不可用的高质量后端会自动回退到 Google、MyMemory，最后仅应用词典并保留原文。
+
+### 3. 启动
+
+推荐双击 `start.bat`，或运行：
+
+```powershell
+.\.venv\Scripts\python.exe start.py
+```
+
+手动启动后端：
+
+```powershell
+.\.venv\Scripts\python.exe -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --app-dir backend
+```
+
+手动启动前端：
+
+```powershell
+cd frontend
+npm.cmd run dev
+```
+
+- 前端开发地址：<http://localhost:5173>
+- 后端地址：<http://localhost:8000>
+- OpenAPI 文档：<http://localhost:8000/docs>
+
+Windows 上建议使用 `npm.cmd`，避免 PowerShell 执行策略阻止 `npm.ps1`。
+
+### Docker
+
+```powershell
 docker compose up -d --build
 ```
 
-访问 http://localhost:8000
+Docker 镜像是否包含全部 AI 模型取决于本地权重与构建配置；首次部署前请确认模型目录和显存/内存需求。
 
-## 配置
+## 核心配置
 
-复制 `.env.example` 为 `.env` 并按需修改：
+| 环境变量 | 说明 | 代码默认值 |
+|---|---|---|
+| `MANGA_PIPELINE_MODE` | `real` / `demo` | `real` |
+| `MANGA_OCR_BACKEND` | `mit48+mangaocr` / `mit48` / `mangaocr` / `paddle` | `mit48+mangaocr` |
+| `MANGA_DETECTOR_BACKEND` | 空值自动选择，或 `cv` / `manga` | 空值 |
+| `MANGA_MIT_DETECTOR` | `ctd` / `default` | `ctd` |
+| `MANGA_MIT_DEVICE` | `auto` / `cpu` / `cuda` / `mps` | `auto` |
+| `MANGA_MIT_MODEL_DIR` | MIT 模型目录 | `backend/data/models/mit` |
+| `MANGA_MIT_OCR_UPSCALE` | 小于该字号的文本先放大识别 | `16` |
+| `MANGA_BUBBLE_FILTER` | `auto` / `on` / `off` | `auto` |
+| `MANGA_TRANSLATOR_BACKEND` | `deepseek` / `openai` / `deepl` / `google` / `mymemory` | `google` |
+| `MANGA_INPAINTER_BACKEND` | `cv` / `lama` | `cv` |
+| `MANGA_LAMA_MODEL_PATH` | LaMa 权重路径 | 自动搜索 |
+| `MANGA_LAMA_INPAINT_SIZE` | 单个 LaMa 推理区域的最长边上限 | `1024` |
+| `MANGA_INPAINT_DEVICE` | `cpu` / `cuda` | `cpu` |
+| `MANGA_RENDER_PADDING` | 气泡内边距比例 | `0.12` |
+| `MANGA_MAX_UPLOAD_MB` | 上传大小上限 | `10` |
 
-| 环境变量 | 说明 | 默认 |
-|----------|------|------|
-| `MANGA_PIPELINE_MODE` | 流水线模式：`real`（真实OCR）/ `demo`（无需模型） | `real` |
-| `MANGA_TRANSLATOR_BACKEND` | 翻译后端：`deepseek` / `google` / `deepl` / `openai` / `mymemory` | `deepseek` |
-| `MANGA_DEEPSEEK_API_KEY` | DeepSeek API Key（推荐，漫画口语翻译最自然） | 空 |
-| `MANGA_DEEPSEEK_MODEL` | DeepSeek 模型 | `deepseek-chat` |
-| `MANGA_DEEPSEEK_BASE_URL` | DeepSeek API 地址 | `https://api.deepseek.com` |
-| `MANGA_DEEPL_AUTH_KEY` | DeepL API Key（可选，支持批量请求） | 空 |
-| `MANGA_OPENAI_API_KEY` | OpenAI 兼容接口 Key（可选） | 空 |
-| `MANGA_INPAINTER_BACKEND` | 修复引擎：`lama`（神经网络）/ `cv`（无模型） | `cv` |
-| `MANGA_LAMA_MODEL_PATH` | LaMa 权重路径（空则自动搜索） | 空 |
-| `MANGA_LAMA_INPAINT_SIZE` | LaMa 推理缩放上限（像素） | `1024` |
-| `MANGA_INPAINT_DEVICE` | 修复设备：`cpu` / `cuda` | `cpu` |
-| `MANGA_MAX_UPLOAD_MB` | 单张图片大小上限 | `10` |
+完整配置见 [.env.example](.env.example) 和 [backend/app/config.py](backend/app/config.py)。
 
-> **翻译后端推荐**：DeepSeek（`deepseek-chat`）对漫画口语/语气词理解力最佳，需设置 `MANGA_DEEPSEEK_API_KEY`。免费后端（Google / MyMemory）作为 fallback，质量一般。Google 需使用 `dict-chrome-ex` 接口避免限流；DeepL 支持批量请求，一次调用翻译全部文本。默认回退链：Google → MyMemory → 仅词典替换。
->
-> **图像修复**：`cv` 无依赖但效果有限（适合白底气泡）；`lama` 需安装 `torch`（CPU 版约 200MB），效果对齐 manga-image-translator。
+## 流水线
 
-## 架构
-
+```text
+上传图片
+  → 文本检测
+  → OCR 与置信度分流
+  → 非气泡文字/拉丁标签保护
+  → 原文擦除与背景修复
+  → 气泡分组
+      · 清理图：寻找无文字遮挡的气泡内部
+      · 原图：检测分隔轮廓，否决跨气泡合并
+  → 气泡级/页级上下文翻译
+  → 翻译质量检查
+  → 横排/竖排中文渲染
+  → 结果下载
 ```
-frontend/          # React + Vite + Tailwind 前端（中文 UI，玻璃拟态组件）
+
+修复发生在翻译之前，因此气泡分组可以在没有原文字笔画干扰的图上进行；同时保留原图作为边界证据，避免修复削弱轮廓后相邻气泡串联。
+
+## 项目结构
+
+```text
 backend/
   app/
-    api/           # REST API（翻译 / 词典 / 文件）
-    services/      # 翻译流水线（可插拔引擎）
+    api/                    REST API
+    services/
+      pipeline.py           流水线编排与质量信息
       engines/
-        base.py         # 引擎基类与工厂
-        detector.py     # 文本检测（OpenCV）
-        ocr.py          # OCR（PaddleOCR 真实识别 / Demo，竖排旋转检测）
-        translator.py   # 翻译（DeepSeek/Google/MyMemory/DeepL/OpenAI，批量+回退链）
-        mask.py         # 精确笔画掩膜（poly + Otsu 自适应阈值）
-        inpainter.py    # 图像修复（CV 无模型）
-        bubble.py       # 气泡过滤（气泡外涂鸦丢弃）
-        lama.py         # LaMa 神经修复引擎
-        lama_model.py   # LaMa 模型结构（FFC 生成网络）
-        renderer.py     # 渲染排版（气泡感知，横排/竖排自适应）
-    storage/       # SQLite + 文件存储
-docs/             # PRD / 竞品分析 / 功能矩阵
-```
-
-> 引擎通过 `services/engines/factory.py` 的 `get_engine(type)` 统一获取（lru_cache 缓存）。OCR 引擎自带检测（`supports_detection=True`）时跳过独立 detector，直接用 OCR 检测+识别。
-
-## 翻译流水线
-
-```
-上传图片
-  → 文本检测   定位气泡文字区域（置信度 ≥0.5 过滤 + 气泡过滤）
-  → OCR        识别文字内容，保留完整检测多边形
-  → 图像修复   整块掩膜擦除原文字（cv / LaMa 重建背景）
-  → 翻译       气泡整块翻译（DeepSeek 最自然 / 批量请求 / 词典整词匹配）
-  → 渲染       均衡排版回原气泡（横排分行、竖排分列，均居中且等长）
-  → 下载结果
+        factory.py          引擎工厂与缓存
+        detector.py         CV/MIT 检测器包装
+        ocr.py              Paddle/MIT/manga-ocr 包装
+        translator.py       翻译后端、批量请求与回退链
+        bubble.py           气泡过滤、分组与原图边界校验
+        mask.py             OCR 多边形、笔画与注音掩膜
+        inpainter.py        CV 修复与残影清理
+        lama.py             LaMa 局部推理
+        renderer.py         气泡几何与中文排版
+        mit/                manga-image-translator 推理代码
+    storage/                SQLite 与文件存储
+frontend/                   React/Vite 前端
+docs/                       项目宪章、研究报告和需求资料
+test_image/                 本地回归漫画，不纳入版本库
 ```
 
 ## API
 
 | 方法 | 路径 | 说明 |
-|------|------|------|
-| POST | `/api/translate` | 上传图片创建翻译任务 |
-| GET | `/api/translate/{id}/status` | 查询翻译进度 |
-| GET | `/api/translate/{id}/result` | 下载翻译结果 |
-| DELETE | `/api/translate/{id}` | 删除任务 |
-| GET/POST | `/api/glossary` | 专有名词列表 / 新增 |
-| PUT/DELETE | `/api/glossary/{id}` | 修改 / 删除词条 |
-| POST | `/api/glossary/import` | JSON 批量导入 |
-| GET | `/api/health` | 健康检查 |
-
-在线 API 文档：`/docs`
+|---|---|---|
+| `POST` | `/api/translate` | 上传图片并创建翻译任务 |
+| `GET` | `/api/translate/{task_id}/status` | 查询任务进度 |
+| `GET` | `/api/translate/{task_id}/result` | 下载翻译结果 |
+| `DELETE` | `/api/translate/{task_id}` | 删除任务 |
+| `GET` / `POST` | `/api/glossary` | 查询或新增词条 |
+| `PUT` / `DELETE` | `/api/glossary/{item_id}` | 修改或删除词条 |
+| `POST` | `/api/glossary/import` | JSON 批量导入词典 |
+| `GET` | `/api/files/{filename}` | 获取结果文件 |
 
 ## 测试
 
-```bash
-.venv\Scripts\python.exe backend\tests\test_app.py
+```powershell
+.\.venv\Scripts\python.exe backend\tests\test_app.py
 ```
 
-stdlib `unittest`（非 pytest）。测试会设 `MANGA_DATA_DIR` 到临时目录；`test_pipeline_runs` 走真实 OCR 路径，已装 AI 依赖时会加载 PaddleOCR 模型、较慢。
+测试使用标准库 `unittest`，不是 pytest。部分测试会加载真实 PaddleOCR 模型，因此首次执行可能较慢。
 
-## 说明
+当前覆盖重点包括 API 与流水线、OCR 适配、掩膜与残影清理、LaMa 局部推理、气泡分组与原图边界校验、气泡几何回退、中文布局、翻译回退和质量告警。
 
-- **真实 OCR**：安装 `requirements-ai.txt` 后自动启用 PaddleOCR 真实文字识别（首次运行会自动下载模型）。检测框置信度 <0.5 或空文本会被过滤。
-- **LaMa 修复**：安装 `requirements-inpaint.txt`（torch）后，设置 `MANGA_INPAINTER_BACKEND=lama` 启用神经修复，效果接近 manga-image-translator。
-- **Demo 模式**：未安装 AI 依赖时，OCR 使用模拟识别，适合快速体验流程。
-- **翻译**：默认使用 DeepSeek（`deepseek-chat`），免费后端（Google / MyMemory）作为自动 fallback。Google 需用 `dict-chrome-ex` 接口防限流；DeepL 支持批量请求。
-- **竖排渲染**：漫画竖排文字靠把原图旋转 90° 再检测、坐标映射回原图实现；渲染时逐列从右到左、整组居中，列间距与字距自适应防文字重叠。
+## 当前限制
+
+- 当前以单张图片为主，尚未交付批量上传、ZIP 导出和章节级任务。
+- 暂无用户账户、历史任务同步、人工校对编辑器和团队协作。
+- MIT、manga-ocr 与 LaMa 模型体积较大，首次准备环境需要额外下载时间和磁盘空间。
+- CPU 可运行，但 CTD、manga-ocr 和 LaMa 的整页处理速度明显慢于 GPU。
+- 免费翻译后端仅作为兜底；正式使用建议配置 DeepSeek、OpenAI 或其他高质量模型。
+- 极端艺术字、开放式气泡、深色气泡或文字压线仍需通过真实漫画持续回归。
+
+## 文档
+
+- [项目宪章与进度基线](docs/project-initiation-report.md)
+- [研究报告](docs/research-report.md)
+- [第三方代码与许可证](THIRD_PARTY.md)
+
+## License
+
+本项目采用 GPL-3.0。第三方模型、代码和服务可能有独立许可或使用条款，发布和商业使用前请逐项核对。
