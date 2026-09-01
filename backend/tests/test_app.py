@@ -2320,6 +2320,100 @@ class TestVerticalColumnOrder(unittest.TestCase):
         self.assertEqual(cols, lines, "竖排列应保持原文行序，不应按字数切碎")
 
 
+class TestRendererSafetyBounds(unittest.TestCase):
+    """渲染异常输入必须有限完成，且单气泡失败不能影响其他气泡。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.source = Path(self.tmp.name) / "renderer_safety.png"
+        Image.new("RGB", (240, 180), "white").save(self.source)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    @staticmethod
+    def _region(index, box, text, direction="h"):
+        from app.services.pipeline import TextRegion
+
+        x0, y0, x1, y1 = box
+        region = TextRegion(
+            box=[[x0, y0], [x1, y0], [x1, y1], [x0, y1]],
+            translated=text,
+            group_translated=text,
+            direction=direction,
+        )
+        region.group_index = index
+        region.group_bounds = box
+        return region
+
+    def _render_size(self, regions, target_lang="zh"):
+        from app.services.engines.renderer import PILRenderer
+
+        out = PILRenderer().render(self.source, regions, target_lang=target_lang)
+        return Image.open(io.BytesIO(out)).size
+
+    def test_empty_translation_finishes_and_keeps_image_size(self):
+        region = self._region(0, (30, 30, 210, 140), "")
+        self.assertEqual(self._render_size([region]), (240, 180))
+
+    def test_long_chinese_translation_finishes(self):
+        region = self._region(0, (30, 30, 210, 140), "这是一段超长中文译文" * 800)
+        self.assertEqual(self._render_size([region]), (240, 180))
+
+    def test_long_english_word_finishes(self):
+        region = self._region(0, (30, 30, 210, 140), "A" * 5000)
+        self.assertEqual(self._render_size([region], target_lang="en"), (240, 180))
+
+    def test_long_english_word_in_subcharacter_container_finishes(self):
+        region = self._region(0, (100, 10, 102, 170), "A" * 5000)
+        self.assertEqual(self._render_size([region], target_lang="en"), (240, 180))
+
+    def test_narrow_vertical_bubble_finishes(self):
+        region = self._region(0, (100, 10, 112, 170), "竖排译文" * 300, direction="v")
+        self.assertEqual(self._render_size([region]), (240, 180))
+
+    def test_extreme_aspect_bubble_finishes(self):
+        region = self._region(0, (5, 80, 235, 88), "横向极端气泡译文" * 100)
+        self.assertEqual(self._render_size([region]), (240, 180))
+
+    def test_vertical_layout_has_fixed_search_bound(self):
+        from app.services.engines.renderer import MAX_VERTICAL_FONT_TRIES, PILRenderer
+
+        renderer = PILRenderer()
+        calls = 0
+        original = renderer._balance_columns
+
+        def counted(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            return original(*args, **kwargs)
+
+        with patch.object(renderer, "_balance_columns", side_effect=counted):
+            renderer._vertical_layout(["竖排文本" * 300], avail_w=10000, avail_h=20, min_font_size=1)
+        self.assertLessEqual(calls, MAX_VERTICAL_FONT_TRIES + 1)
+
+    def test_one_bubble_failure_does_not_block_other_bubbles(self):
+        from app.services.engines.renderer import PILRenderer
+
+        first = self._region(0, (20, 20, 100, 100), "first")
+        second = self._region(1, (130, 20, 220, 100), "second")
+        renderer = PILRenderer()
+        original = renderer._render_horizontal_bubble
+        calls = 0
+
+        def flaky(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise ValueError("模拟单气泡布局失败")
+            return original(*args, **kwargs)
+
+        with patch.object(renderer, "_render_horizontal_bubble", side_effect=flaky):
+            out = renderer.render(self.source, [first, second], target_lang="en")
+        self.assertEqual(calls, 2)
+        self.assertEqual(Image.open(io.BytesIO(out)).size, (240, 180))
+
+
 class TestThreeLanguageTranslation(unittest.TestCase):
     def test_detects_chinese_japanese_and_english(self):
         from app.services.language import detect_language

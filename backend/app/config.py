@@ -106,6 +106,8 @@ class Settings(BaseSettings):
     render_en_line_spacing: float = 0.22
     render_zh_line_spacing: float = 0.32
     render_ja_line_spacing: float = 0.30
+    # 渲染诊断：开启后记录每个气泡的几何、布局和耗时，便于定位单个异常气泡。
+    render_diagnostics: bool = False
 
     class Config:
         env_prefix = "MANGA_"

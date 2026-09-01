@@ -9,6 +9,9 @@
 from __future__ import annotations
 
 import io
+import logging
+import math
+import time
 from pathlib import Path
 
 import numpy as np
@@ -84,6 +87,15 @@ SAFE_EDGE_THRESH = 25.0
 # 候选带内边缘像素占比上限（超过即视为触及轮廓/分镜线/人物纹理，停止该边）
 SAFE_EDGE_RATIO_MAX = 0.12
 
+# 单个气泡的排版必须是有界计算。漫画对话的正常译文远小于这些上限；超限时保留前缀并
+# 记录诊断，避免异常服务响应或错误 OCR 让整张图片停在渲染阶段。
+MAX_RENDER_TEXT_CHARS = 1200
+MAX_RENDER_GROUP_PIXELS = 24_000_000
+MAX_RENDER_FONT_SIZE = 256
+MAX_VERTICAL_FONT_TRIES = 64
+
+logger = logging.getLogger(__name__)
+
 try:
     import cv2
 except ImportError:  # noqa: BLE001
@@ -106,6 +118,21 @@ class PILRenderer(BaseRenderer):
         s = get_settings()
         self.pad_ratio = max(0.02, float(s.render_padding))
         self.vertical_min_ratio = max(1.0, float(s.render_vertical_min_ratio))
+        self.render_diagnostics = bool(getattr(s, "render_diagnostics", False))
+        self._render_gradient = None
+        self._render_gradient_source = None
+
+    def _diagnose(self, message: str, *args) -> None:
+        if self.render_diagnostics:
+            logger.info("[render] " + message, *args)
+
+    @staticmethod
+    def _bounded_text(text: str | None) -> tuple[str, bool]:
+        """清理不可绘制字符并限制单个气泡的排版规模。"""
+        value = (text or "").replace("\x00", "").replace("\r\n", "\n").replace("\r", "\n")
+        if len(value) <= MAX_RENDER_TEXT_CHARS:
+            return value, False
+        return value[: MAX_RENDER_TEXT_CHARS - 1] + "…", True
 
     def _find_font(self, target_lang: str = "zh") -> str | None:
         candidates = FONT_CANDIDATES_BY_LANG.get(target_lang, FONT_CANDIDATES)
@@ -171,6 +198,7 @@ class PILRenderer(BaseRenderer):
         }.get(self._active_target_lang, LINE_SPACING_RATIO)
 
     def render(self, cleaned_image_path: Path, regions: list[TextRegion], target_lang: LangCode) -> bytes:
+        render_started = time.monotonic()
         img = Image.open(cleaned_image_path).convert("RGB")
         img_w, img_h = img.size
         target_value = getattr(target_lang, "value", target_lang)
@@ -178,45 +206,56 @@ class PILRenderer(BaseRenderer):
         render_text = "\n".join(
             (region.group_translated or region.translated or "") for region in regions
         )
+        render_text, _ = self._bounded_text(render_text)
         self._active_font_path = self._select_font_for_text(self._active_target_lang, render_text)
         self.last_font_path = self._active_font_path or ""
         for region in regions:
             region.render_font = self.last_font_path
-        min_font_size = max(1, round((img_w + img_h) / 200))
+        min_font_size = min(MAX_RENDER_FONT_SIZE, max(1, round((img_w + img_h) / 200)))
 
         bgr = np.array(img)[:, :, ::-1].copy()
+        self._render_gradient = None
+        self._render_gradient_source = id(bgr)
 
         groups = self._group_by_bubble(bgr, regions, img_w, img_h)
 
         # 每组使用独立 overlay，先按自身容器裁剪再合成，避免失败组污染其他组的覆盖率统计。
         overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
 
-        for _bubble, group_regions in groups:
-            bb, mask = self._bubble_geometry(bgr, group_regions, img_w, img_h)
+        for fallback_index, (_bubble, group_regions) in enumerate(groups):
+            group_index = next((r.group_index for r in group_regions if r.group_index is not None), fallback_index)
+            group_bounds = next((r.group_bounds for r in group_regions if r.group_bounds), None)
+            self._active_group_context = (group_index, group_bounds, target_value)
+            group_text = self._group_block_text(group_regions)
+            raw_text_length = len(group_text or "\n".join((r.translated or "") for r in group_regions))
+            self._diagnose("气泡%s开始渲染：bbox=%s，区域数=%s，文本长度=%s，目标语言=%s", group_index, group_bounds, len(group_regions), raw_text_length, target_value)
+            if group_text:
+                group_text, was_truncated = self._bounded_text(group_text)
+                if was_truncated:
+                    self._diagnose("气泡%s译文过长，已截断：文本长度=%s，目标语言=%s", group_index, len(self._group_block_text(group_regions) or ""), target_value)
+            geometry_started = time.monotonic()
+            bb, mask = self._safe_bubble_geometry(bgr, group_regions, img_w, img_h)
+            geometry_ms = (time.monotonic() - geometry_started) * 1000
+            self._diagnose("气泡%s几何耗时：%.1fms", group_index, geometry_ms)
             if bb is None:
+                self._diagnose("气泡%s没有可用几何区域：bbox=%s", group_index, group_bounds)
                 continue
             bx0, by0, bx1, by1 = bb
             bw, bh = bx1 - bx0, by1 - by0
-            if bw <= 0 or bh <= 0:
+            self._diagnose("气泡%s几何完成：bbox=%s，掩膜=%s，尺寸=%sx%s", group_index, bb, mask is not None, bw, bh)
+            if bw <= 0 or bh <= 0 or bw * bh > MAX_RENDER_GROUP_PIXELS:
+                logger.warning("[render] 气泡%s尺寸异常，已隔离：bbox=%s，尺寸=%sx%s，目标语言=%s", group_index, bb, bw, bh, target_value)
                 continue
-            block = self._group_block_text(group_regions)
+            block = group_text
             block = self._layout_block_text(block, target_lang)
             fill, stroke = self._text_colors(group_regions)
             group_overlay = Image.new("RGBA", (bw, bh), (0, 0, 0, 0))
             odraw = ImageDraw.Draw(group_overlay)
-            if target_value != "en" and self._use_vertical(group_regions, bw, bh):
-                if block:
-                    self._render_vertical_bubble_block(
-                        odraw, block, 0, 0, bw, bh, min_font_size, fill=fill, stroke=stroke
-                    )
-                else:
-                    self._render_vertical_bubble(
-                        odraw, group_regions, 0, 0, bw, bh, min_font_size, fill=fill, stroke=stroke
-                    )
-            else:
-                self._render_horizontal_bubble(
-                    odraw, group_regions, 0, 0, bw, bh, min_font_size, block=block, fill=fill, stroke=stroke
-                )
+            layout_started = time.monotonic()
+            self._render_group_layout(
+                odraw, group_regions, block, bw, bh, min_font_size, target_value, fill, stroke
+            )
+            self._diagnose("气泡%s布局耗时：%.1fms", group_index, (time.monotonic() - layout_started) * 1000)
 
             group_alpha = np.array(group_overlay.getchannel("A"))
             drawn = group_alpha > 0
@@ -236,13 +275,53 @@ class PILRenderer(BaseRenderer):
             keep = np.minimum(group_alpha, group_clip).astype(np.uint8)
             group_overlay.putalpha(Image.fromarray(keep, "L"))
             overlay.alpha_composite(group_overlay, dest=(bx0, by0))
+            self._diagnose("气泡%s布局完成：绘制像素=%s", group_index, int(drawn.sum()))
 
+        self._render_gradient = None
+        self._render_gradient_source = None
         base = img.convert("RGBA")
         merged = Image.alpha_composite(base, overlay).convert("RGB")
 
         buf = io.BytesIO()
         merged.save(buf, format="PNG")
+        self._diagnose("整页渲染完成：图片尺寸=%sx%s，气泡数=%s，总耗时=%.1fms", img_w, img_h, len(groups), (time.monotonic() - render_started) * 1000)
         return buf.getvalue()
+
+    def _render_group_layout(self, draw, group_regions, block, bw, bh, min_font_size, target_value, fill, stroke):
+        """隔离单个气泡的布局失败，不能让一个坏译文阻塞整页。"""
+        group_index, group_bounds, language = getattr(self, "_active_group_context", (-1, None, target_value))
+        text = block or "\n".join((r.translated or "") for r in group_regions)
+        try:
+            if target_value != "en" and self._use_vertical(group_regions, bw, bh):
+                if block:
+                    self._render_vertical_bubble_block(
+                        draw, block, 0, 0, bw, bh, min_font_size, fill=fill, stroke=stroke
+                    )
+                else:
+                    self._render_vertical_bubble(
+                        draw, group_regions, 0, 0, bw, bh, min_font_size, fill=fill, stroke=stroke
+                    )
+            else:
+                self._render_horizontal_bubble(
+                    draw, group_regions, 0, 0, bw, bh, min_font_size, block=block, fill=fill, stroke=stroke
+                )
+        except (ValueError, OverflowError, OSError, MemoryError, TypeError) as exc:
+            logger.warning(
+                "[render] 气泡%s布局失败，已隔离：bbox=%s，文本长度=%s，目标语言=%s，原因=%s",
+                group_index, group_bounds, len(text), language, exc,
+            )
+
+    def _safe_bubble_geometry(self, bgr, group_regions, img_w, img_h):
+        group_index, group_bounds, language = getattr(self, "_active_group_context", (-1, None, ""))
+        text = self._group_block_text(group_regions) or "\n".join((r.translated or "") for r in group_regions)
+        try:
+            return self._bubble_geometry(bgr, group_regions, img_w, img_h)
+        except (ValueError, OverflowError, OSError, MemoryError, TypeError) as exc:
+            logger.warning(
+                "[render] 气泡%s几何计算失败，已隔离：bbox=%s，文本长度=%s，目标语言=%s，原因=%s",
+                group_index, group_bounds, len(text), language, exc,
+            )
+            return None, None
 
     def _bubble_geometry(self, bgr, group_regions: list[TextRegion], img_w, img_h):
         """在修复后图像上重推该组的气泡：返回 (bbox, mask|None)
@@ -256,10 +335,14 @@ class PILRenderer(BaseRenderer):
         """
         from app.services.engines.bubble import bubble_with_mask
 
-        x0 = min(r.bounds[0] for r in group_regions)
-        y0 = min(r.bounds[1] for r in group_regions)
-        x1 = max(r.bounds[2] for r in group_regions)
-        y1 = max(r.bounds[3] for r in group_regions)
+        if not group_regions or img_w <= 0 or img_h <= 0:
+            return None, None
+        x0 = max(0, min(img_w, min(r.bounds[0] for r in group_regions)))
+        y0 = max(0, min(img_h, min(r.bounds[1] for r in group_regions)))
+        x1 = max(0, min(img_w, max(r.bounds[2] for r in group_regions)))
+        y1 = max(0, min(img_h, max(r.bounds[3] for r in group_regions)))
+        if x1 <= x0 or y1 <= y0:
+            return None, None
 
         def tight():
             return (
@@ -367,10 +450,16 @@ class PILRenderer(BaseRenderer):
         if bw <= 0 or bh <= 0:
             return None
 
-        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-        gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
-        gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
-        grad = cv2.magnitude(gx, gy)
+        # 同一页的多个气泡共用同一份梯度图，避免每个气泡重复对整页执行 Sobel。
+        if self._render_gradient_source == id(bgr) and self._render_gradient is not None:
+            grad = self._render_gradient
+        else:
+            gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+            gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+            gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+            grad = cv2.magnitude(gx, gy)
+            self._render_gradient = grad
+            self._render_gradient_source = id(bgr)
 
         # 锚点内部基线：气泡内部平坦区域边缘密度的参考
         inner = grad[y0:y1, x0:x1]
@@ -396,7 +485,8 @@ class PILRenderer(BaseRenderer):
         step = max(2, SAFE_EXPAND_STEP)
         changed = True
         guard = 0
-        while changed and guard < 2000:
+        max_steps = min(2000, max(1, math.ceil((cap_w + cap_h) / step) + 4))
+        while changed and guard < max_steps:
             changed = False
             guard += 1
             if by0 - step >= cap_y0 and band_safe(grad[by0 - step:by0, bx0:bx1]):
@@ -623,13 +713,17 @@ class PILRenderer(BaseRenderer):
         """横排气泡：整块文本（或各 region 合并）排版，单行优先、避免孤字折行、填满气泡"""
         lines = sorted(regions, key=lambda r: (r.bounds[1], r.bounds[0]))
         text = block if block is not None else "\n".join((r.translated or "").strip() for r in lines)
+        text, _ = self._bounded_text(text)
         if not text.strip():
             return
         pad = self.pad_ratio
         avail_w = bw * (1 - 2 * pad)
         avail_h = bh * (1 - 2 * pad)
-        max_font = max(min_font_size, int(bh * MAX_FONT_RATIO))
-        font_size = self._select_horizontal_font(draw, text, avail_w, avail_h, max_font, min_font_size)
+        if avail_w <= 1 or avail_h <= 1:
+            return
+        max_font = min(MAX_RENDER_FONT_SIZE, max(1, int(bh * MAX_FONT_RATIO)))
+        local_min_font = min(max_font, max(1, min_font_size))
+        font_size = self._select_horizontal_font(draw, text, avail_w, avail_h, max_font, local_min_font)
 
         font = self._get_font(font_size)
         sw = max(1, int(font_size * STROKE_RATIO))
@@ -659,15 +753,26 @@ class PILRenderer(BaseRenderer):
         )
 
     def _select_horizontal_font(self, draw, text, avail_w, avail_h, max_size, min_size) -> int:
-        """横排字号：优先单行，否则取能放下的最大字号并规避孤字最后一行"""
-        # 单行优先：某字号整段一行放得下 → 直接单行（不折出怪行）
-        for font in range(max_size, min_size - 1, -1):
-            if self._fits_oneline(draw, text, font, avail_w, avail_h):
-                return font
-        # 多行：取最大适应字号，并尝试避免最后一行孤儿
-        for font in range(max_size, min_size - 1, -1):
-            if self._fits_in(draw, text, font, avail_w, avail_h):
-                return self._refine_last_line(draw, text, font, avail_w, avail_h, min_size)
+        """在有限搜索范围内选择横排字号。"""
+        return self._select_horizontal_font_bounded(draw, text, avail_w, avail_h, max_size, min_size)
+
+    def _select_horizontal_font_bounded(self, draw, text, avail_w, avail_h, max_size, min_size) -> int:
+        """二分搜索字号，避免图片异常大时逐字号扫描。"""
+        max_size = min(MAX_RENDER_FONT_SIZE, max(min_size, int(max_size)))
+        min_size = max(1, min(int(min_size), max_size))
+        lo, hi, one_line = min_size, max_size, None
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            if self._fits_oneline(draw, text, mid, avail_w, avail_h):
+                one_line = mid
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        if one_line is not None:
+            return one_line
+        font = self._find_max_font_in(draw, text, avail_w, avail_h, max_size, min_size)
+        if self._fits_in(draw, text, font, avail_w, avail_h):
+            return self._refine_last_line(draw, text, font, avail_w, avail_h, min_size)
         return min_size
 
     def _fits_oneline(self, draw, text, font_size, max_w, max_h) -> bool:
@@ -702,7 +807,8 @@ class PILRenderer(BaseRenderer):
     ):
         """竖排气泡（每 region 即一列）：整组对称居中，每列垂直居中"""
         columns = sorted(regions, key=lambda r: -r.bounds[0])
-        texts = [t for t in ((r.translated or "").strip() for r in columns) if t]
+        fallback_text, _ = self._bounded_text("\n".join((r.translated or "").strip() for r in columns))
+        texts = [t for t in fallback_text.split("\n") if t]
         if not texts:
             return
         n = len(texts)
@@ -790,32 +896,28 @@ class PILRenderer(BaseRenderer):
                 ty += char_h
 
     def _vertical_layout(self, lines, avail_w, avail_h, min_font_size) -> tuple[int, list[str], int]:
-        """竖排布局：返回 (font_size, balanced_columns, char_h)；无解时 (0, [], 0)
+        """在有限候选字号内计算竖排分列布局。"""
+        return self._vertical_layout_bounded(lines, avail_w, avail_h, min_font_size)
 
-        字号上界由「列宽」约束（均衡切列会把长行拆入多列，高度约束在平衡后按列校验）。
-        """
-        if not lines:
+    def _vertical_layout_bounded(self, lines, avail_w, avail_h, min_font_size) -> tuple[int, list[str], int]:
+        """有限候选字号的竖排布局，任何输入都在固定次数内结束。"""
+        if not lines or avail_w <= 0 or avail_h <= 0:
             return 0, [], 0
-        total = sum(len(ln) for ln in lines)
-        upper = int(avail_w * VERTICAL_COL_USE_RATIO)
-        upper = max(min_font_size, upper)
-        font = upper
-        while font >= min_font_size:
+        total = sum(len(line) for line in lines)
+        upper = min(MAX_RENDER_FONT_SIZE, max(1, int(avail_w * VERTICAL_COL_USE_RATIO)))
+        lower = min(upper, max(1, int(min_font_size)))
+        step = max(1, math.ceil((upper - lower + 1) / MAX_VERTICAL_FONT_TRIES))
+        candidates = list(range(upper, lower - 1, -step))
+        if candidates[-1] != lower:
+            candidates.append(lower)
+        for font in candidates:
             char_h = max(1, int(font * VERTICAL_CHAR_RATIO))
             cols = self._balance_columns(lines, total, avail_h, char_h)
-            if cols is None:
-                font -= 1
+            if not cols:
                 continue
-            # 每列高度校验 + 列数宽度校验
-            max_col_len = max(len(c) for c in cols)
+            max_col_len = max(len(col) for col in cols)
             if max_col_len * char_h <= avail_h and font <= (avail_w / len(cols)) * VERTICAL_COL_USE_RATIO:
                 return font, cols, char_h
-            font -= 1
-        # 兜底：最小字号下能放下的均衡列
-        char_h = max(1, int(min_font_size * VERTICAL_CHAR_RATIO))
-        cols = self._balance_columns(lines, total, avail_h, char_h)
-        if cols and max(len(c) for c in cols) * char_h <= avail_h:
-            return min_font_size, cols, char_h
         return 0, [], 0
 
     def _balance_columns(self, lines, total, avail_h, char_h) -> list[str] | None:
@@ -974,30 +1076,53 @@ class PILRenderer(BaseRenderer):
 
     @staticmethod
     def _wrap_latin_text(text: str, font: ImageFont.FreeTypeFont, max_width: int) -> list[str]:
-        """英文优先在词间换行，单个超长词才安全拆分。"""
+        """按有限步长拆分拉丁文本，确保窄容器也会持续收敛。"""
+        return PILRenderer._wrap_latin_text_bounded(text, font, max_width)
+
+    @staticmethod
+    def _wrap_latin_text_bounded(text: str, font: ImageFont.FreeTypeFont, max_width: int) -> list[str]:
+        """按单词换行；超长单词按小窗口测量拆分，保证每轮至少消费一个字符。"""
+        import re
+
+        width = max(1, int(max_width))
         lines: list[str] = []
         current = ""
-        import re
+        probe_width = max(1.0, _text_length(font, "M"))
+        estimate = max(1, int(width / probe_width))
+
+        def split_token(token: str) -> list[str]:
+            chunks: list[str] = []
+            remaining = token
+            while remaining:
+                limit = min(len(remaining), max(1, estimate * 2 + 4))
+                lo, hi, best = 1, limit, 1
+                while lo <= hi:
+                    mid = (lo + hi) // 2
+                    if _text_length(font, remaining[:mid]) <= width:
+                        best = mid
+                        lo = mid + 1
+                    else:
+                        hi = mid - 1
+                # 字符本身宽于容器时仍强制前进，不能原地循环。
+                chunks.append(remaining[:best])
+                remaining = remaining[best:]
+            return chunks
 
         for token in re.findall(r"\s+|\S+", text):
             if token.isspace():
                 if current:
                     current += token
                 continue
-            candidate = current + token
-            if current and _text_length(font, candidate.rstrip()) > max_width:
+            if current and _text_length(font, current + token) > width:
                 lines.append(current.rstrip())
-                current = token
-            else:
-                current = candidate
-            while current and _text_length(font, current.rstrip()) > max_width:
-                cut = len(current.rstrip()) - 1
-                compact = current.rstrip()
-                while cut > 1 and _text_length(font, compact[:cut]) > max_width:
-                    cut -= 1
-                lines.append(compact[:cut])
-                current = compact[cut:]
-        if current:
+                current = ""
+            if _text_length(font, token) <= width:
+                current += token
+                continue
+            pieces = split_token(token)
+            lines.extend(piece for piece in pieces[:-1] if piece)
+            current = pieces[-1] if pieces else ""
+        if current.rstrip():
             lines.append(current.rstrip())
         return lines or [text]
 

@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import os
+import socket
 import subprocess
 import sys
 from pathlib import Path
@@ -69,7 +70,20 @@ def _backend_url() -> str:
     return f"{host}:{PORT}"
 
 
+def _backend_port_in_use() -> bool:
+    """启动前检查端口，避免新 uvicorn 绑定失败后用户继续连到旧进程。"""
+    probe_host = "127.0.0.1" if HOST in ("0.0.0.0", "127.0.0.1") else HOST
+    try:
+        with socket.create_connection((probe_host, PORT), timeout=0.3):
+            return True
+    except OSError:
+        return False
+
+
 def start_backend() -> int:
+    if _backend_port_in_use():
+        print(f"[错误] 后端端口 {PORT} 已被占用。请先停止旧后端进程，再重新启动 start.py。\n")
+        return 1
     print(f"启动后端 ... API 文档: http://{_backend_url()}/docs  (Ctrl+C 停止)\n")
     return subprocess.call(BACKEND_ARGS, cwd=str(BASE))
 
@@ -80,6 +94,9 @@ def start_frontend() -> int:
 
 
 def start_both() -> int:
+    if _backend_port_in_use():
+        print(f"[错误] 后端端口 {PORT} 已被占用。请先停止旧后端进程，再重新启动 start.py。\n")
+        return 1
     print("同时启动后端 + 前端（两个独立终端窗口）...\n")
     print(f"后端: http://{_backend_url()}    前端: http://localhost:5173")
     print("关闭对应窗口即停止服务。\n")
