@@ -59,6 +59,24 @@ export function getTaskResultUrl(taskId) {
   return `${BASE}/translate/${taskId}/result`
 }
 
+export function retryTranslateTask(taskId) {
+  return request(`/translate/${taskId}/retry`, { method: 'POST' })
+}
+
+export async function downloadTaskResult(taskId) {
+  const response = await request(`/translate/${taskId}/result`)
+  const disposition = response.headers.get('content-disposition') || ''
+  const encoded = disposition.match(/filename\*=utf-8''([^;]+)/i)?.[1]
+  const plain = disposition.match(/filename="?([^";]+)"?/i)?.[1]
+  let filename = `translated_${taskId}.png`
+  try {
+    filename = encoded ? decodeURIComponent(encoded) : (plain || filename)
+  } catch {
+    filename = plain || filename
+  }
+  return { blob: await response.blob(), filename }
+}
+
 export function deleteTask(taskId) {
   return request(`/translate/${taskId}`, { method: 'DELETE' })
 }

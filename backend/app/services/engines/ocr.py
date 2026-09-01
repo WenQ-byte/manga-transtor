@@ -1237,6 +1237,7 @@ class LanguageRoutingOCREngine(BaseOCR):
         for region in regions:
             mit_text, mit_conf = mit_states[id(region)]
             candidates = []
+            context_region = None
             attempted_models = ["mit48"] if mit is not None else []
             if mit_text:
                 candidates.append({
@@ -1279,6 +1280,9 @@ class LanguageRoutingOCREngine(BaseOCR):
                 elif mit_hint and mit_hint.language == "zh" and page_hint == "zh":
                     langs = ("zh",)
                     route_reason = "纯汉字区域采用高置信中文页面共识"
+                elif mit_hint and mit_hint.language == "zh" and page_hint == "ja":
+                    langs = ("ja", "zh")
+                    route_reason = "纯汉字区域采用高置信日文页面共识比较候选"
                 elif mit_hint and mit_hint.language == "zh":
                     langs = ("zh", "ja")
                     route_reason = "纯汉字区域，比较中文与日文候选"
@@ -1308,10 +1312,28 @@ class LanguageRoutingOCREngine(BaseOCR):
                             result["text"], float(result.get("score", 0.0)), lang
                         ):
                             break
+                x0, y0, x1, y1 = region.bounds
+                if (
+                    page_hint == "ja"
+                    and getattr(region, "direction", None) == "v"
+                    and mit_conf < self.settings.ocr_candidate_fallback_threshold
+                    and y1 - y0 <= max(1, x1 - x0) * 3.2
+                ):
+                    context_region = self._vertical_context_region(region)
+                    ja_ocr = paddle._get_ocr("ja")
+                    if ja_ocr is not None:
+                        attempted_models.append("paddle:ja-context")
+                        context_result = paddle._recognize_region_candidates(
+                            image, context_region, ja_ocr, "ja"
+                        )
+                        for candidate in context_result.get("candidates", []):
+                            candidate = dict(candidate)
+                            candidate["variant"] = f"vertical-context:{candidate.get('variant', 'original')}"
+                            candidates.append(candidate)
             elif paddle is None:
                 route_reason = "PaddleOCR 不可用，保留日文模型候选"
 
-            chosen = self._choose_candidate(candidates, mit_hint)
+            chosen = self._choose_candidate(candidates, mit_hint, page_hint)
             if chosen is None:
                 self._clear([region], self.settings.auto_source_fallback)
                 region.ocr_candidates = candidates
@@ -1322,6 +1344,10 @@ class LanguageRoutingOCREngine(BaseOCR):
             region.confidence = float(chosen["confidence"])
             region.source_lang = chosen["lang"] or self.settings.auto_source_fallback
             region.ocr_engine = chosen["engine"]
+            if context_region is not None and str(chosen.get("variant", "")).startswith("vertical-context:"):
+                region.box = context_region.box
+                region.poly = context_region.poly
+                region.mask = None
             low_confidence = float(chosen["confidence"]) < self.settings.ocr_candidate_fallback_threshold
             region.ocr_fallback = chosen["engine"] != "mit48" or low_confidence
             if chosen["engine"] != "mit48":
@@ -1345,7 +1371,18 @@ class LanguageRoutingOCREngine(BaseOCR):
                     region.ocr_fallback_reason = "MIT48 空结果，manga-ocr 救空"
 
     @staticmethod
-    def _choose_candidate(candidates, hint):
+    def _vertical_context_region(region):
+        x0, y0, x1, y1 = region.bounds
+        width = max(1, x1 - x0)
+        left = max(0, x0 - int(round(width * 0.24)))
+        right = x1 + int(round(width * 0.08))
+        top = max(0, y0 - int(round(width * 1.16)))
+        bottom = y1 + max(2, int(round(width * 0.10)))
+        box = [[left, top], [right, top], [right, bottom], [left, bottom]]
+        return TextRegion(box=box, poly=[[float(x), float(y)] for x, y in box], direction="v")
+
+    @staticmethod
+    def _choose_candidate(candidates, hint, page_hint=""):
         usable = [c for c in candidates if (c.get("text") or "").strip() and c.get("lang")]
         if not usable:
             return None
@@ -1353,12 +1390,27 @@ class LanguageRoutingOCREngine(BaseOCR):
         for candidate in usable:
             detection = region_language_hint(candidate["text"], candidate["lang"])
             score = float(candidate.get("confidence", 0.0))
-            if detection.language == candidate["lang"]:
+            meaningful = [
+                ch for ch in candidate["text"]
+                if ch.isalpha() or "\u3040" <= ch <= "\u30ff" or "\u3400" <= ch <= "\u9fff"
+            ]
+            cjk_only = bool(meaningful) and all(
+                "\u3040" <= ch <= "\u30ff" or "\u3400" <= ch <= "\u9fff"
+                for ch in meaningful
+            )
+            page_resolves_han = cjk_only and page_hint in {"zh", "ja"}
+            if detection.language == candidate["lang"] and not (
+                page_resolves_han and candidate["lang"] != page_hint
+            ):
                 score += 0.22 * detection.confidence
-            elif detection.confidence >= 0.55:
+            elif detection.confidence >= 0.55 and not (
+                page_resolves_han and candidate["lang"] == page_hint
+            ):
                 score -= 0.16
-            if hint and hint.language == candidate["lang"]:
+            if hint and hint.language == candidate["lang"] and not page_resolves_han:
                 score += 0.08
+            if page_resolves_han and candidate["lang"] == page_hint:
+                score += 0.18
             ranked.append((score, candidate))
         ranked.sort(key=lambda item: (item[0], len(item[1].get("text", ""))), reverse=True)
         return ranked[0][1]

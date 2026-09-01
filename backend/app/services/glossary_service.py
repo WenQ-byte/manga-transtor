@@ -19,6 +19,7 @@ BUILTIN_GLOSSARY = [
     {"source": "センセイ", "target": "老师", "lang": "ja", "note": "称呼"},
     {"source": "くん", "target": "君", "lang": "ja", "note": "称呼后缀"},
     {"source": "ちゃん", "target": "酱", "lang": "ja", "note": "称呼后缀"},
+    {"source": "コテ川", "target": "古手川", "lang": "ja", "note": "To LOVEる 角色名"},
 ]
 
 BUILTIN_ENGLISH_GLOSSARY = {
@@ -33,10 +34,7 @@ class GlossaryService:
         self.db = Database.get_instance()
 
     def _ensure_builtin(self) -> None:
-        """首次启动时导入内置词库"""
-        existing = self.db.glossary_list()
-        if existing:
-            return
+        """补齐内置词库，已存在的词条会被唯一索引跳过。"""
         for item in BUILTIN_GLOSSARY:
             self.db.glossary_create(
                 item["source"], item["target"], item["lang"], item.get("note", ""), "zh"

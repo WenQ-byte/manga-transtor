@@ -222,8 +222,10 @@ async def download_batch_zip(
                 manifest.append({
                     "original_filename": "未知文件",
                     "result_filename": None,
+                    "result_path": None,
                     "task_id": task_id,
                     "status": "failed",
+                    "error": "任务不存在",
                     "text_count": 0,
                     "duration_ms": 0,
                     "source_lang": None,
@@ -257,8 +259,10 @@ async def download_batch_zip(
             manifest.append({
                 "original_filename": original_name,
                 "result_filename": result_name,
+                "result_path": f"translated_images/{result_name}" if result_name else None,
                 "task_id": task_id,
                 "status": task["status"],
+                "error": error if result_name is None else "",
                 "text_count": int(task.get("text_count") or 0),
                 "duration_ms": int(task.get("duration_ms") or 0),
                 "source_lang": task.get("source_lang"),
@@ -310,6 +314,35 @@ async def get_status(task_id: str, manager: TranslationTaskManager = Depends(get
     )
 
 
+@router.post("/translate/{task_id}/retry", response_model=TranslateResponse)
+async def retry_task(task_id: str, manager: TranslationTaskManager = Depends(get_manager)):
+    task = manager.get_status(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    if task["status"] != "failed":
+        raise HTTPException(status_code=409, detail="只有失败任务可以重新翻译")
+    original_path = task.get("original_path")
+    source = manager.files.resolve(original_path) if original_path else None
+    if not source:
+        raise HTTPException(status_code=404, detail="原始图片不存在，请重新上传")
+    meta = dict(task.get("meta") or {})
+    filename = _task_filename(task, source.name)
+    retry_meta = {
+        key: meta[key]
+        for key in ("batch_id", "filename", "index", "requested_source_lang", "target_lang")
+        if key in meta
+    }
+    retry_meta["retry_of"] = task_id
+    new_task_id = manager.create_task(
+        task.get("source_lang") or "auto",
+        task.get("target_lang") or "zh",
+        source.read_bytes(),
+        filename,
+        metadata=retry_meta,
+    )
+    return TranslateResponse(task_id=new_task_id, status="queued", message="翻译任务已重新创建")
+
+
 @router.get("/translate/{task_id}/result")
 async def get_result(task_id: str, manager: TranslationTaskManager = Depends(get_manager)):
     task = manager.get_status(task_id)
@@ -324,7 +357,9 @@ async def get_result(task_id: str, manager: TranslationTaskManager = Depends(get
     p = manager.files.resolve(result_path)
     if not p:
         raise HTTPException(status_code=404, detail="结果文件不存在")
-    return FileResponse(p, media_type="image/png", filename=f"translated_{task_id}.png")
+    original_name = _safe_archive_name(_task_filename(task, f"{task_id}.png"))
+    result_name = f"{Path(original_name).stem or task_id}_translated.png"
+    return FileResponse(p, media_type="image/png", filename=result_name)
 
 
 @router.delete("/translate/{task_id}")

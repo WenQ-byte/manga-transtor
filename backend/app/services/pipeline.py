@@ -147,6 +147,18 @@ def _looks_like_name_or_abbreviation(words: list[str]) -> bool:
     return all(word[:1].isupper() and word[1:].islower() for word in words)
 
 
+def preserve_decorative_symbols(source: str, translated: str) -> str:
+    result = translated or ""
+    for symbol in ("♡", "♥"):
+        missing = (source or "").count(symbol) - result.count(symbol)
+        while missing > 0 and "□" in result:
+            result = result.replace("□", symbol, 1)
+            missing -= 1
+        if missing > 0:
+            result += symbol * missing
+    return result
+
+
 def assess_translation_quality(
     source: str,
     translated: str,
@@ -403,6 +415,17 @@ class TranslationPipeline:
             "backends_attempted": [],
         }
         settings = get_settings()
+
+        def stage_start(name: str) -> float:
+            started = time.monotonic()
+            print(f"[pipeline] {name} 开始", flush=True)
+            return started
+
+        def stage_end(name: str, key: str, started: float) -> None:
+            elapsed = int((time.monotonic() - started) * 1000)
+            stage_ms[key] += elapsed
+            print(f"[pipeline] {name} 结束：{elapsed}ms", flush=True)
+
         requested_source = _language_value(source_lang)
         # 新路由器需要收到 auto 才能做区域级候选比较；旧版单语言 OCR 仍使用稳定回退。
         if requested_source == "auto" and getattr(self.ocr, "supports_language_routing", False):
@@ -432,18 +455,18 @@ class TranslationPipeline:
             self._report(progress_cb, 0, 100)
             regions: list[TextRegion] = []
             self._report(progress_cb, 1, 10)
-            phase_started = time.monotonic()
+            phase_started = stage_start("ocr")
             self.ocr.recognize(image_path, regions, ocr_source)
-            stage_ms["ocr_ms"] += int((time.monotonic() - phase_started) * 1000)
+            stage_end("ocr", "ocr_ms", phase_started)
             self._ensure_ocr_metadata(regions, ocr_source)
             self._report(progress_cb, 1, 100)
             if not regions:
                 return empty_result()
         else:
             self._report(progress_cb, 0, 10)
-            phase_started = time.monotonic()
+            phase_started = stage_start("detect")
             regions = self.detector.detect(image_path)
-            stage_ms["detection_ms"] += int((time.monotonic() - phase_started) * 1000)
+            stage_end("detect", "detection_ms", phase_started)
             self._report(progress_cb, 0, 100)
 
             if not regions:
@@ -451,9 +474,9 @@ class TranslationPipeline:
 
             # 2. OCR
             self._report(progress_cb, 1, 10)
-            phase_started = time.monotonic()
+            phase_started = stage_start("ocr")
             self.ocr.recognize(image_path, regions, ocr_source)
-            stage_ms["ocr_ms"] += int((time.monotonic() - phase_started) * 1000)
+            stage_end("ocr", "ocr_ms", phase_started)
             self._ensure_ocr_metadata(regions, ocr_source)
             self._report(progress_cb, 1, 100)
 
@@ -565,20 +588,20 @@ class TranslationPipeline:
 
         # 3. 图像修复（擦除原文）—— 提前到翻译前，使气泡分组可在干净图上进行
         self._report(progress_cb, 2, 10)
-        phase_started = time.monotonic()
+        phase_started = stage_start("inpaint")
         cleaned = self.inpainter.inpaint(image_path, erase_regions)
-        stage_ms["inpaint_ms"] += int((time.monotonic() - phase_started) * 1000)
+        stage_end("inpaint", "inpaint_ms", phase_started)
         self._report(progress_cb, 2, 100)
 
         # 4. 按气泡分组（干净图上泛洪，笔画已擦除 → 分组可靠）→ 整块翻译
         self._report(progress_cb, 3, 5)
-        phase_started = time.monotonic()
+        phase_started = stage_start("bubble grouping")
         groups = self._group_regions(
             cleaned,
             text_regions,
             boundary_image_path=image_path,
         )
-        stage_ms["grouping_ms"] += int((time.monotonic() - phase_started) * 1000)
+        stage_end("bubble grouping", "grouping_ms", phase_started)
         group_texts = ["\n".join(r.text for r in g["regions"] if r.text.strip()) for g in groups]
         group_languages: list[str] = []
         for group in groups:
@@ -602,7 +625,7 @@ class TranslationPipeline:
             language_buckets.setdefault(language, []).append(index)
 
         bucket_items = list(language_buckets.items())
-        phase_started = time.monotonic()
+        phase_started = stage_start("translate")
         for bucket_pos, (language, indices) in enumerate(bucket_items):
             texts = [group_texts[index] for index in indices]
             glossary = self.glossary.get_mapping(language, target_value)
@@ -645,6 +668,7 @@ class TranslationPipeline:
                 # 翻译失败/空结果：回退原文整块，避免文字消失
                 block = "\n".join(r.text for r in g["regions"])
             source_block = group_texts[group_idx]
+            block = preserve_decorative_symbols(source_block, block)
             backend_name = backend_names[group_idx]
             warnings = assess_translation_quality(
                 source_block,
@@ -662,14 +686,14 @@ class TranslationPipeline:
                 r.translated = lines[i] if i < len(lines) else last
                 r.translation_backend = backend_name
                 r.quality_warnings = list(warnings)
-        stage_ms["translation_ms"] += int((time.monotonic() - phase_started) * 1000)
+        stage_end("translate", "translation_ms", phase_started)
         self._report(progress_cb, 3, 100)
 
         # 5. 渲染译文
         self._report(progress_cb, 4, 10)
-        phase_started = time.monotonic()
+        phase_started = stage_start("render")
         result_bytes = self.renderer.render(cleaned, text_regions, target_lang=target_lang)
-        stage_ms["render_ms"] += int((time.monotonic() - phase_started) * 1000)
+        stage_end("render", "render_ms", phase_started)
         self._report(progress_cb, 4, 100)
 
         duration = int((time.monotonic() - start) * 1000)

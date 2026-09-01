@@ -5,6 +5,7 @@ manga-ocr 对日文漫画风格化字体/手写体召回更强，但无置信度
 """
 from __future__ import annotations
 
+from pathlib import Path
 from typing import List
 
 import numpy as np
@@ -23,10 +24,37 @@ class MangaOcrWrapper:
         try:
             from manga_ocr import MangaOcr  # noqa: F401
 
-            self._mocr = MangaOcr()
+            model_path = self._cached_model_path()
+            self._mocr = MangaOcr(model_path or "kha-white/manga-ocr-base")
         except Exception as e:  # noqa: BLE001
             self._error = f"manga-ocr 加载失败: {e}"
             self._mocr = None
+
+    @staticmethod
+    def _cached_model_path() -> str | None:
+        """优先使用完整本地缓存，避免缓存完整时仍访问 Hugging Face 重试。"""
+        try:
+            from huggingface_hub import try_to_load_from_cache
+
+            required = (
+                "config.json",
+                "preprocessor_config.json",
+                "tokenizer_config.json",
+                "special_tokens_map.json",
+                "vocab.txt",
+                "pytorch_model.bin",
+            )
+            cached = [
+                try_to_load_from_cache("kha-white/manga-ocr-base", name, revision="main")
+                for name in required
+            ]
+            if cached and all(isinstance(path, str) and Path(path).is_file() for path in cached):
+                parent = Path(cached[0]).parent
+                if all(Path(path).parent == parent for path in cached):
+                    return str(parent)
+        except Exception:  # noqa: BLE001
+            pass
+        return None
 
     @property
     def available(self) -> bool:

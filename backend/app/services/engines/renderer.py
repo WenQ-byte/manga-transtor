@@ -12,6 +12,7 @@ import io
 import logging
 import math
 import time
+import unicodedata
 from pathlib import Path
 
 import numpy as np
@@ -93,6 +94,7 @@ MAX_RENDER_TEXT_CHARS = 1200
 MAX_RENDER_GROUP_PIXELS = 24_000_000
 MAX_RENDER_FONT_SIZE = 256
 MAX_VERTICAL_FONT_TRIES = 64
+MAX_HORIZONTAL_FONT_TRIES = 16
 
 logger = logging.getLogger(__name__)
 
@@ -129,7 +131,11 @@ class PILRenderer(BaseRenderer):
     @staticmethod
     def _bounded_text(text: str | None) -> tuple[str, bool]:
         """清理不可绘制字符并限制单个气泡的排版规模。"""
-        value = (text or "").replace("\x00", "").replace("\r\n", "\n").replace("\r", "\n")
+        value = unicodedata.normalize("NFC", (text or "").replace("\x00", "").replace("\r\n", "\n").replace("\r", "\n"))
+        value = "".join(
+            ch for ch in value
+            if ch in {"\n", "\t"} or (not unicodedata.category(ch).startswith("C") and not 0xD800 <= ord(ch) <= 0xDFFF)
+        )
         if len(value) <= MAX_RENDER_TEXT_CHARS:
             return value, False
         return value[: MAX_RENDER_TEXT_CHARS - 1] + "…", True
@@ -199,6 +205,7 @@ class PILRenderer(BaseRenderer):
 
     def render(self, cleaned_image_path: Path, regions: list[TextRegion], target_lang: LangCode) -> bytes:
         render_started = time.monotonic()
+        logger.info("[render] 进入渲染：区域数=%s，目标语言=%s", len(regions), getattr(target_lang, "value", target_lang))
         img = Image.open(cleaned_image_path).convert("RGB")
         img_w, img_h = img.size
         target_value = getattr(target_lang, "value", target_lang)
@@ -208,6 +215,7 @@ class PILRenderer(BaseRenderer):
         )
         render_text, _ = self._bounded_text(render_text)
         self._active_font_path = self._select_font_for_text(self._active_target_lang, render_text)
+        logger.info("[render] 字体准备完成：文本长度=%s", len(render_text))
         self.last_font_path = self._active_font_path or ""
         for region in regions:
             region.render_font = self.last_font_path
@@ -217,7 +225,13 @@ class PILRenderer(BaseRenderer):
         self._render_gradient = None
         self._render_gradient_source = id(bgr)
 
+        grouping_started = time.monotonic()
+        logger.info("[render] 气泡分组开始：区域数=%s", len(regions))
         groups = self._group_by_bubble(bgr, regions, img_w, img_h)
+        logger.info(
+            "[render] 气泡分组结束：气泡数=%s，耗时=%.1fms",
+            len(groups), (time.monotonic() - grouping_started) * 1000,
+        )
 
         # 每组使用独立 overlay，先按自身容器裁剪再合成，避免失败组污染其他组的覆盖率统计。
         overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
@@ -228,20 +242,27 @@ class PILRenderer(BaseRenderer):
             self._active_group_context = (group_index, group_bounds, target_value)
             group_text = self._group_block_text(group_regions)
             raw_text_length = len(group_text or "\n".join((r.translated or "") for r in group_regions))
+            logger.info(
+                "[render] 气泡开始：group_index=%s，区域数=%s，bbox=%s，文本长度=%s，目标语言=%s",
+                group_index, len(group_regions), group_bounds, raw_text_length, target_value,
+            )
             self._diagnose("气泡%s开始渲染：bbox=%s，区域数=%s，文本长度=%s，目标语言=%s", group_index, group_bounds, len(group_regions), raw_text_length, target_value)
             if group_text:
                 group_text, was_truncated = self._bounded_text(group_text)
                 if was_truncated:
                     self._diagnose("气泡%s译文过长，已截断：文本长度=%s，目标语言=%s", group_index, len(self._group_block_text(group_regions) or ""), target_value)
             geometry_started = time.monotonic()
+            logger.info("[render] 气泡几何开始：group_index=%s，bbox=%s", group_index, group_bounds)
             bb, mask = self._safe_bubble_geometry(bgr, group_regions, img_w, img_h)
             geometry_ms = (time.monotonic() - geometry_started) * 1000
+            logger.info("[render] 气泡几何结束：group_index=%s，耗时=%.1fms", group_index, geometry_ms)
             self._diagnose("气泡%s几何耗时：%.1fms", group_index, geometry_ms)
             if bb is None:
-                self._diagnose("气泡%s没有可用几何区域：bbox=%s", group_index, group_bounds)
+                logger.warning("[render] 气泡跳过：group_index=%s，原因=没有可用几何区域，bbox=%s", group_index, group_bounds)
                 continue
             bx0, by0, bx1, by1 = bb
             bw, bh = bx1 - bx0, by1 - by0
+            logger.info("[render] 气泡几何结果：group_index=%s，bbox=%s，尺寸=%sx%s，掩膜=%s", group_index, bb, bw, bh, mask is not None)
             self._diagnose("气泡%s几何完成：bbox=%s，掩膜=%s，尺寸=%sx%s", group_index, bb, mask is not None, bw, bh)
             if bw <= 0 or bh <= 0 or bw * bh > MAX_RENDER_GROUP_PIXELS:
                 logger.warning("[render] 气泡%s尺寸异常，已隔离：bbox=%s，尺寸=%sx%s，目标语言=%s", group_index, bb, bw, bh, target_value)
@@ -252,14 +273,19 @@ class PILRenderer(BaseRenderer):
             group_overlay = Image.new("RGBA", (bw, bh), (0, 0, 0, 0))
             odraw = ImageDraw.Draw(group_overlay)
             layout_started = time.monotonic()
+            logger.info("[render] 气泡布局开始：group_index=%s，方向=%s，尺寸=%sx%s，文本长度=%s", group_index, "竖排" if self._use_vertical(group_regions, bw, bh) and target_value != "en" else "横排", bw, bh, len(block or ""))
             self._render_group_layout(
                 odraw, group_regions, block, bw, bh, min_font_size, target_value, fill, stroke
             )
+            logger.info("[render] 气泡布局结束：group_index=%s，耗时=%.1fms", group_index, (time.monotonic() - layout_started) * 1000)
             self._diagnose("气泡%s布局耗时：%.1fms", group_index, (time.monotonic() - layout_started) * 1000)
 
+            mask_started = time.monotonic()
             group_alpha = np.array(group_overlay.getchannel("A"))
             drawn = group_alpha > 0
+            mask_crop = None
             if not drawn.any():
+                logger.warning("[render] 气泡跳过：group_index=%s，原因=没有绘制像素", group_index)
                 continue
             group_clip = np.full((bh, bw), 255, np.uint8)
 
@@ -267,14 +293,20 @@ class PILRenderer(BaseRenderer):
                 # 可靠容器是硬边界；覆盖不足说明排版/几何不可信，宁可跳过也不放行到人物背景。
                 mask_crop = mask[by0:by1, bx0:bx1]
                 if mask_crop.shape != group_alpha.shape:
+                    logger.warning("[render] 气泡跳过：group_index=%s，原因=掩膜尺寸不匹配，掩膜=%s，绘制=%s", group_index, mask_crop.shape, group_alpha.shape)
                     continue
                 coverage = float((drawn & (mask_crop > 0)).sum()) / float(drawn.sum())
                 if coverage < 0.5:
+                    logger.warning("[render] 气泡跳过：group_index=%s，原因=掩膜覆盖率过低，覆盖率=%.3f", group_index, coverage)
                     continue
                 group_clip = mask_crop
+            logger.info("[render] 气泡掩膜处理完成：group_index=%s，耗时=%.1fms，掩膜=%s，覆盖率=%s", group_index, (time.monotonic() - mask_started) * 1000, mask is not None, "无" if mask is None else f"{coverage:.3f}")
+            composite_started = time.monotonic()
             keep = np.minimum(group_alpha, group_clip).astype(np.uint8)
             group_overlay.putalpha(Image.fromarray(keep, "L"))
             overlay.alpha_composite(group_overlay, dest=(bx0, by0))
+            logger.info("[render] 气泡 alpha 合成完成：group_index=%s，耗时=%.1fms", group_index, (time.monotonic() - composite_started) * 1000)
+            logger.info("[render] 气泡完成：group_index=%s", group_index)
             self._diagnose("气泡%s布局完成：绘制像素=%s", group_index, int(drawn.sum()))
 
         self._render_gradient = None
@@ -305,7 +337,7 @@ class PILRenderer(BaseRenderer):
                 self._render_horizontal_bubble(
                     draw, group_regions, 0, 0, bw, bh, min_font_size, block=block, fill=fill, stroke=stroke
                 )
-        except (ValueError, OverflowError, OSError, MemoryError, TypeError) as exc:
+        except (ValueError, OverflowError, OSError, MemoryError, TypeError, RuntimeError) as exc:
             logger.warning(
                 "[render] 气泡%s布局失败，已隔离：bbox=%s，文本长度=%s，目标语言=%s，原因=%s",
                 group_index, group_bounds, len(text), language, exc,
@@ -723,24 +755,28 @@ class PILRenderer(BaseRenderer):
             return
         max_font = min(MAX_RENDER_FONT_SIZE, max(1, int(bh * MAX_FONT_RATIO)))
         local_min_font = min(max_font, max(1, min_font_size))
+        group_index = getattr(self, "_active_group_context", (-1, None, ""))[0]
+        logger.info("[render] 横排字号选择开始：group_index=%s，字号范围=%s-%s", group_index, local_min_font, max_font)
         font_size = self._select_horizontal_font(draw, text, avail_w, avail_h, max_font, local_min_font)
+        logger.info("[render] 横排字号选择结束：group_index=%s，字号=%s", group_index, font_size)
 
         font = self._get_font(font_size)
         sw = max(1, int(font_size * STROKE_RATIO))
         spacing = max(1, int(font_size * self._line_spacing()))
+        logger.info("[render] 横排换行开始：group_index=%s，最大宽度=%.1f", group_index, avail_w)
         wrapped = self._wrap_paragraph(text, font, avail_w)
+        logger.info("[render] 横排换行结束：group_index=%s，行数=%s", group_index, len(wrapped))
         joined = "\n".join(wrapped)
-        bbox = draw.multiline_textbbox(
-            (0, 0), joined, font=font, stroke_width=sw, spacing=spacing, align="center"
-        )
-        tw = bbox[2] - bbox[0]
-        th = bbox[3] - bbox[1]
+        logger.info("[render] 横排尺寸计算开始：group_index=%s", group_index)
+        tw, th = self._multiline_size(font, wrapped, sw, spacing)
+        logger.info("[render] 横排尺寸计算结束：group_index=%s", group_index)
 
         cx = bx0 + bw / 2
         cy = by0 + bh / 2
-        tx = cx - tw / 2 - bbox[0]
-        ty = cy - th / 2 - bbox[1]
+        tx = cx - tw / 2 + sw
+        ty = cy - th / 2 + sw
 
+        logger.info("[render] 横排 PIL 绘制开始：group_index=%s", group_index)
         draw.multiline_text(
             (tx, ty),
             joined,
@@ -751,56 +787,71 @@ class PILRenderer(BaseRenderer):
             spacing=spacing,
             align="center",
         )
+        logger.info("[render] 横排 PIL 绘制结束：group_index=%s", group_index)
 
     def _select_horizontal_font(self, draw, text, avail_w, avail_h, max_size, min_size) -> int:
         """在有限搜索范围内选择横排字号。"""
         return self._select_horizontal_font_bounded(draw, text, avail_w, avail_h, max_size, min_size)
 
     def _select_horizontal_font_bounded(self, draw, text, avail_w, avail_h, max_size, min_size) -> int:
-        """二分搜索字号，避免图片异常大时逐字号扫描。"""
+        """只测量最小字号一次，其余字号用线性尺度估算，避免反复创建 FreeType 字体。"""
         max_size = min(MAX_RENDER_FONT_SIZE, max(min_size, int(max_size)))
         min_size = max(1, min(int(min_size), max_size))
-        lo, hi, one_line = min_size, max_size, None
-        while lo <= hi:
-            mid = (lo + hi) // 2
-            if self._fits_oneline(draw, text, mid, avail_w, avail_h):
-                one_line = mid
-                lo = mid + 1
+        group_index = getattr(self, "_active_group_context", (-1, None, ""))[0]
+        started = time.monotonic()
+        base_font = self._get_font(min_size)
+        base_stroke = max(1, int(min_size * STROKE_RATIO))
+        base_width = _text_length(base_font, text) + base_stroke * 2
+        base_height = min_size * 1.4 + base_stroke * 2
+        if base_width <= avail_w and base_height <= avail_h:
+            width_scale = avail_w / max(1.0, base_width)
+            height_scale = avail_h / max(1.0, base_height)
+            selected = min(max_size, max(min_size, int(min_size * min(width_scale, height_scale))))
+            logger.info(
+                "[render] 横排单行字号估算结束：group_index=%s，字号=%s，耗时=%.1fms",
+                group_index, selected, (time.monotonic() - started) * 1000,
+            )
+            return selected
+        selected = self._estimate_multiline_font(text, avail_w, avail_h, max_size, min_size)
+        logger.info(
+            "[render] 横排多行字号估算结束：group_index=%s，字号=%s，耗时=%.1fms",
+            group_index, selected, (time.monotonic() - started) * 1000,
+        )
+        return selected
+
+    def _estimate_multiline_font(self, text, avail_w, avail_h, max_size, min_size) -> int:
+        """用字符宽度单位估算多行字号；搜索过程不加载候选字体。"""
+        paragraphs = text.split("\n") or [""]
+
+        def units(ch: str) -> float:
+            if ch.isspace():
+                return 0.35
+            if ch.isascii():
+                return 0.58 if ch.isalnum() else 0.5
+            return 1.0
+
+        paragraph_units = [sum(units(ch) for ch in paragraph) for paragraph in paragraphs]
+        max_unit = max((units(ch) for ch in text if ch != "\n"), default=1.0)
+        lo, hi, best = min_size, max_size, min_size
+        attempts = 0
+        while lo <= hi and attempts < MAX_HORIZONTAL_FONT_TRIES:
+            attempts += 1
+            size = (lo + hi) // 2
+            capacity = avail_w / max(1.0, size)
+            if max_unit > capacity:
+                fits = False
             else:
-                hi = mid - 1
-        if one_line is not None:
-            return one_line
-        font = self._find_max_font_in(draw, text, avail_w, avail_h, max_size, min_size)
-        if self._fits_in(draw, text, font, avail_w, avail_h):
-            return self._refine_last_line(draw, text, font, avail_w, avail_h, min_size)
-        return min_size
-
-    def _fits_oneline(self, draw, text, font_size, max_w, max_h) -> bool:
-        font = self._get_font(font_size)
-        sw = max(1, int(font_size * STROKE_RATIO))
-        w = _text_length(font, text) + sw * 2
-        h = font_size * 1.4 + sw * 2
-        return w <= max_w and h <= max_h
-
-    def _refine_last_line(self, draw, text, font_size, avail_w, avail_h, min_size) -> int:
-        """若多行最后一行过短（孤字），尝试更小字号减少行数"""
-        font = self._get_font(font_size)
-        wrapped = self._wrap_paragraph(text, font, avail_w)
-        if len(wrapped) < 2:
-            return font_size
-        last = wrapped[-1].strip()
-        if not last:
-            return font_size
-        max_len = max(len(l.strip()) for l in wrapped)
-        if max_len <= 0 or len(last) / max_len >= 0.25:
-            return font_size
-        for trial in range(font_size - 1, max(min_size, int(font_size * 0.8)) - 1, -1):
-            tw = self._wrap_paragraph(text, self._get_font(trial), avail_w)
-            if len(tw) < len(wrapped) and self._fits_in(draw, text, trial, avail_w, avail_h):
-                return trial
-            if len(tw) < len(wrapped):
-                break
-        return font_size
+                line_count = sum(max(1, math.ceil(value / max(0.1, capacity))) for value in paragraph_units)
+                stroke = max(1, int(size * STROKE_RATIO))
+                spacing = max(1, int(size * self._line_spacing()))
+                height = line_count * size * 1.4 + max(0, line_count - 1) * spacing + stroke * 2
+                fits = height <= avail_h
+            if fits:
+                best = size
+                lo = size + 1
+            else:
+                hi = size - 1
+        return best
 
     def _render_vertical_bubble(
         self, draw, regions, bx0, by0, bw, bh, min_font_size, fill=(0, 0, 0), stroke=(255, 255, 255)
@@ -993,29 +1044,18 @@ class PILRenderer(BaseRenderer):
             result.append(remaining)
         return result
 
-    def _find_max_font_in(self, draw, text, max_w, max_h, max_size, min_size):
-        """二分查找 [min_size, max_size] 内能放进 (max_w, max_h) 的最大字号"""
-        lo, hi = min_size, max_size
-        best = min_size
-        while lo <= hi:
-            mid = (lo + hi) // 2
-            if self._fits_in(draw, text, mid, max_w, max_h):
-                best = mid
-                lo = mid + 1
-            else:
-                hi = mid - 1
-        return best
-
-    def _fits_in(self, draw, text, font_size, max_w, max_h) -> bool:
-        font = self._get_font(font_size)
-        sw = max(1, int(font_size * STROKE_RATIO))
-        spacing = max(1, int(font_size * self._line_spacing()))
-        wrapped = self._wrap_paragraph(text, font, max_w)
-        joined = "\n".join(wrapped)
-        bbox = draw.multiline_textbbox(
-            (0, 0), joined, font=font, stroke_width=sw, spacing=spacing, align="center"
-        )
-        return (bbox[2] - bbox[0]) <= max_w and (bbox[3] - bbox[1]) <= max_h
+    @staticmethod
+    def _multiline_size(font: ImageFont.FreeTypeFont, lines: list[str], stroke_width: int, spacing: int) -> tuple[float, float]:
+        """用字体度量计算多行尺寸，避免 Pillow 对整段文本做原生 bbox 测量。"""
+        safe_lines = lines or [""]
+        width = max((_text_length(font, line) for line in safe_lines), default=0.0) + stroke_width * 2
+        try:
+            ascent, descent = font.getmetrics()
+            line_height = max(1, ascent + descent)
+        except (AttributeError, OSError, ValueError):
+            line_height = max(1, int(getattr(font, "size", 1) * 1.4))
+        height = line_height * len(safe_lines) + spacing * max(0, len(safe_lines) - 1) + stroke_width * 2
+        return width, height
 
     def _wrap_paragraph(self, text, font, max_width) -> list[str]:
         result = []
@@ -1038,14 +1078,19 @@ class PILRenderer(BaseRenderer):
         # 按目标宽度断行：达到目标宽度即换行，超限则硬断
         lines = []
         current = ""
+        current_width = 0.0
         for ch in text:
-            if current and _text_length(font, current) >= target:
+            char_width = _text_length(font, ch)
+            if current and current_width >= target:
                 lines.append(current)
                 current = ""
+                current_width = 0.0
             current += ch
-            if _text_length(font, current) > max_width and len(current) > 1:
+            current_width += char_width
+            if current_width > max_width and len(current) > 1:
                 lines.append(current[:-1])
                 current = current[-1]
+                current_width = char_width
         if current:
             lines.append(current)
         if not lines:
@@ -1131,13 +1176,16 @@ class PILRenderer(BaseRenderer):
         """宽贪心换行：每行尽量填满"""
         lines = []
         current = ""
+        current_width = 0.0
         for ch in text:
-            test = current + ch
-            if _text_length(font, test) > max_width and current:
+            char_width = _text_length(font, ch)
+            if current and current_width + char_width > max_width:
                 lines.append(current)
                 current = ch
+                current_width = char_width
             else:
-                current = test
+                current += ch
+                current_width += char_width
         if current:
             lines.append(current)
         if not lines:

@@ -9,6 +9,7 @@
 
   --color-ink-100: #f5f5f5;
   --color-ink-200: #d4d4d4;
+  --color-ink-300: #bdbdbd;
   --color-ink-400: #9ca3af;
   --color-ink-500: #6b7280;
   --color-ink-600: #4b5563;
@@ -41,6 +42,11 @@
     -webkit-font-smoothing: antialiased;
     text-rendering: optimizeLegibility;
     overflow-x: hidden;
+  }
+
+  :focus-visible {
+    outline: 2px solid rgba(255, 255, 255, 0.45);
+    outline-offset: 2px;
   }
 
   ::selection {
@@ -135,5 +141,25 @@
     outline: none;
     border-color: rgba(255, 255, 255, 0.35);
     box-shadow: 0 0 0 3px rgba(255, 255, 255, 0.08);
+  }
+}
+
+.comicx-glow {
+  animation: comicx-pulse 3.4s ease-in-out infinite;
+}
+
+@keyframes comicx-pulse {
+  0%, 100% {
+    filter: drop-shadow(0 0 14px rgba(167, 139, 250, 0.35)) drop-shadow(0 0 34px rgba(232, 121, 249, 0.2));
+  }
+  50% {
+    filter: drop-shadow(0 0 26px rgba(167, 139, 250, 0.6)) drop-shadow(0 0 56px rgba(232, 121, 249, 0.35));
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .comicx-glow {
+    animation: none;
+    filter: drop-shadow(0 0 18px rgba(167, 139, 250, 0.45));
   }
 }

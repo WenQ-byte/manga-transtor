@@ -28,6 +28,7 @@ _ENGLISH_ENTITY_AFTER_RE = re.compile(
 _ENGLISH_ENTITY_TITLE_RE = re.compile(
     r"\b([A-Z][a-z]+(?:[-'][A-Za-z]+)?(?:\s+[A-Z][a-z]+(?:[-'][A-Za-z]+)?)+)\b"
 )
+_JAPANESE_MIXED_NAME_RE = re.compile(r"[ァ-ヶー]{1,8}[\u3400-\u9fff]{1,3}")
 _ENGLISH_ENTITY_STOP_WORDS = {
     "A",
     "AN",
@@ -123,6 +124,13 @@ def _is_english_to_chinese(source, target) -> bool:
     )
 
 
+def _is_japanese_to_chinese(source, target) -> bool:
+    return (
+        getattr(source, "value", source) == "ja"
+        and getattr(target, "value", target) == "zh"
+    )
+
+
 def _english_entity_hints(texts) -> list[str]:
     content = " ".join(str(text or "") for text in texts)
     found: list[str] = []
@@ -152,6 +160,18 @@ def _append_english_entity_hints(prompt: str, texts) -> str:
     return (
         f"{prompt}本页疑似专名原文：{names}。同一专名在所有段落中必须使用同一个中文译名，"
         "即使原文只写了简称，也不得漏译、擅自改名或前后不一致。"
+    )
+
+
+def _append_japanese_entity_hints(prompt: str, texts) -> str:
+    content = " ".join(str(text or "") for text in texts)
+    names = list(dict.fromkeys(_JAPANESE_MIXED_NAME_RE.findall(content)))[:12]
+    if not names:
+        return prompt
+    return (
+        f"{prompt}本页疑似日文人名或简称：{'、'.join(names)}。"
+        "片假名与汉字混写的名称不要按字面词义拆译；能从作品或上下文确定惯用中文名时使用惯用译名，"
+        "无法确定时保留原文并在本页保持一致，不要臆造带贬义的中文名字。"
     )
 
 
@@ -440,6 +460,8 @@ class DeepSeekTranslator(BaseRemoteTranslator):
                 prompt += f"人名对照：{mapping}"
         if _is_english_to_chinese(source, target):
             prompt = _append_english_entity_hints(prompt, texts or [])
+        if _is_japanese_to_chinese(source, target):
+            prompt = _append_japanese_entity_hints(prompt, texts or [])
         return prompt
 
     def _context_prompt(self, source: LangCode, target: LangCode, glossary, n: int, texts=None) -> str:
@@ -451,6 +473,8 @@ class DeepSeekTranslator(BaseRemoteTranslator):
                 prompt += f"人名对照：{mapping}"
         if _is_english_to_chinese(source, target):
             prompt = _append_english_entity_hints(prompt, texts or [])
+        if _is_japanese_to_chinese(source, target):
+            prompt = _append_japanese_entity_hints(prompt, texts or [])
         return prompt
 
     @staticmethod
@@ -603,6 +627,8 @@ class OpenAITranslator(BaseRemoteTranslator):
                 prompt += f"人名对照：{mapping}"
         if _is_english_to_chinese(source, target):
             prompt = _append_english_entity_hints(prompt, texts or [])
+        if _is_japanese_to_chinese(source, target):
+            prompt = _append_japanese_entity_hints(prompt, texts or [])
         return prompt
 
     def translate_one(self, text: str, source: LangCode, target: LangCode, glossary=None) -> str:
@@ -787,6 +813,8 @@ class SmartTranslator(BaseTranslator):
                         _normalize_english_translation(item, source_lang, target_lang)
                         for item in out
                     ]
+                    if glossary:
+                        out = [self._apply_glossary(item, glossary, source_lang) for item in out]
                     backend_name = getattr(backend, "name", type(backend).__name__)
                     self.last_backend_names = [backend_name] * len(srcs)
                     failed_indices = sorted(set(getattr(backend, "last_failed_indices", []) or []))
@@ -816,6 +844,8 @@ class SmartTranslator(BaseTranslator):
             result = self._translate_with_fallback(
                 src, source_lang, target_lang, backend, glossary=glossary if use_prompt else None
             )
+            if glossary:
+                result = self._apply_glossary(result, glossary, source_lang)
             out.append(result)
             self.last_backend_names.append(self._last_backend_name or "original")
             if progress_cb and total:

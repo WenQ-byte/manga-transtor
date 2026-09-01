@@ -131,7 +131,7 @@ export default function GlossaryPanel({ onCountChange }) {
           <input
             value={search}
             onChange={(e) => onSearchChange(e.target.value)}
-            className="min-h-[40px] flex-1 bg-transparent text-[15px] text-ink-100 outline-none placeholder:text-ink-600"
+            className="min-h-[40px] flex-1 bg-transparent text-[15px] text-ink-100 outline-none placeholder:text-ink-500"
             type="search"
             placeholder="搜索源词或译词…"
             aria-label="搜索专有名词"
@@ -192,7 +192,7 @@ export default function GlossaryPanel({ onCountChange }) {
                 <div className="min-w-0">
                   <div className="flex flex-wrap items-center gap-2.5">
                     <span className="truncate font-medium text-ink-100">{item.source}</span>
-                    <span className="text-ink-600">
+                    <span className="text-ink-500">
                       <ArrowRight size={15} />
                     </span>
                     <span className="truncate font-medium text-accent">{item.target}</span>
@@ -226,7 +226,7 @@ export default function GlossaryPanel({ onCountChange }) {
         </motion.div>
       )}
 
-      <div className="mt-6 text-center font-mono text-xs text-ink-600">共 {total} 条词条</div>
+      <div className="mt-6 text-center font-mono text-xs text-ink-500">共 {total} 条词条</div>
 
       <GlossaryModal
         open={showEditor}

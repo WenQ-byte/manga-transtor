@@ -290,6 +290,8 @@ class TestBatchTranslateApi(unittest.TestCase):
         self.assertEqual(manifest[0]["task_id"], "done")
         self.assertEqual(manifest[0]["text_count"], 12)
         self.assertEqual(manifest[0]["duration_ms"], 18000)
+        self.assertEqual(manifest[0]["result_path"], "translated_images/01_page-01_translated.png")
+        self.assertEqual(manifest[0]["error"], "")
 
     def test_partial_failure_generates_errors_file(self):
         result = self._create_result("result.png")
@@ -327,6 +329,33 @@ class TestBatchTranslateApi(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json()["status"], "queued")
         self.assertEqual(self.manager.created[0][3], "single.png")
+
+    def test_single_result_download_uses_safe_original_filename(self):
+        result = self._create_result("result.png")
+        self._set_task("done", "../../chapter-01.png", result_path=result)
+        response = self.client.get("/api/translate/done/result")
+        self.assertEqual(response.status_code, 200, response.text)
+        disposition = response.headers["content-disposition"]
+        self.assertIn("chapter-01_translated.png", disposition)
+        self.assertNotIn("..", disposition)
+
+    def test_failed_single_task_can_be_retried_from_stored_original(self):
+        original = self._create_result("original.png", b"original-image")
+        self._set_task(
+            "bad", "page-01.png", status="failed", error="识别失败",
+            original_path=original, source_lang="ja", target_lang="zh",
+            meta={"filename": "page-01.png", "index": 2, "batch_id": "batch-one"},
+        )
+        response = self.client.post("/api/translate/bad/retry")
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(self.manager.created[-1][0:4], ("ja", "zh", b"original-image", "page-01.png"))
+        self.assertEqual(self.manager.created[-1][4]["retry_of"], "bad")
+        self.assertEqual(self.manager.created[-1][4]["index"], 2)
+
+    def test_completed_task_cannot_be_retried(self):
+        self._set_task("done", "page.png", status="completed")
+        response = self.client.post("/api/translate/done/retry")
+        self.assertEqual(response.status_code, 409)
 
 
 class TestTaskPipelineIsolation(unittest.TestCase):
@@ -624,6 +653,9 @@ class TestGlossary(unittest.TestCase):
     def test_english_builtin_name_mapping(self):
         self.assertEqual(self.service.get_mapping("en")["Ken Takakura"], "高仓健")
 
+    def test_japanese_builtin_name_mapping(self):
+        self.assertEqual(self.service.get_mapping("ja")["コテ川"], "古手川")
+
     def test_glossary_distinguishes_target_language(self):
         japanese_id, _ = self.service.create("主角", "主人公", "zh", "", "ja")
         english_id, _ = self.service.create("主角", "protagonist", "zh", "", "en")
@@ -731,6 +763,48 @@ class TestMultilingualOcrRouting(unittest.TestCase):
         ]
         chosen = LanguageRoutingOCREngine._choose_candidate(candidates, region_language_hint("Hello world"))
         self.assertEqual(chosen["lang"], "en")
+
+    def test_japanese_page_context_resolves_pure_han_region(self):
+        from app.services.engines.ocr import LanguageRoutingOCREngine
+        from app.services.language import region_language_hint
+
+        candidates = [
+            {"engine": "paddle", "lang": "zh", "text": "紀委員♡", "confidence": 0.7461},
+            {"engine": "paddle", "lang": "ja", "text": "紀委員♡", "confidence": 0.8310},
+        ]
+        chosen = LanguageRoutingOCREngine._choose_candidate(
+            candidates,
+            region_language_hint("2委員♡", "ja"),
+            "ja",
+        )
+        self.assertEqual(chosen["lang"], "ja")
+
+    def test_japanese_page_context_resolves_single_kana_cjk_region(self):
+        from app.services.engines.ocr import LanguageRoutingOCREngine
+        from app.services.language import region_language_hint
+
+        candidates = [
+            {"engine": "paddle", "lang": "zh", "text": "今週を“風紀強化週間”", "confidence": 0.9414},
+            {"engine": "paddle", "lang": "ja", "text": "今週を“風紀強化週間”", "confidence": 0.9579},
+        ]
+        chosen = LanguageRoutingOCREngine._choose_candidate(
+            candidates,
+            region_language_hint("今週を“風紀強化週間”", "ja"),
+            "ja",
+        )
+        self.assertEqual(chosen["lang"], "ja")
+
+    def test_vertical_context_region_expands_short_column_upstream(self):
+        from app.services.engines.ocr import LanguageRoutingOCREngine
+        from app.services.pipeline import TextRegion
+
+        region = TextRegion(
+            box=[[19, 139], [57, 139], [57, 211], [19, 211]], direction="v"
+        )
+        expanded = LanguageRoutingOCREngine._vertical_context_region(region)
+        self.assertLess(expanded.bounds[0], region.bounds[0])
+        self.assertLess(expanded.bounds[1], region.bounds[1])
+        self.assertGreater(expanded.bounds[3], region.bounds[3])
 
     def test_english_preprocess_keeps_upscale_and_binary_candidates(self):
         from app.services.engines.ocr import PaddleOCREngine
@@ -1439,6 +1513,28 @@ class TestDeepSeekPrompt(unittest.TestCase):
         prompt = t._system_prompt("ja", "zh")
         self.assertNotIn("英语漫画到中文", prompt)
         self.assertIn("日语", prompt)
+
+    def test_japanese_context_marks_mixed_script_name_without_literal_translation(self):
+        from app.services.engines.translator import DeepSeekTranslator
+
+        t = DeepSeekTranslator.__new__(DeepSeekTranslator)
+        prompt = t._context_prompt("ja", "zh", None, 2, texts=["さすが", "コテ川だ‼"])
+        self.assertIn("コテ川", prompt)
+        self.assertIn("不要按字面词义拆译", prompt)
+        self.assertIn("惯用中文名", prompt)
+
+    def test_japanese_known_name_glossary_is_applied_after_remote_translation(self):
+        from app.services.engines.translator import _apply_glossary_text
+
+        glossary = GlossaryService().get_mapping("ja", "zh")
+        self.assertEqual(glossary["コテ川"], "古手川")
+        self.assertEqual(_apply_glossary_text("真不愧是コテ川啊！", glossary, "ja"), "真不愧是古手川啊！")
+
+    def test_preserves_japanese_heart_when_translation_returns_placeholder(self):
+        from app.services.pipeline import preserve_decorative_symbols
+
+        self.assertEqual(preserve_decorative_symbols("風紀委員♡", "风纪委员□"), "风纪委员♡")
+        self.assertEqual(preserve_decorative_symbols("帰ってきた！♡", "回来了！"), "回来了！♡")
 
     def test_english_context_prompt_keeps_numbered_segments(self):
         from app.services.engines.translator import DeepSeekTranslator
@@ -2364,6 +2460,16 @@ class TestRendererSafetyBounds(unittest.TestCase):
         region = self._region(0, (30, 30, 210, 140), "A" * 5000)
         self.assertEqual(self._render_size([region], target_lang="en"), (240, 180))
 
+    def test_long_english_word_wrap_keeps_all_characters(self):
+        from app.services.engines.renderer import PILRenderer
+
+        renderer = PILRenderer()
+        renderer._active_target_lang = "en"
+        font = renderer._get_font(16, "en")
+        text = "A" * 5000
+        lines = renderer._wrap_latin_text(text, font, 1)
+        self.assertEqual("".join(lines), text)
+
     def test_long_english_word_in_subcharacter_container_finishes(self):
         region = self._region(0, (100, 10, 102, 170), "A" * 5000)
         self.assertEqual(self._render_size([region], target_lang="en"), (240, 180))
@@ -2375,6 +2481,25 @@ class TestRendererSafetyBounds(unittest.TestCase):
     def test_extreme_aspect_bubble_finishes(self):
         region = self._region(0, (5, 80, 235, 88), "横向极端气泡译文" * 100)
         self.assertEqual(self._render_size([region]), (240, 180))
+
+    def test_narrow_horizontal_bubble_font_search_is_bounded(self):
+        from app.services.engines.renderer import PILRenderer
+
+        region = self._region(6, (80, 40, 151, 127), "窄气泡十字文本")
+        renderer = PILRenderer()
+        with patch.object(renderer, "_get_font", wraps=renderer._get_font) as get_font:
+            out = renderer.render(self.source, [region], target_lang="zh")
+        self.assertEqual(Image.open(io.BytesIO(out)).size, (240, 180))
+        self.assertLessEqual(get_font.call_count, 2)
+
+    def test_narrow_horizontal_multiline_font_search_is_bounded(self):
+        from app.services.engines.renderer import PILRenderer
+
+        renderer = PILRenderer()
+        with patch.object(renderer, "_get_font", side_effect=AssertionError("估算过程不应加载字体")):
+            size = renderer._estimate_multiline_font("什么？！不！等等……", 54, 66, 73, 10)
+        self.assertGreaterEqual(size, 10)
+        self.assertLessEqual(size, 73)
 
     def test_vertical_layout_has_fixed_search_bound(self):
         from app.services.engines.renderer import MAX_VERTICAL_FONT_TRIES, PILRenderer
@@ -2412,6 +2537,16 @@ class TestRendererSafetyBounds(unittest.TestCase):
             out = renderer.render(self.source, [first, second], target_lang="en")
         self.assertEqual(calls, 2)
         self.assertEqual(Image.open(io.BytesIO(out)).size, (240, 180))
+
+    def test_ten_bubbles_with_long_translation_finish(self):
+        regions = []
+        for index in range(10):
+            x0 = 5 + (index % 5) * 47
+            y0 = 5 + (index // 5) * 85
+            box = (x0, y0, x0 + 40, y0 + 70)
+            for _ in range(6):
+                regions.append(self._region(index, box, "中文长译文" * 160))
+        self.assertEqual(self._render_size(regions), (240, 180))
 
 
 class TestThreeLanguageTranslation(unittest.TestCase):
