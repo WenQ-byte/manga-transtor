@@ -1,846 +1,520 @@
-import { Fragment, useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { AnimatePresence, motion } from 'framer-motion'
 import {
-  UploadCloud,
-  FileImage,
-  X,
-  ArrowRight,
-  Wand2,
-  Download,
-  RotateCcw,
-  RefreshCw,
-  AlertTriangle,
-  Check,
-  Loader2,
-  ChevronDown,
+  AlertTriangle, ArrowDownToLine, ArrowRight, ArrowUp, Check, ChevronDown, Clipboard,
+  Clock3, FileImage, Image as ImageIcon, Loader2, Paperclip, RefreshCw, Sparkles, X,
 } from 'lucide-react'
 import {
-  createTranslateTask,
-  createBatchTranslateTask,
-  getTaskStatus,
-  getBatchTaskStatus,
-  getTaskResultUrl,
-  downloadBatchZip,
-  deleteTask,
-  formatBytes,
-  formatDuration,
+  createBatchTranslateTask, createTranslateTask, downloadBatchZip, formatBytes,
+  formatDuration, getBatchTaskStatus, getTaskResultUrl,
 } from '../api'
 import { useToast } from './Toast'
-import SpecularButton from './SpecularButton'
-import GlassSurface from './GlassSurface'
-import { SPECULAR_PRIMARY, SPECULAR_SECONDARY } from './specularPresets'
-
-const STEPS = [
-  { key: 'detect', label: '检测区域', weight: 0.15 },
-  { key: 'ocr', label: '识别文字', weight: 0.25 },
-  { key: 'inpaint', label: '修复图像', weight: 0.15 },
-  { key: 'translate', label: '翻译', weight: 0.3 },
-  { key: 'render', label: '渲染译文', weight: 0.15 },
-]
 
 const ALLOWED = '.jpg,.jpeg,.png,.webp,.bmp'
 const MAX_MB = 10
 const MAX_BATCH_FILES = 100
 const MAX_BATCH_MB = 500
+const STORAGE_KEY = 'manga-translator-current-batches-v1'
+const TERMINAL_STATUSES = new Set(['completed', 'failed'])
+const LANGUAGE_OPTIONS = [
+  { value: 'auto', label: '自动检测' }, { value: 'zh', label: '中文' },
+  { value: 'ja', label: '日语' }, { value: 'en', label: '英语' },
+]
+const TARGET_OPTIONS = LANGUAGE_OPTIONS.filter((item) => item.value !== 'auto')
+const PIPELINE_STEPS = [
+  { end: 15, label: '检测文字区域' }, { end: 40, label: '识别原文' },
+  { end: 55, label: '修复原图' }, { end: 85, label: '翻译文本' },
+  { end: 101, label: '渲染译文' },
+]
 
-function stepIndexFromProgress(progress) {
-  let acc = 0
-  for (let i = 0; i < STEPS.length; i++) {
-    acc += STEPS[i].weight * 100
-    if (progress < acc) return i
-  }
-  return STEPS.length - 1
+function languageLabel(code) {
+  return { auto: '自动检测', zh: '中文', ja: '日语', en: '英语' }[code] || code || '未知语言'
 }
 
-function validateFile(f) {
-  if (!f) return '请选择图片文件'
-  const ext = (f.name.split('.').pop() || '').toLowerCase()
-  if (!ALLOWED.includes(`.${ext}`)) return `不支持 .${ext} 格式，仅支持 JPG / PNG / WebP / BMP`
-  if (f.size > MAX_MB * 1024 * 1024) return `文件超过 ${MAX_MB}MB 限制，请压缩后重试`
-  if (f.size === 0) return '文件为空'
+function pipelineStage(progress) {
+  return PIPELINE_STEPS.find((step) => progress < step.end)?.label || '渲染译文'
+}
+
+function validateFile(file) {
+  if (!file) return '请选择图片文件'
+  const extension = (file.name.split('.').pop() || '').toLowerCase()
+  if (!ALLOWED.includes(`.${extension}`)) return `不支持 .${extension} 格式，仅支持 JPG / PNG / WebP / BMP`
+  if (file.size > MAX_MB * 1024 * 1024) return `文件超过 ${MAX_MB}MB 限制，请压缩后重试`
+  if (file.size === 0) return '文件为空'
   return ''
 }
 
-function LangSelect({ id, label, value, options, onChange }) {
-  return (
-    <label className="block">
-      <span className="mb-2 block font-mono text-[10px] uppercase tracking-[0.25em] text-ink-500">
-        {label}
-      </span>
-      <div className="relative">
-        <GlassSurface
-          width="100%"
-          height="100%"
-          borderRadius={10}
-          borderWidth={0.07}
-          brightness={55}
-          opacity={0.9}
-          blur={12}
-          backgroundOpacity={0.06}
-          saturation={1.3}
-          className="absolute inset-0"
-        />
-        <select
-          id={id}
-          value={value}
-          onChange={(e) => onChange(e.target.value)}
-          className="relative z-10 w-full appearance-none bg-transparent px-4 py-3 pr-10 font-medium text-ink-100 outline-none"
-        >
-          {options.map((o) => (
-            <option key={o.value} value={o.value} className="bg-surface-2">
-              {o.label}
-            </option>
-          ))}
-        </select>
-        <ChevronDown
-          size={16}
-          className="pointer-events-none absolute right-3 top-1/2 z-10 -translate-y-1/2 text-ink-500"
-        />
-      </div>
-    </label>
-  )
+function loadStoredBatches() {
+  try {
+    const stored = JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]')
+    if (!Array.isArray(stored)) return []
+    return stored.map((batch) => ({
+      ...batch,
+      items: (batch.items || []).map((item) => ({ ...item, file: null, previewUrl: '' })),
+    }))
+  } catch {
+    return []
+  }
 }
 
-const panelMotion = {
-  initial: { opacity: 0, y: 24 },
-  animate: { opacity: 1, y: 0 },
-  exit: { opacity: 0, y: -16 },
-  transition: { type: 'spring', stiffness: 200, damping: 24 },
+function persistableBatches(batches) {
+  return batches.slice(-12).map((batch) => ({
+    id: batch.id, createdAt: batch.createdAt, sourceLang: batch.sourceLang, targetLang: batch.targetLang,
+    items: batch.items.map((item) => ({
+      task_id: item.task_id, filename: item.filename, index: item.index, status: item.status,
+      progress: item.progress || 0, error: item.error || '', text_count: item.text_count || 0,
+      duration_ms: item.duration_ms || 0, source_lang: item.source_lang || batch.sourceLang,
+      target_lang: item.target_lang || batch.targetLang,
+      detected_source_lang: item.detected_source_lang || null,
+      translation_backends: item.translation_backends || [], ocr_backend: item.ocr_backend || '',
+      render_font: item.render_font || '',
+    })),
+  }))
+}
+
+function batchStats(batch) {
+  const completed = batch.items.filter((item) => item.status === 'completed').length
+  const failed = batch.items.filter((item) => item.status === 'failed').length
+  const active = batch.items.length - completed - failed
+  const progress = batch.items.length
+    ? Math.round(batch.items.reduce((sum, item) => sum + (item.progress || 0), 0) / batch.items.length)
+    : 0
+  return { completed, failed, active, progress }
+}
+
+function triggerDownload(url, filename) {
+  const anchor = document.createElement('a')
+  anchor.href = url
+  anchor.download = filename || ''
+  document.body.appendChild(anchor)
+  anchor.click()
+  anchor.remove()
 }
 
 export default function TranslatePanel() {
   const notify = useToast()
-
-  const [phase, setPhase] = useState('idle') // idle | submitting | running | result | error
+  const [batches, setBatches] = useState(loadStoredBatches)
   const [files, setFiles] = useState([])
-  const [filePreviewUrl, setFilePreviewUrl] = useState('')
-  const [fileError, setFileError] = useState('')
-  const [isDragging, setIsDragging] = useState(false)
   const [sourceLang, setSourceLang] = useState('auto')
   const [targetLang, setTargetLang] = useState('zh')
-
-  const [taskId, setTaskId] = useState(null)
-  const [taskIds, setTaskIds] = useState([])
-  const [progress, setProgress] = useState(0)
-  const [batchStatus, setBatchStatus] = useState(null)
-  const [zipLoading, setZipLoading] = useState(false)
-  const [result, setResult] = useState(null)
-  const [errorMessage, setErrorMessage] = useState('')
-
+  const [fileError, setFileError] = useState('')
+  const [isDragging, setIsDragging] = useState(false)
+  const [submitting, setSubmitting] = useState(false)
+  const [zipLoadingId, setZipLoadingId] = useState('')
+  const [retryingTaskId, setRetryingTaskId] = useState('')
   const inputRef = useRef(null)
-  const pollRef = useRef(null)
-  const pollTokenRef = useRef(0)
-  const activeRef = useRef(true)
-  const file = files[0] || null
+  const endRef = useRef(null)
+  const mountedRef = useRef(true)
+  const batchesRef = useRef(batches)
+  const pollTimerRef = useRef(null)
+  const pollInFlightRef = useRef(false)
+  const pollErrorNotifiedRef = useRef(false)
+  const submitLockRef = useRef(false)
+  const objectUrlsRef = useRef(new Set())
+  const totalBytes = useMemo(() => files.reduce((sum, file) => sum + file.size, 0), [files])
+  const languageInvalid = sourceLang !== 'auto' && sourceLang === targetLang
 
   useEffect(() => {
-    activeRef.current = true
+    batchesRef.current = batches
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(persistableBatches(batches)))
+    } catch {
+      // 本地存储不可用时不影响任务本身和轮询。
+    }
+  }, [batches])
+
+  useEffect(() => {
+    mountedRef.current = true
+    schedulePoll(0)
     return () => {
-      activeRef.current = false
-      stopPolling()
+      mountedRef.current = false
+      if (pollTimerRef.current) clearTimeout(pollTimerRef.current)
+      objectUrlsRef.current.forEach((url) => URL.revokeObjectURL(url))
+      objectUrlsRef.current.clear()
     }
   }, [])
+
   useEffect(() => {
-    if (!file) {
-      setFilePreviewUrl('')
-      return undefined
+    const onPaste = (event) => {
+      const pasted = Array.from(event.clipboardData?.items || [])
+        .filter((item) => item.kind === 'file' && item.type.startsWith('image/'))
+        .map((item, index) => {
+          const blob = item.getAsFile()
+          if (!blob) return null
+          const extension = blob.type.split('/')[1]?.replace('jpeg', 'jpg') || 'png'
+          return new File([blob], `剪贴板图片-${Date.now()}-${index + 1}.${extension}`, {
+            type: blob.type, lastModified: Date.now(),
+          })
+        }).filter(Boolean)
+      if (!pasted.length) return
+      event.preventDefault()
+      if (addFiles(pasted)) notify(`已粘贴 ${pasted.length} 张图片`, 'success')
     }
-    const url = URL.createObjectURL(file)
-    setFilePreviewUrl(url)
-    return () => URL.revokeObjectURL(url)
-  }, [file])
+    window.addEventListener('paste', onPaste)
+    return () => window.removeEventListener('paste', onPaste)
+  }, [files])
 
-  const currentStep = useMemo(
-    () => (phase === 'running' ? stepIndexFromProgress(progress) : -1),
-    [phase, progress],
-  )
+  function activeTaskIds() {
+    return batchesRef.current.flatMap((batch) =>
+      batch.items.filter((item) => !TERMINAL_STATUSES.has(item.status)).map((item) => item.task_id),
+    )
+  }
 
-  function stopPolling() {
-    pollTokenRef.current += 1
-    if (pollRef.current) {
-      clearTimeout(pollRef.current)
-      pollRef.current = null
+  function schedulePoll(delay = 900) {
+    if (!mountedRef.current) return
+    if (pollTimerRef.current) clearTimeout(pollTimerRef.current)
+    if (!activeTaskIds().length) return
+    pollTimerRef.current = setTimeout(runPoll, delay)
+  }
+
+  async function runPoll() {
+    if (!mountedRef.current || pollInFlightRef.current) return
+    const ids = activeTaskIds()
+    if (!ids.length) return
+    pollInFlightRef.current = true
+    let nextDelay = 900
+    try {
+      const response = await getBatchTaskStatus(ids)
+      if (!mountedRef.current) return
+      pollErrorNotifiedRef.current = false
+      const updates = new Map(response.items.map((item) => [item.task_id, item]))
+      setBatches((current) => current.map((batch) => ({
+        ...batch,
+        items: batch.items.map((item) => {
+          const update = updates.get(item.task_id)
+          return update ? { ...item, ...update, file: item.file, previewUrl: item.previewUrl } : item
+        }),
+      })))
+    } catch (error) {
+      nextDelay = 2500
+      if (mountedRef.current && !pollErrorNotifiedRef.current) {
+        pollErrorNotifiedRef.current = true
+        notify(`任务状态暂时无法更新：${error.message}`, 'error')
+      }
+    } finally {
+      pollInFlightRef.current = false
+      if (mountedRef.current) schedulePoll(nextDelay)
     }
   }
 
   function addFiles(selected) {
     const incoming = Array.from(selected || [])
     if (!incoming.length) return false
-    const next = [...files, ...incoming]
     const error = incoming.map(validateFile).find(Boolean)
-    if (error) {
-      setFileError(error)
-      return false
+    if (error) { setFileError(error); return false }
+    const next = [...files, ...incoming]
+    if (next.length > MAX_BATCH_FILES) { setFileError(`每批最多选择 ${MAX_BATCH_FILES} 张图片`); return false }
+    if (next.reduce((sum, file) => sum + file.size, 0) > MAX_BATCH_MB * 1024 * 1024) {
+      setFileError(`每批图片总大小不能超过 ${MAX_BATCH_MB}MB`); return false
     }
-    if (next.length > MAX_BATCH_FILES) {
-      setFileError(`批量翻译最多选择 ${MAX_BATCH_FILES} 张图片`)
-      return false
-    }
-    const totalBytes = next.reduce((sum, item) => sum + item.size, 0)
-    if (totalBytes > MAX_BATCH_MB * 1024 * 1024) {
-      setFileError(`批量图片总大小不能超过 ${MAX_BATCH_MB}MB`)
-      return false
-    }
-    setFileError('')
     setFiles(next)
+    setFileError('')
     return true
   }
 
-  function onFileSelect(e) {
-    addFiles(e.target.files)
-    e.target.value = ''
+  function handleFileSelect(event) {
+    addFiles(event.target.files)
+    event.target.value = ''
   }
 
-  function onDrop(e) {
-    e.preventDefault()
-    setIsDragging(false)
-    addFiles(e.dataTransfer.files)
-  }
-
-  function removeFile(index) {
-    setFiles((current) => current.filter((_, itemIndex) => itemIndex !== index))
+  async function submitBatch() {
+    if (!files.length || submitting || submitLockRef.current) return
+    if (languageInvalid) { setFileError('源语言和目标语言不能相同'); return }
+    submitLockRef.current = true
+    setSubmitting(true)
     setFileError('')
-  }
-
-  async function startTranslate() {
-    if (!files.length) return
-    if (sourceLang !== 'auto' && sourceLang === targetLang) {
-      setFileError('源语言和目标语言不能相同')
-      notify('源语言和目标语言不能相同', 'error')
-      return
-    }
-    setPhase('submitting')
-    setFileError('')
-    setErrorMessage('')
-    setResult(null)
-    setBatchStatus(null)
-    setProgress(0)
+    const selectedFiles = [...files]
     try {
-      if (files.length === 1) {
-        const data = await createTranslateTask(files[0], sourceLang, targetLang)
-        if (!activeRef.current) return
-        setTaskId(data.task_id)
-        setTaskIds([data.task_id])
-        setPhase('running')
-        startPolling([data.task_id], false)
+      let responseItems
+      if (selectedFiles.length === 1) {
+        const response = await createTranslateTask(selectedFiles[0], sourceLang, targetLang)
+        responseItems = [{ task_id: response.task_id, filename: selectedFiles[0].name, index: 1 }]
       } else {
-        const data = await createBatchTranslateTask(files, sourceLang, targetLang)
-        if (!activeRef.current) return
-        const ids = data.items.map((item) => item.task_id)
-        setTaskIds(ids)
-        setBatchStatus({
-          total: data.total,
-          completed: 0,
-          processing: data.total,
-          failed: 0,
-          progress: 0,
-          items: data.items.map((item) => ({ ...item, progress: 0 })),
-        })
-        setPhase('running')
-        startPolling(ids, true)
+        responseItems = (await createBatchTranslateTask(selectedFiles, sourceLang, targetLang)).items
       }
-    } catch (err) {
-      if (!activeRef.current) return
-      setPhase('error')
-      setErrorMessage(err.message)
-      notify(err.message, 'error')
-    }
-  }
-
-  function startPolling(ids, isBatch) {
-    stopPolling()
-    const token = pollTokenRef.current
-    const tick = async () => {
-      const done = isBatch ? await pollBatchStatus(ids, token) : await pollStatus(ids[0], token)
-      if (activeRef.current && token === pollTokenRef.current && !done) {
-        pollRef.current = setTimeout(tick, 800)
-      }
-    }
-    tick()
-  }
-
-  async function pollStatus(id, token) {
-    try {
-      const status = await getTaskStatus(id)
-      if (!activeRef.current || token !== pollTokenRef.current) return true
-      setProgress((current) => Math.max(current, status.progress || 0))
-      if (status.status === 'completed') {
-        setResult({
-          resultUrl: getTaskResultUrl(id),
-          originalUrl: filePreviewUrl,
-          textCount: status.text_count,
-          durationMs: status.duration_ms,
-          sourceLang: status.source_lang,
-          targetLang: status.target_lang,
-          detectedSourceLang: status.detected_source_lang,
-          translationBackends: status.translation_backends || [],
-          ocrBackend: status.ocr_backend || '',
-          renderFont: status.render_font || '',
-          regionDiagnostics: status.region_diagnostics || [],
-        })
-        setPhase('result')
-        notify('翻译完成', 'success')
-        return true
-      } else if (status.status === 'failed') {
-        setErrorMessage(status.error || '翻译失败，请重试')
-        setPhase('error')
-        notify(status.error || '翻译失败', 'error')
-        return true
-      }
-    } catch (err) {
-      if (!activeRef.current || token !== pollTokenRef.current) return true
-      setErrorMessage(err.message)
-      setPhase('error')
-      notify('获取进度失败：' + err.message, 'error')
-      return true
-    }
-    return false
-  }
-
-  async function pollBatchStatus(ids, token) {
-    try {
-      const status = await getBatchTaskStatus(ids)
-      if (!activeRef.current || token !== pollTokenRef.current) return true
-      setBatchStatus(status)
-      setProgress(status.progress || 0)
-      if (status.completed + status.failed === status.total) {
-        setPhase('batch-result')
-        notify(
-          status.failed ? `批量处理结束，${status.completed} 张成功、${status.failed} 张失败` : '批量翻译完成',
-          status.failed ? 'error' : 'success',
-        )
-        return true
-      }
-    } catch (err) {
-      if (!activeRef.current || token !== pollTokenRef.current) return true
-      setErrorMessage(err.message)
-      setPhase('error')
-      notify('获取批量进度失败：' + err.message, 'error')
-      return true
-    }
-    return false
-  }
-
-  function cancelTask() {
-    stopPolling()
-    const ids = taskIds.length ? taskIds : taskId ? [taskId] : []
-    Promise.allSettled(ids.map((id) => deleteTask(id))).catch(() => {})
-    resetAll()
-  }
-
-  async function downloadZip() {
-    setZipLoading(true)
-    try {
-      const blob = await downloadBatchZip(taskIds)
-      if (!activeRef.current) return
-      const url = URL.createObjectURL(blob)
-      const a = document.createElement('a')
-      a.href = url
-      a.download = 'translated_images.zip'
-      document.body.appendChild(a)
-      a.click()
-      a.remove()
-      URL.revokeObjectURL(url)
-    } catch (err) {
-      notify('ZIP 下载失败：' + err.message, 'error')
-    } finally {
-      if (activeRef.current) setZipLoading(false)
-    }
-  }
-
-  function resetAll() {
-    stopPolling()
-    setTaskId(null)
-    setTaskIds([])
-    setProgress(0)
-    setBatchStatus(null)
-    setZipLoading(false)
-    setErrorMessage('')
-    setResult(null)
-    setPhase('idle')
-  }
-
-  function startNewTranslation() {
-    resetAll()
-    setFiles([])
-    setFileError('')
-  }
-
-  const isBlurHint = (errorMessage || '').includes('模糊')
-
-  return (
-    <div className="card relative mx-auto max-w-[760px] bg-surface/40 p-8 md:p-10 backdrop-blur-sm">
-      <AnimatePresence mode="wait">
-        {phase === 'idle' && (
-          <motion.div key="idle" {...panelMotion}>
-            <StepHeading index="01" title="上传漫画图片" />
-            <Dropzone
-              files={files}
-              previewUrl={filePreviewUrl}
-              isDragging={isDragging}
-              setIsDragging={setIsDragging}
-              onDrop={onDrop}
-              onSelect={onFileSelect}
-              onRemove={removeFile}
-              inputRef={inputRef}
-            />
-            {fileError && (
-              <motion.p
-                initial={{ opacity: 0, y: -6 }}
-                animate={{ opacity: 1, y: 0 }}
-                className="mt-3 flex items-center gap-2 text-sm text-danger"
-                role="alert"
-              >
-                <AlertTriangle size={15} />
-                {fileError}
-              </motion.p>
-            )}
-
-            <StepHeading index="02" title="选择翻译方向" className="mt-9" />
-            <div className="grid grid-cols-[1fr_auto_1fr] items-end gap-4">
-              <LangSelect
-                id="source-lang"
-                label="Source"
-                value={sourceLang}
-                onChange={setSourceLang}
-                options={[
-                  { value: 'auto', label: '自动检测' },
-                  { value: 'zh', label: '中文' },
-                  { value: 'ja', label: '日语' },
-                  { value: 'en', label: '英语' },
-                ]}
-              />
-              <div className="flex h-[50px] items-center justify-center text-ink-500">
-                <ArrowRight size={18} />
-              </div>
-              <LangSelect
-                id="target-lang"
-                label="Target"
-                value={targetLang}
-                onChange={setTargetLang}
-                options={[
-                  { value: 'zh', label: '中文' },
-                  { value: 'ja', label: '日语' },
-                  { value: 'en', label: '英语' },
-                ]}
-              />
-            </div>
-            <p className="mt-3 text-center text-sm text-ink-500">
-              当前方向：{languageLabel(sourceLang)} → {languageLabel(targetLang)}
-            </p>
-            {sourceLang !== 'auto' && sourceLang === targetLang && (
-              <p className="mt-2 text-center text-sm text-danger">源语言和目标语言不能相同</p>
-            )}
-
-            <div className="mt-9 flex justify-center">
-              <SpecularButton
-                {...SPECULAR_PRIMARY}
-                disabled={!files.length || (sourceLang !== 'auto' && sourceLang === targetLang)}
-                onClick={startTranslate}
-              >
-                <Wand2 size={18} />
-                {files.length > 1 ? `开始批量翻译（${files.length} 张）` : '开始翻译'}
-              </SpecularButton>
-            </div>
-          </motion.div>
-        )}
-
-        {phase === 'submitting' && (
-          <motion.div key="submitting" {...panelMotion} className="py-10 text-center">
-            <Loader2 size={28} className="mx-auto animate-spin text-accent" />
-            <p className="mt-4 text-ink-200">正在提交任务…</p>
-          </motion.div>
-        )}
-
-        {phase === 'running' && (
-          <motion.div key="running" {...panelMotion}>
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-3">
-                <Loader2 size={20} className="animate-spin text-accent" />
-                <h2 className="font-display text-xl font-semibold">
-                  {taskIds.length > 1 ? '正在批量翻译漫画' : '正在翻译漫画'}
-                </h2>
-              </div>
-              <span className="font-mono text-sm text-ink-400">{progress}%</span>
-            </div>
-            <p className="mt-1 truncate text-sm text-ink-500">
-              {taskIds.length > 1 ? `${taskIds.length} 张图片独立处理中` : file?.name}
-            </p>
-
-            <div className="mt-8 h-1.5 overflow-hidden rounded-full bg-surface-2">
-              <motion.div
-                className="h-full rounded-full bg-gradient-to-r from-accent-strong to-accent"
-                animate={{ width: `${progress}%` }}
-                transition={{ type: 'spring', stiffness: 120, damping: 24 }}
-              />
-            </div>
-
-            {taskIds.length > 1 && batchStatus ? (
-              <>
-                <p className="mt-4 text-sm text-ink-500">
-                  已完成 {batchStatus.completed} 张 · 失败 {batchStatus.failed} 张 · 处理中 {batchStatus.processing} 张
-                </p>
-                <BatchItems items={batchStatus.items} />
-              </>
-            ) : (
-              <Pipeline currentStep={currentStep} progress={progress} />
-            )}
-
-            <div className="mt-8 flex justify-center">
-              <SpecularButton {...SPECULAR_SECONDARY} onClick={cancelTask}>
-                取消翻译
-              </SpecularButton>
-            </div>
-          </motion.div>
-        )}
-
-        {phase === 'batch-result' && batchStatus && (
-          <motion.div key="batch-result" {...panelMotion}>
-            <div className="flex flex-wrap items-end justify-between gap-4">
-              <div>
-                <h2 className="font-display text-xl font-semibold text-ink-100">批量处理完成</h2>
-                <p className="mt-1 text-sm text-ink-500">
-                  成功 {batchStatus.completed} 张 · 失败 {batchStatus.failed} 张
-                </p>
-              </div>
-              {batchStatus.completed > 0 && (
-                <SpecularButton {...SPECULAR_PRIMARY} size="md" disabled={zipLoading} onClick={downloadZip}>
-                  {zipLoading ? <Loader2 size={16} className="animate-spin" /> : <Download size={16} />}
-                  下载 ZIP
-                </SpecularButton>
-              )}
-            </div>
-            <BatchItems items={batchStatus.items} />
-            <div className="mt-7 flex justify-center">
-              <SpecularButton {...SPECULAR_SECONDARY} onClick={startNewTranslation}>
-                <RotateCcw size={16} />
-                继续翻译
-              </SpecularButton>
-            </div>
-          </motion.div>
-        )}
-
-        {phase === 'result' && result && (
-          <motion.div key="result" {...panelMotion}>
-            <div className="mb-6 flex flex-wrap items-end justify-between gap-4">
-              <div>
-                <h2 className="font-display text-xl font-semibold text-ink-100">翻译完成</h2>
-                <p className="mt-1 text-sm text-ink-500">
-                  共识别 {result.textCount} 处文字
-                  {result.durationMs ? ` · 耗时 ${formatDuration(result.durationMs)}` : ''}
-                </p>
-                <p className="mt-1 text-sm text-ink-500">
-                  {languageLabel(result.detectedSourceLang || result.sourceLang)} → {languageLabel(result.targetLang)}
-                  {result.translationBackends?.length ? ` · ${result.translationBackends.join(' / ')}` : ''}
-                </p>
-                <p className="mt-1 text-xs text-ink-600">
-                  OCR：{result.ocrBackend || '按区域路由'}
-                  {result.renderFont ? ` · 字体：${result.renderFont.split(/[\\/]/).pop()}` : ''}
-                  {result.regionDiagnostics?.length ? ` · 区域：${result.regionDiagnostics.length}` : ''}
-                </p>
-              </div>
-              <SpecularButton
-                {...SPECULAR_PRIMARY}
-                size="md"
-                onClick={() => {
-                  const a = document.createElement('a')
-                  a.href = result.resultUrl
-                  a.download = ''
-                  document.body.appendChild(a)
-                  a.click()
-                  a.remove()
-                }}
-              >
-                <Download size={16} />
-                下载图片
-              </SpecularButton>
-            </div>
-
-            <div className="relative flex w-full items-center justify-center overflow-hidden rounded-xl border border-line bg-surface-2">
-              <img
-                src={result.resultUrl}
-                alt="翻译结果"
-                className="w-full object-contain"
-                draggable={false}
-              />
-            </div>
-
-            <div className="mt-6 flex justify-center">
-              <SpecularButton {...SPECULAR_SECONDARY} onClick={startNewTranslation}>
-                <RotateCcw size={16} />
-                翻译下一张
-              </SpecularButton>
-            </div>
-          </motion.div>
-        )}
-
-        {phase === 'error' && (
-          <motion.div key="error" {...panelMotion} className="py-8 text-center">
-            <div className="mx-auto flex h-14 w-14 items-center justify-center rounded-full border border-danger/30 bg-danger/10 text-danger">
-              <AlertTriangle size={26} />
-            </div>
-            <h2 className="mt-5 font-display text-xl font-semibold">翻译失败</h2>
-            <p className="mx-auto mt-3 max-w-md text-sm leading-relaxed text-ink-400">{errorMessage}</p>
-            {isBlurHint && (
-              <p className="mt-2 text-sm text-ink-500">建议：尝试更换更清晰、对比度更高的图片。</p>
-            )}
-            <div className="mt-8 flex justify-center gap-3">
-              <SpecularButton {...SPECULAR_PRIMARY} onClick={startNewTranslation}>
-                <RefreshCw size={16} />
-                重新上传
-              </SpecularButton>
-              <SpecularButton {...SPECULAR_SECONDARY} disabled={!files.length} onClick={startTranslate}>
-                重试
-              </SpecularButton>
-            </div>
-          </motion.div>
-        )}
-      </AnimatePresence>
-    </div>
-  )
-}
-
-function StepHeading({ index, title, className = '' }) {
-  return (
-    <div className={`mb-5 flex items-center gap-3 ${className}`}>
-      <span className="flex h-7 w-7 items-center justify-center rounded-md border border-accent/30 bg-accent/10 font-mono text-xs font-medium text-accent">
-        {index}
-      </span>
-      <h2 className="font-display text-lg font-medium text-ink-100">{title}</h2>
-    </div>
-  )
-}
-
-function Dropzone({ files, previewUrl, isDragging, setIsDragging, onDrop, onSelect, onRemove, inputRef }) {
-  return (
-    <div
-      className={`relative cursor-pointer overflow-hidden rounded-xl border-2 border-dashed transition-all duration-200 ${
-        isDragging ? 'border-accent ring-glow' : 'border-line-strong hover:border-accent/40'
-      }`}
-      onDragOver={(e) => {
-        e.preventDefault()
-        setIsDragging(true)
-      }}
-      onDragLeave={(e) => {
-        e.preventDefault()
-        setIsDragging(false)
-      }}
-      onDrop={onDrop}
-      onClick={() => inputRef.current?.click()}
-      role="button"
-      tabIndex={0}
-      onKeyDown={(e) => {
-        if (e.key === 'Enter' || e.key === ' ') {
-          e.preventDefault()
-          inputRef.current?.click()
+      if (!mountedRef.current) return
+      const items = responseItems.map((item, index) => {
+        const file = selectedFiles[item.index ? item.index - 1 : index]
+        const previewUrl = URL.createObjectURL(file)
+        objectUrlsRef.current.add(previewUrl)
+        return {
+          ...item, filename: item.filename || file.name, status: 'queued', progress: 0, error: '',
+          source_lang: sourceLang, target_lang: targetLang, file, previewUrl,
         }
-      }}
-    >
-      <input
-        ref={inputRef}
-        type="file"
-        accept={ALLOWED}
-        multiple
-        className="hidden"
-        onChange={onSelect}
-      />
-
-      <GlassSurface
-        width="100%"
-        height="100%"
-        borderRadius={12}
-        borderWidth={0.07}
-        brightness={55}
-        opacity={0.9}
-        blur={12}
-        backgroundOpacity={0.06}
-        saturation={1.3}
-        displace={3}
-      >
-        {!files.length ? (
-          <div className="flex flex-col items-center justify-center px-6 py-14 text-center">
-            <motion.div
-              animate={isDragging ? { y: -6, scale: 1.05 } : { y: 0, scale: 1 }}
-              className="mb-4 flex h-14 w-14 items-center justify-center rounded-2xl border border-line bg-surface text-accent"
-            >
-              <UploadCloud size={26} />
-            </motion.div>
-            <p className="text-[15px] font-medium text-ink-100">点击上传，或拖拽多张图片到此处</p>
-            <p className="mt-2 text-[13px] text-ink-500">
-              支持 JPG / PNG / WebP / BMP · 单张 10MB · 最多 100 张 / 共 500MB
-            </p>
-          </div>
-        ) : files.length === 1 ? (
-          <FileRow
-            file={files[0]}
-            previewUrl={previewUrl}
-            onRemove={(event) => {
-              event.stopPropagation()
-              onRemove(0)
-            }}
-          />
-        ) : (
-          <div className="px-5 py-4 text-left">
-            <div className="mb-3 flex items-center justify-between">
-              <span className="text-sm font-medium text-ink-200">已选择 {files.length} 张图片</span>
-              <span className="font-mono text-xs text-ink-500">
-                {formatBytes(files.reduce((sum, file) => sum + file.size, 0))}
-              </span>
-            </div>
-            <div className="max-h-64 space-y-2 overflow-y-auto pr-1">
-              {files.map((file, index) => (
-                <div
-                  key={`${file.name}-${file.size}-${file.lastModified}-${index}`}
-                  className="flex items-center gap-3 rounded-lg border border-line bg-surface/45 px-3 py-2.5"
-                >
-                  <FileImage size={17} className="shrink-0 text-accent" />
-                  <div className="min-w-0 flex-1">
-                    <p className="truncate text-sm text-ink-100">{file.name}</p>
-                    <p className="font-mono text-[10px] text-ink-500">{formatBytes(file.size)}</p>
-                  </div>
-                  <button
-                    type="button"
-                    onClick={(event) => {
-                      event.stopPropagation()
-                      onRemove(index)
-                    }}
-                    className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-ink-500 transition-colors hover:bg-surface hover:text-danger"
-                    aria-label={`移除 ${file.name}`}
-                  >
-                    <X size={16} />
-                  </button>
-                </div>
-              ))}
-            </div>
-            <p className="mt-3 text-center text-xs text-ink-500">点击空白处可继续添加图片</p>
-          </div>
-        )}
-      </GlassSurface>
-    </div>
-  )
-}
-
-function languageLabel(code) {
-  return { auto: '自动检测', zh: '中文', ja: '日语', en: '英语' }[code] || code || '未知语言'
-}
-
-function FileRow({ file, previewUrl, onRemove }) {
-  return (
-    <div className="flex items-center gap-5 px-6 py-6">
-      <div className="h-20 w-20 shrink-0 overflow-hidden rounded-lg border border-line bg-surface-2">
-        <img src={previewUrl} alt="待翻译图片预览" className="h-full w-full object-cover" />
-      </div>
-      <div className="min-w-0 flex-1 text-left">
-        <p className="truncate text-[15px] font-medium text-ink-100">{file.name}</p>
-        <p className="mt-1 text-[13px] text-ink-500">{formatBytes(file.size)}</p>
-      </div>
-      <button
-        type="button"
-        onClick={onRemove}
-        className="flex h-9 w-9 items-center justify-center rounded-lg text-ink-500 transition-colors hover:bg-surface hover:text-danger"
-        aria-label="移除图片"
-      >
-        <X size={18} />
-      </button>
-    </div>
-  )
-}
-
-function BatchItems({ items }) {
-  const statusLabel = {
-    queued: '等待中',
-    processing: '处理中',
-    completed: '已完成',
-    failed: '失败',
+      })
+      const batch = {
+        id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        createdAt: new Date().toISOString(), sourceLang, targetLang, items,
+      }
+      setBatches((current) => [...current, batch])
+      batchesRef.current = [...batchesRef.current, batch]
+      setFiles([])
+      notify(`已提交 ${items.length} 张图片`, 'success')
+      requestAnimationFrame(() => endRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' }))
+      schedulePoll(0)
+    } catch (error) {
+      if (mountedRef.current) { setFileError(error.message); notify(`提交失败：${error.message}`, 'error') }
+    } finally {
+      submitLockRef.current = false
+      if (mountedRef.current) setSubmitting(false)
+    }
   }
+
+  async function retryItem(batchId, taskId) {
+    const batch = batchesRef.current.find((candidate) => candidate.id === batchId)
+    const item = batch?.items.find((candidate) => candidate.task_id === taskId)
+    if (!batch || !item?.file || retryingTaskId) return
+    setRetryingTaskId(taskId)
+    try {
+      const response = await createTranslateTask(item.file, batch.sourceLang, batch.targetLang)
+      if (!mountedRef.current) return
+      const replaceTask = (candidate) => candidate.id !== batchId ? candidate : {
+        ...candidate,
+        items: candidate.items.map((currentItem) => currentItem.task_id !== taskId ? currentItem : {
+          ...currentItem, task_id: response.task_id, status: 'queued', progress: 0, error: '',
+          text_count: 0, duration_ms: 0,
+        }),
+      }
+      setBatches((current) => current.map(replaceTask))
+      batchesRef.current = batchesRef.current.map(replaceTask)
+      notify(`已重新提交 ${item.filename}`, 'success')
+      schedulePoll(0)
+    } catch (error) {
+      if (mountedRef.current) notify(`重新翻译失败：${error.message}`, 'error')
+    } finally {
+      if (mountedRef.current) setRetryingTaskId('')
+    }
+  }
+
+  async function downloadZip(batch) {
+    setZipLoadingId(batch.id)
+    try {
+      const blob = await downloadBatchZip(batch.items.map((item) => item.task_id))
+      if (!mountedRef.current) return
+      const url = URL.createObjectURL(blob)
+      triggerDownload(url, `翻译结果-${batch.id.slice(0, 8)}.zip`)
+      setTimeout(() => URL.revokeObjectURL(url), 0)
+    } catch (error) {
+      if (mountedRef.current) notify(`ZIP 下载失败：${error.message}`, 'error')
+    } finally {
+      if (mountedRef.current) setZipLoadingId('')
+    }
+  }
+
   return (
-    <div className="mt-7 space-y-2">
-      {items.map((item) => (
-        <div key={item.task_id} className="rounded-lg border border-line bg-surface/35 px-4 py-3">
-          <div className="flex items-center gap-3">
-            {item.status === 'completed' ? (
-              <Check size={16} className="shrink-0 text-accent" />
-            ) : item.status === 'failed' ? (
-              <AlertTriangle size={16} className="shrink-0 text-danger" />
-            ) : (
-              <Loader2 size={16} className="shrink-0 animate-spin text-accent" />
-            )}
-            <span className="min-w-0 flex-1 truncate text-sm text-ink-100">{item.filename}</span>
-            <span className={`font-mono text-xs ${item.status === 'failed' ? 'text-danger' : 'text-ink-500'}`}>
-              {statusLabel[item.status] || item.status} · {item.progress || 0}%
-            </span>
-          </div>
-          <div className="mt-2 h-1 overflow-hidden rounded-full bg-surface-2">
-            <div
-              className={`h-full rounded-full ${item.status === 'failed' ? 'bg-danger' : 'bg-accent'}`}
-              style={{ width: `${item.progress || 0}%` }}
-            />
-          </div>
-          {item.error && <p className="mt-2 text-xs text-danger">{item.error}</p>}
-          <p className="mt-2 text-xs text-ink-500">
-            {languageLabel(item.detected_source_lang || item.source_lang)} → {languageLabel(item.target_lang)}
-            {item.translation_backends?.length ? ` · ${item.translation_backends.join(' / ')}` : ''}
-          </p>
-          {(item.ocr_backend || item.render_font) && (
-            <p className="mt-1 truncate text-[11px] text-ink-600">
-              OCR：{item.ocr_backend || '按区域路由'}{item.render_font ? ` · 字体：${item.render_font.split(/[\\/]/).pop()}` : ''}
-            </p>
-          )}
-        </div>
-      ))}
+    <div className="relative min-h-[calc(100vh-4rem)]">
+      <section className="mx-auto w-full max-w-5xl px-4 pb-[330px] pt-10 sm:px-6 md:pb-[270px]">
+        {!batches.length ? <EmptyConversation /> : null}
+        <AnimatePresence initial={false}>
+          {batches.map((batch) => (
+            <BatchMessage key={batch.id} batch={batch} zipLoading={zipLoadingId === batch.id}
+              retryingTaskId={retryingTaskId} onDownloadZip={() => downloadZip(batch)}
+              onRetry={(taskId) => retryItem(batch.id, taskId)} />
+          ))}
+        </AnimatePresence>
+        <div ref={endRef} />
+      </section>
+      <Composer files={files} sourceLang={sourceLang} targetLang={targetLang} totalBytes={totalBytes}
+        fileError={fileError} isDragging={isDragging} submitting={submitting}
+        languageInvalid={languageInvalid} inputRef={inputRef} onSourceLangChange={setSourceLang}
+        onTargetLangChange={setTargetLang} onFileSelect={handleFileSelect}
+        onRemoveFile={(index) => { setFiles((current) => current.filter((_, i) => i !== index)); setFileError('') }}
+        onDraggingChange={setIsDragging} onDrop={(event) => {
+          event.preventDefault(); setIsDragging(false); addFiles(event.dataTransfer.files)
+        }} onSubmit={submitBatch} />
     </div>
   )
 }
 
-function Pipeline({ currentStep, progress }) {
+function EmptyConversation() {
   return (
-    <div className="mt-8">
-      <div className="flex items-center">
-        {STEPS.map((s, i) => {
-          const done = i < currentStep
-          const active = i === currentStep
-          return (
-            <Fragment key={s.key}>
-              {i > 0 && (
-                <div className="relative h-px flex-1 overflow-hidden bg-line-strong">
-                  <motion.div
-                    className="absolute inset-y-0 left-0 bg-accent"
-                    initial={false}
-                    animate={{ width: i <= currentStep ? '100%' : '0%' }}
-                    transition={{ duration: 0.5 }}
-                  />
-                </div>
-              )}
-              <div className="flex flex-col items-center gap-2">
-                <motion.span
-                  animate={
-                    active
-                      ? { boxShadow: ['0 0 0 0 rgba(255,255,255,0.4)', '0 0 0 8px rgba(255,255,255,0)'] }
-                      : {}
-                  }
-                  transition={{ duration: 1.6, repeat: active ? Infinity : 0, ease: 'easeOut' }}
-                  className={`flex h-9 w-9 items-center justify-center rounded-full border text-xs font-medium transition-colors ${
-                    done
-                      ? 'border-accent bg-accent text-bg'
-                      : active
-                        ? 'border-accent bg-accent/15 text-accent'
-                        : 'border-line-strong bg-surface-2 text-ink-600'
-                  }`}
-                >
-                  {done ? <Check size={16} /> : <span className="font-mono">{i + 1}</span>}
-                </motion.span>
-                <span
-                  className={`font-mono text-[10px] uppercase tracking-wider ${
-                    active ? 'text-accent' : done ? 'text-ink-200' : 'text-ink-600'
-                  }`}
-                >
-                  {s.label}
-                </span>
-              </div>
-            </Fragment>
-          )
-        })}
+    <motion.div initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }}
+      className="flex min-h-[46vh] flex-col items-center justify-center text-center">
+      <div className="flex h-14 w-14 items-center justify-center rounded-2xl border border-line-strong bg-surface/80 shadow-[0_0_40px_-14px_rgba(255,255,255,0.35)]">
+        <Sparkles size={24} className="text-accent" />
       </div>
+      <h1 className="mt-6 font-display text-3xl font-semibold tracking-tight text-ink-100 sm:text-4xl">今天要翻译哪几页漫画？</h1>
+      <p className="mt-3 max-w-xl text-sm leading-6 text-ink-500 sm:text-base">
+        从底部选择或直接粘贴多张图片。每张图片会独立显示进度，完成一张就能立即预览和下载。
+      </p>
+      <div className="mt-7 flex flex-wrap justify-center gap-2 text-xs text-ink-500">
+        {['多图批量提交', '剪贴板粘贴', '逐张实时预览'].map((text) =>
+          <span key={text} className="rounded-full border border-line bg-surface/60 px-3 py-1.5">{text}</span>)}
+      </div>
+    </motion.div>
+  )
+}
+
+function BatchMessage({ batch, zipLoading, retryingTaskId, onDownloadZip, onRetry }) {
+  const stats = batchStats(batch)
+  return (
+    <motion.article initial={{ opacity: 0, y: 18 }} animate={{ opacity: 1, y: 0 }} className="mb-14 space-y-7">
+      <div className="ml-auto max-w-3xl">
+        <div className="rounded-2xl rounded-br-md border border-line-strong bg-surface-2/90 p-4 sm:p-5">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <p className="font-medium text-ink-100">翻译这 {batch.items.length} 张图片</p>
+            <p className="text-xs text-ink-500">{languageLabel(batch.sourceLang)} <ArrowRight size={12} className="mx-1 inline" /> {languageLabel(batch.targetLang)}</p>
+          </div>
+          <div className="mt-4 grid grid-cols-3 gap-2 sm:grid-cols-5 md:grid-cols-6">
+            {batch.items.map((item) => <OriginalThumb key={item.task_id} item={item} />)}
+          </div>
+        </div>
+        <p className="mt-2 text-right font-mono text-[10px] text-ink-600">
+          {new Date(batch.createdAt).toLocaleString('zh-CN', { hour12: false })}
+        </p>
+      </div>
+      <div className="flex gap-3 sm:gap-4">
+        <div className="mt-1 flex h-8 w-8 shrink-0 items-center justify-center rounded-xl border border-line-strong bg-surface text-accent"><Sparkles size={15} /></div>
+        <div className="min-w-0 flex-1">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <h2 className="font-display text-lg font-semibold text-ink-100">{stats.active ? '正在处理翻译任务' : '本批任务已处理完成'}</h2>
+              <p className="mt-1 text-sm text-ink-500">已完成 {stats.completed} 张 · 失败 {stats.failed} 张 · {stats.active ? `待处理 ${stats.active} 张` : '全部结束'}</p>
+            </div>
+            {stats.completed > 0 ? (
+              <button type="button" disabled={zipLoading} onClick={onDownloadZip}
+                className="inline-flex items-center gap-2 rounded-xl border border-line-strong bg-surface-2 px-3.5 py-2 text-sm text-ink-200 transition hover:border-accent/35 hover:text-ink-100 disabled:cursor-wait disabled:opacity-60">
+                {zipLoading ? <Loader2 size={15} className="animate-spin" /> : <ArrowDownToLine size={15} />} 下载本批 ZIP
+              </button>
+            ) : null}
+          </div>
+          <div className="mt-4 h-1 overflow-hidden rounded-full bg-surface-2">
+            <motion.div className="h-full rounded-full bg-gradient-to-r from-ink-500 to-accent"
+              animate={{ width: `${stats.progress}%` }} transition={{ type: 'spring', stiffness: 120, damping: 24 }} />
+          </div>
+          <div className="mt-5 space-y-4">
+            {batch.items.map((item) => <TaskCard key={item.task_id} item={item}
+              retrying={retryingTaskId === item.task_id} onRetry={() => onRetry(item.task_id)} />)}
+          </div>
+        </div>
+      </div>
+    </motion.article>
+  )
+}
+
+function OriginalThumb({ item }) {
+  return (
+    <div className="group relative aspect-[4/5] overflow-hidden rounded-lg border border-line bg-bg">
+      {item.previewUrl ? <img src={item.previewUrl} alt={item.filename} className="h-full w-full object-cover" /> : (
+        <div className="flex h-full flex-col items-center justify-center gap-2 px-2 text-center text-ink-600">
+          <ImageIcon size={20} /><span className="line-clamp-2 text-[9px]">刷新后原图不再缓存</span>
+        </div>
+      )}
+      <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/90 to-transparent px-2 pb-1.5 pt-6"><p className="truncate text-[10px] text-white/80">{item.filename}</p></div>
+    </div>
+  )
+}
+
+function TaskCard({ item, retrying, onRetry }) {
+  const progress = Math.max(0, Math.min(100, item.progress || 0))
+  const status = item.status === 'processing' ? 'processing' : item.status
+  const statusMeta = {
+    queued: { label: '等待中', icon: Clock3, color: 'text-ink-400' },
+    processing: { label: '处理中', icon: Loader2, color: 'text-accent' },
+    completed: { label: '已完成', icon: Check, color: 'text-ok' },
+    failed: { label: '失败', icon: AlertTriangle, color: 'text-danger' },
+  }[status] || { label: status || '等待中', icon: Clock3, color: 'text-ink-400' }
+  const StatusIcon = statusMeta.icon
+  const resultUrl = status === 'completed' ? getTaskResultUrl(item.task_id) : ''
+  return (
+    <motion.section layout className="overflow-hidden rounded-2xl border border-line bg-surface/70">
+      <div className="p-4 sm:p-5">
+        <div className="flex items-start gap-3">
+          <div className={`mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-surface-2 ${statusMeta.color}`}>
+            <StatusIcon size={16} className={status === 'processing' ? 'animate-spin' : ''} />
+          </div>
+          <div className="min-w-0 flex-1">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <p className="max-w-full truncate text-sm font-medium text-ink-100">{item.filename}</p>
+              <span className={`font-mono text-xs ${statusMeta.color}`}>{statusMeta.label}</span>
+            </div>
+            {status === 'queued' ? <p className="mt-1 text-xs text-ink-500">任务已进入队列，等待前序图片处理</p> : null}
+            {status === 'processing' ? <p className="mt-1 text-xs text-ink-500">{pipelineStage(progress)} · {progress}%</p> : null}
+            {status === 'completed' ? <p className="mt-1 text-xs text-ink-500">识别 {item.text_count || 0} 处文字{item.duration_ms ? ` · 耗时 ${formatDuration(item.duration_ms)}` : ''}{item.translation_backends?.length ? ` · ${item.translation_backends.join(' / ')}` : ''}</p> : null}
+            {status === 'failed' ? <p className="mt-2 rounded-lg border border-danger/20 bg-danger/5 px-3 py-2 text-xs leading-5 text-danger">{item.error || '翻译失败，请重新提交这张图片'}</p> : null}
+          </div>
+        </div>
+        {(status === 'queued' || status === 'processing') ? (
+          <div className="mt-4 h-1 overflow-hidden rounded-full bg-surface-2"><motion.div className="h-full rounded-full bg-accent" animate={{ width: `${progress}%` }} transition={{ type: 'spring', stiffness: 120, damping: 24 }} /></div>
+        ) : null}
+      </div>
+      {status === 'completed' ? (
+        <div className="border-t border-line bg-bg/40 p-3 sm:p-4"><div className="overflow-hidden rounded-xl border border-line bg-surface-2"><img src={resultUrl} alt={`${item.filename} 翻译结果`} className="max-h-[720px] w-full object-contain" /></div></div>
+      ) : null}
+      {(status === 'completed' || status === 'failed') ? (
+        <div className="flex flex-wrap items-center gap-2 border-t border-line px-4 py-3 sm:px-5">
+          {status === 'completed' ? <button type="button" onClick={() => triggerDownload(resultUrl, `translated_${item.filename}`)} className="inline-flex items-center gap-2 rounded-lg border border-line-strong bg-surface-2 px-3 py-2 text-xs text-ink-200 transition hover:text-ink-100"><ArrowDownToLine size={14} />下载图片</button> : null}
+          <button type="button" disabled={!item.file || retrying} onClick={onRetry}
+            title={item.file ? '使用原图重新创建翻译任务' : '页面刷新后需重新选择原图才能重新翻译'}
+            className="inline-flex items-center gap-2 rounded-lg border border-line-strong px-3 py-2 text-xs text-ink-400 transition hover:bg-surface-2 hover:text-ink-100 disabled:cursor-not-allowed disabled:opacity-40">
+            {retrying ? <Loader2 size={14} className="animate-spin" /> : <RefreshCw size={14} />}重新翻译
+          </button>
+          {!item.file ? <span className="text-[11px] text-ink-600">刷新后重新翻译需再次选择原图</span> : null}
+        </div>
+      ) : null}
+    </motion.section>
+  )
+}
+
+function Composer({ files, sourceLang, targetLang, totalBytes, fileError, isDragging, submitting,
+  languageInvalid, inputRef, onSourceLangChange, onTargetLangChange, onFileSelect,
+  onRemoveFile, onDraggingChange, onDrop, onSubmit }) {
+  return (
+    <div className="fixed inset-x-0 bottom-0 z-40 border-t border-line bg-bg/88 px-3 pb-4 pt-3 backdrop-blur-2xl sm:px-6 sm:pb-6">
+      <div className={`mx-auto max-w-4xl rounded-2xl border bg-surface/95 p-3 shadow-[0_-18px_60px_-35px_rgba(255,255,255,0.28)] transition sm:p-4 ${isDragging ? 'border-accent/60 ring-4 ring-accent/10' : 'border-line-strong'}`}
+        onDragOver={(event) => { event.preventDefault(); onDraggingChange(true) }}
+        onDragLeave={(event) => { if (!event.currentTarget.contains(event.relatedTarget)) onDraggingChange(false) }} onDrop={onDrop}>
+        <input ref={inputRef} type="file" accept={ALLOWED} multiple className="hidden" onChange={onFileSelect} />
+        {files.length ? <div className="mb-3 flex max-h-24 gap-2 overflow-x-auto pb-1">
+          {files.map((file, index) => <PendingFile key={`${file.name}-${file.size}-${file.lastModified}-${index}`} file={file} onRemove={() => onRemoveFile(index)} />)}
+        </div> : null}
+        <div className="flex items-center gap-2">
+          <button type="button" onClick={() => inputRef.current?.click()} className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border border-line text-ink-400 transition hover:bg-surface-2 hover:text-ink-100" aria-label="选择图片" title="选择多张图片"><Paperclip size={18} /></button>
+          <div className="min-w-0 flex-1">
+            <p className="truncate text-sm text-ink-200">{files.length ? `已选择 ${files.length} 张图片 · ${formatBytes(totalBytes)}` : '选择、拖入或粘贴漫画图片'}</p>
+            <p className="mt-0.5 hidden items-center gap-1.5 text-[11px] text-ink-600 sm:flex"><Clipboard size={11} /> 支持 JPG / PNG / WebP / BMP，单张不超过 10MB</p>
+          </div>
+          <button type="button" disabled={!files.length || submitting || languageInvalid} onClick={onSubmit}
+            className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-accent text-bg transition hover:bg-accent-strong disabled:cursor-not-allowed disabled:bg-surface-2 disabled:text-ink-600" aria-label="提交翻译" title="提交翻译">
+            {submitting ? <Loader2 size={18} className="animate-spin" /> : <ArrowUp size={19} />}
+          </button>
+        </div>
+        <div className="mt-3 flex flex-wrap items-center gap-2 border-t border-line pt-3">
+          <CompactLangSelect value={sourceLang} options={LANGUAGE_OPTIONS} onChange={onSourceLangChange} label="源语言" />
+          <ArrowRight size={14} className="text-ink-600" />
+          <CompactLangSelect value={targetLang} options={TARGET_OPTIONS} onChange={onTargetLangChange} label="目标语言" />
+          {languageInvalid ? <span className="text-xs text-danger">源语言和目标语言不能相同</span> : null}
+          {fileError ? <span className="flex min-w-0 items-center gap-1.5 text-xs text-danger" role="alert"><AlertTriangle size={13} className="shrink-0" /><span className="truncate">{fileError}</span></span> : null}
+        </div>
+      </div>
+      <p className="mx-auto mt-2 max-w-4xl text-center text-[10px] text-ink-600">翻译任务按顺序执行，关闭或刷新页面后仍会继续处理</p>
+    </div>
+  )
+}
+
+function CompactLangSelect({ value, options, onChange, label }) {
+  return (
+    <label className="relative"><span className="sr-only">{label}</span>
+      <select value={value} onChange={(event) => onChange(event.target.value)} className="appearance-none rounded-lg border border-line bg-surface-2 py-1.5 pl-3 pr-8 text-xs text-ink-300 outline-none transition focus:border-accent/40">
+        {options.map((option) => <option key={option.value} value={option.value} className="bg-surface-2">{option.label}</option>)}
+      </select>
+      <ChevronDown size={12} className="pointer-events-none absolute right-2.5 top-1/2 -translate-y-1/2 text-ink-500" />
+    </label>
+  )
+}
+
+function PendingFile({ file, onRemove }) {
+  const [previewUrl, setPreviewUrl] = useState('')
+  useEffect(() => {
+    const url = URL.createObjectURL(file)
+    setPreviewUrl(url)
+    return () => URL.revokeObjectURL(url)
+  }, [file])
+  return (
+    <div className="relative h-20 w-16 shrink-0 overflow-hidden rounded-lg border border-line bg-surface-2">
+      {previewUrl ? <img src={previewUrl} alt={file.name} className="h-full w-full object-cover" /> : <FileImage size={18} />}
+      <button type="button" onClick={onRemove} className="absolute right-1 top-1 flex h-5 w-5 items-center justify-center rounded-full bg-black/75 text-white transition hover:bg-danger" aria-label={`移除 ${file.name}`}><X size={11} /></button>
+      <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/90 to-transparent px-1 pb-1 pt-4"><p className="truncate text-[8px] text-white/80">{file.name}</p></div>
     </div>
   )
 }
