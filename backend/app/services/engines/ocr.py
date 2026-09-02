@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -1383,7 +1384,7 @@ class LanguageRoutingOCREngine(BaseOCR):
 
     @staticmethod
     def _choose_candidate(candidates, hint, page_hint=""):
-        usable = [c for c in candidates if (c.get("text") or "").strip() and c.get("lang")]
+        usable = [c for c in candidates if (c.get("text") or "").strip()]
         if not usable:
             return None
         ranked = []
@@ -1399,19 +1400,29 @@ class LanguageRoutingOCREngine(BaseOCR):
                 for ch in meaningful
             )
             page_resolves_han = cjk_only and page_hint in {"zh", "ja"}
-            if detection.language == candidate["lang"] and not (
-                page_resolves_han and candidate["lang"] != page_hint
-            ):
+            resolved = dict(candidate)
+            resolved_lang = candidate.get("lang") or page_hint
+            if detection.confidence >= 0.55 and detection.language == page_hint:
+                resolved_lang = detection.language
+            elif page_resolves_han:
+                resolved_lang = page_hint
+            resolved["lang"] = resolved_lang
+
+            if detection.language == resolved_lang:
                 score += 0.22 * detection.confidence
-            elif detection.confidence >= 0.55 and not (
-                page_resolves_han and candidate["lang"] == page_hint
-            ):
+            elif detection.confidence >= 0.55:
                 score -= 0.16
-            if hint and hint.language == candidate["lang"] and not page_resolves_han:
+            if hint and hint.language == resolved_lang and not page_resolves_han:
                 score += 0.08
-            if page_resolves_han and candidate["lang"] == page_hint:
-                score += 0.18
-            ranked.append((score, candidate))
+            if page_resolves_han and resolved_lang == page_hint:
+                score += 0.06
+            if page_hint == "ja" and detection.language == "ja" and detection.confidence >= 0.55:
+                score += 0.22
+            if page_hint == "ja" and detection.language == "en":
+                latin_words = re.findall(r"[A-Za-z]+", candidate["text"])
+                if latin_words and not any(len(word) >= 3 for word in latin_words):
+                    score -= 0.55
+            ranked.append((score, resolved))
         ranked.sort(key=lambda item: (item[0], len(item[1].get("text", ""))), reverse=True)
         return ranked[0][1]
 

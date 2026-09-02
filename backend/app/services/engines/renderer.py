@@ -23,6 +23,8 @@ from app.models.schemas import LangCode
 from app.services.engines.base import BaseRenderer
 from app.services.pipeline import TextRegion
 
+PROJECT_FONT_DIR = Path(__file__).resolve().parents[3] / "data" / "fonts"
+
 # 中文字体候选（Windows / Linux）
 FONT_CANDIDATES = [
     "C:/Windows/Fonts/msyh.ttc",  # 微软雅黑
@@ -42,6 +44,8 @@ FONT_CANDIDATES_BY_LANG = {
         "C:/Windows/Fonts/msyhbd.ttc",
         "C:/Windows/Fonts/simhei.ttf",
         "C:/Windows/Fonts/msjh.ttc",
+        str(PROJECT_FONT_DIR / "NotoSansSC-VF.ttf"),
+        str(PROJECT_FONT_DIR / "NotoSerifSC-VF.ttf"),
         "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
         "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
         "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
@@ -60,6 +64,16 @@ FONT_CANDIDATES_BY_LANG = {
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
     ],
 }
+
+FONT_PRESETS = [
+    {"value": "", "label": "原始默认（微软雅黑）", "category": "默认", "css_family": "Microsoft YaHei", "weight": 400},
+    {"value": str(PROJECT_FONT_DIR / "NotoSansSC-VF.ttf"), "label": "清晰对白", "category": "默认", "css_family": "MangaNotoSansSC", "weight": 400},
+    {"value": str(PROJECT_FONT_DIR / "NotoSerifSC-VF.ttf"), "label": "复古宋体", "category": "复古", "css_family": "MangaNotoSerifSC", "weight": 400},
+    {"value": str(PROJECT_FONT_DIR / "ZCOOLKuaiLe-Regular.ttf"), "label": "搞笑圆体", "category": "搞笑", "css_family": "MangaZCOOLKuaiLe", "weight": 400},
+    {"value": str(PROJECT_FONT_DIR / "ZCOOLXiaoWei-Regular.ttf"), "label": "艺术标题", "category": "艺术", "css_family": "MangaZCOOLXiaoWei", "weight": 400},
+    {"value": str(PROJECT_FONT_DIR / "MaShanZheng-Regular.ttf"), "label": "古风手写", "category": "古风", "css_family": "MangaMaShanZheng", "weight": 400},
+    {"value": str(PROJECT_FONT_DIR / "LongCang-Regular.ttf"), "label": "潦草手写", "category": "手写", "css_family": "MangaLongCang", "weight": 400},
+]
 
 # 竖排字距系数（字号 * 该系数 = 相邻字符垂直间距）
 VERTICAL_CHAR_RATIO = 1.15
@@ -110,7 +124,7 @@ class PILRenderer(BaseRenderer):
     name = "pil"
 
     def __init__(self):
-        self._font_cache: dict[tuple[str, int], ImageFont.FreeTypeFont] = {}
+        self._font_cache: dict[tuple[str, int, int], ImageFont.FreeTypeFont] = {}
         self._glyph_cache: dict[str, set[int] | None] = {}
         self._font_paths = {lang: self._find_font(lang) for lang in FONT_CANDIDATES_BY_LANG}
         self._font_path = self._font_paths.get("zh") or self._find_font("zh")
@@ -147,20 +161,52 @@ class PILRenderer(BaseRenderer):
                 return p
         return None
 
+    def available_fonts(self) -> list[dict[str, str]]:
+        return [dict(item) for item in FONT_PRESETS if not item["value"] or Path(item["value"]).exists()]
+
+    def _resolve_font(self, value: str | None) -> str | None:
+        if not value:
+            return None
+        allowed = {item["value"] for item in self.available_fonts()}
+        return value if value in allowed else None
+
     def _get_font(self, size: int, target_lang: str | None = None) -> ImageFont.FreeTypeFont:
         target_lang = target_lang or self._active_target_lang
         size = max(1, int(size))
         path = self._active_font_path if target_lang == self._active_target_lang else self._font_paths.get(target_lang)
         path = path or self._font_path
-        key = (path or target_lang, size)
+        weight = max(100, min(900, int(getattr(self, "_active_style", {}).get("font_weight") or 400)))
+        path = self._font_path_for_weight(path, weight)
+        key = (path or target_lang, size, weight)
         if key in self._font_cache:
             return self._font_cache[key]
         if path:
             font = ImageFont.truetype(path, size)
+            if weight >= 500:
+                try:
+                    axes = font.get_variation_axes()
+                    weight_axis = next((index for index, axis in enumerate(axes) if axis.get("tag") == b"wght" or axis.get("name") == b"Weight"), None)
+                    if weight_axis is not None:
+                        values = [axis["default"] for axis in axes]
+                        values[weight_axis] = weight
+                        font.set_variation_by_axes(values)
+                except (AttributeError, OSError, ValueError):
+                    pass
         else:
             font = ImageFont.load_default()
         self._font_cache[key] = font
         return font
+
+    @staticmethod
+    def _font_path_for_weight(path: str | None, weight: int) -> str | None:
+        if not path or weight < 600:
+            return path
+        regular = Path(path)
+        if regular.name.lower() == "msyh.ttc":
+            bold = regular.with_name("msyhbd.ttc")
+            if bold.exists():
+                return str(bold)
+        return path
 
     def _select_font_for_text(self, target_lang: str, text: str) -> str | None:
         """选择实际存在且覆盖页面字符的字体；无法读取 cmap 时退回首个可用字体。"""
@@ -215,6 +261,7 @@ class PILRenderer(BaseRenderer):
         )
         render_text, _ = self._bounded_text(render_text)
         self._active_font_path = self._select_font_for_text(self._active_target_lang, render_text)
+        default_font_path = self._active_font_path
         logger.info("[render] 字体准备完成：文本长度=%s", len(render_text))
         self.last_font_path = self._active_font_path or ""
         for region in regions:
@@ -237,6 +284,18 @@ class PILRenderer(BaseRenderer):
         overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
 
         for fallback_index, (_bubble, group_regions) in enumerate(groups):
+            style_region = group_regions[0]
+            self._active_style = {
+                "font_size": getattr(style_region, "style_font_size", None),
+                "font_family": getattr(style_region, "style_font_family", ""),
+                "font_weight": getattr(style_region, "style_font_weight", None),
+            }
+            render_weight = max(100, min(900, int(self._active_style["font_weight"] or 400)))
+            for item in group_regions:
+                item.render_font_weight = render_weight
+            custom_font = self._resolve_font(self._active_style["font_family"])
+            self._active_font_path = custom_font or default_font_path
+            self.last_font_path = self._active_font_path or ""
             group_index = next((r.group_index for r in group_regions if r.group_index is not None), fallback_index)
             group_bounds = next((r.group_bounds for r in group_regions if r.group_bounds), None)
             self._active_group_context = (group_index, group_bounds, target_value)
@@ -262,6 +321,8 @@ class PILRenderer(BaseRenderer):
                 continue
             bx0, by0, bx1, by1 = bb
             bw, bh = bx1 - bx0, by1 - by0
+            for region in group_regions:
+                region.render_box = (bx0, by0, bx1, by1)
             logger.info("[render] 气泡几何结果：group_index=%s，bbox=%s，尺寸=%sx%s，掩膜=%s", group_index, bb, bw, bh, mask is not None)
             self._diagnose("气泡%s几何完成：bbox=%s，掩膜=%s，尺寸=%sx%s", group_index, bb, mask is not None, bw, bh)
             if bw <= 0 or bh <= 0 or bw * bh > MAX_RENDER_GROUP_PIXELS:
@@ -272,11 +333,19 @@ class PILRenderer(BaseRenderer):
             fill, stroke = self._text_colors(group_regions)
             group_overlay = Image.new("RGBA", (bw, bh), (0, 0, 0, 0))
             odraw = ImageDraw.Draw(group_overlay)
+            self._last_render_font_size = None
+            self._active_layout_plan = None
             layout_started = time.monotonic()
             logger.info("[render] 气泡布局开始：group_index=%s，方向=%s，尺寸=%sx%s，文本长度=%s", group_index, "竖排" if self._use_vertical(group_regions, bw, bh) and target_value != "en" else "横排", bw, bh, len(block or ""))
             self._render_group_layout(
                 odraw, group_regions, block, bw, bh, min_font_size, target_value, fill, stroke
             )
+            effective_font_size = getattr(self, "_last_render_font_size", None)
+            for region in group_regions:
+                region._last_render_font_size = effective_font_size
+                region.render_layout = getattr(self, "_active_layout_plan", None)
+                if not self._active_style.get("font_size") and effective_font_size:
+                    region.render_font_size = effective_font_size
             logger.info("[render] 气泡布局结束：group_index=%s，耗时=%.1fms", group_index, (time.monotonic() - layout_started) * 1000)
             self._diagnose("气泡%s布局耗时：%.1fms", group_index, (time.monotonic() - layout_started) * 1000)
 
@@ -304,6 +373,17 @@ class PILRenderer(BaseRenderer):
             composite_started = time.monotonic()
             keep = np.minimum(group_alpha, group_clip).astype(np.uint8)
             group_overlay.putalpha(Image.fromarray(keep, "L"))
+            visible_y, visible_x = np.nonzero(keep)
+            if visible_x.size and visible_y.size:
+                text_padding = max(3, int((effective_font_size or min_font_size or 12) * 0.25))
+                render_bounds = (
+                    max(0, bx0 + int(visible_x.min()) - text_padding),
+                    max(0, by0 + int(visible_y.min()) - text_padding),
+                    min(img_w, bx0 + int(visible_x.max()) + 1 + text_padding),
+                    min(img_h, by0 + int(visible_y.max()) + 1 + text_padding),
+                )
+                for region in group_regions:
+                    region.render_bounds = render_bounds
             overlay.alpha_composite(group_overlay, dest=(bx0, by0))
             logger.info("[render] 气泡 alpha 合成完成：group_index=%s，耗时=%.1fms", group_index, (time.monotonic() - composite_started) * 1000)
             logger.info("[render] 气泡完成：group_index=%s", group_index)
@@ -376,12 +456,40 @@ class PILRenderer(BaseRenderer):
         if x1 <= x0 or y1 <= y0:
             return None, None
 
+        if any(getattr(region, "source", "ocr") == "manual" or getattr(region, "layout_bounds_override", False) for region in group_regions):
+            override_bounds = next((region.group_bounds for region in group_regions if region.group_bounds), (x0, y0, x1, y1))
+            mx0, my0, mx1, my1 = [int(value) for value in override_bounds]
+            return (
+                max(0, min(img_w, mx0)), max(0, min(img_h, my0)),
+                max(0, min(img_w, mx1)), max(0, min(img_h, my1)),
+            ), None
+
         def tight():
             return (
                 max(0, x0 + 1),
                 max(0, y0 + 1),
                 min(img_w, x1 - 1),
                 min(img_h, y1 - 1),
+            )
+
+        # 二级：有限安全扩展框（锚点外扩，受边缘/纹理/分镜线约束）。它是
+        # 唯一绝不穿越气泡轮廓/分镜线的几何：泛洪在相邻气泡连通时可能泄漏，
+        # 但安全框能正确停在锚点附近。先算一次，作为下方所有候选框的硬上限。
+        safe = self._safe_expand_box(bgr, x0, y0, x1, y1, img_w, img_h)
+
+        def clamp(v, lo, hi):
+            return max(lo, min(hi, v))
+
+        def within_safe(bb):
+            """候选框任一方向明显越过安全框则拒绝（防泛洪泄漏穿出分镜线）。"""
+            if safe is None:
+                return True
+            margin = max(4, int(0.10 * max(safe[2] - safe[0], safe[3] - safe[1])))
+            return not (
+                bb[0] < safe[0] - margin
+                or bb[1] < safe[1] - margin
+                or bb[2] > safe[2] + margin
+                or bb[3] > safe[3] + margin
             )
 
         # 优先复用分组阶段在同一张修复图上确认的容器，避免渲染阶段重新泛洪得到不同区域。
@@ -396,15 +504,18 @@ class PILRenderer(BaseRenderer):
         if stored_mask is not None and bool(stored_mask.any()):
             ys, xs = np.where(stored_mask > 0)
             stored_bb = (int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1)
-            if self._mask_reliable(
+            if within_safe(stored_bb) and self._mask_reliable(
                 stored_bb, stored_mask, group_regions, (x0, y0, x1, y1), img_w, img_h
             ):
                 return stored_bb, stored_mask
 
         # 一级：可靠气泡掩膜
         bb, mask = bubble_with_mask(bgr, (x0, y0, x1, y1), img_w, img_h)
-        if mask is not None and mask.any() and self._mask_reliable(
-            bb, mask, group_regions, (x0, y0, x1, y1), img_w, img_h
+        if (
+            mask is not None
+            and mask.any()
+            and within_safe(bb)
+            and self._mask_reliable(bb, mask, group_regions, (x0, y0, x1, y1), img_w, img_h)
         ):
             return bb, mask
 
@@ -419,10 +530,37 @@ class PILRenderer(BaseRenderer):
             if union_area > region_area * 3.0:
                 return None, None
 
-        # 二级：有限安全扩展框（锚点外扩，受边缘/纹理约束）
-        safe = self._safe_expand_box(bgr, x0, y0, x1, y1, img_w, img_h)
+        # group_bounds 由分组阶段泛洪确认、并经校验，是真实气泡的安全包围盒。
+        # 成员 bounds 仅覆盖文字区（尤其竖排多列时很窄），导致 safe_expand 从
+        # 成员锚点出发会停在扁小框、把竖排译文挤变形；故用 group_bounds 兜底/撑大。
+        gb0 = next((r.group_bounds for r in group_regions if r.group_bounds), None)
+        gb0 = (
+            (
+                max(0, min(img_w, int(gb0[0]))),
+                max(0, min(img_h, int(gb0[1]))),
+                max(0, min(img_w, int(gb0[2]))),
+                max(0, min(img_h, int(gb0[3]))),
+            )
+            if gb0 is not None
+            else None
+        )
+
+        # safe 已是受约束几何，作为默认框；但与 group_bounds 取并集，避免因锚点过窄
+        # 而把框压缩到真实气泡以内（group_bounds 本身是安全的受约束包围盒）。
         if safe is not None:
+            if gb0 is not None:
+                safe = (
+                    min(safe[0], gb0[0]),
+                    min(safe[1], gb0[1]),
+                    max(safe[2], gb0[2]),
+                    max(safe[3], gb0[3]),
+                )
             return safe, None
+
+        # safe 无扩展空间（四周皆描边/纹理）时，直接用 group_bounds 作为受约束框，
+        # 而不是回退到更窄的紧致文本框（后者会把竖排译文挤压变形）。
+        if gb0 is not None and gb0[2] - gb0[0] >= 6 and gb0[3] - gb0[1] >= 6:
+            return gb0, None
 
         # 三级：紧致文本框兜底
         t = tight()
@@ -550,8 +688,25 @@ class PILRenderer(BaseRenderer):
             return True
         if h > v:
             return False
-        # 无方向信息时按形状：高明显大于宽 → 竖排
+        # 平票：用各 region 自身纵横比二次判定。气泡内混入的近方形/横排误检
+        # （低置信度）会污染整体 shape，而真正的竖排主列是窄高条（h/w 明显 >1）。
+        # 按 region 形态投票，避免竖排文字被误检拉成横排导致重叠。
         ratio = min_ratio if min_ratio is not None else 1.2
+        if len(group_regions) > 1:
+            tall = 0
+            wide = 0
+            for r in group_regions:
+                rw = r.bounds[2] - r.bounds[0]
+                rh = r.bounds[3] - r.bounds[1]
+                if rw <= 0 or rh <= 0:
+                    continue
+                if rh / rw > ratio:
+                    tall += 1
+                elif rw / rh > ratio:
+                    wide += 1
+            if tall != wide:
+                return tall > wide
+        # 单 region / 全部中性：退回气泡整体形状：高明显大于宽 → 竖排
         return bh > bw * ratio
 
     @staticmethod
@@ -570,6 +725,9 @@ class PILRenderer(BaseRenderer):
             lum = 0.299 * bg[0] + 0.587 * bg[1] + 0.114 * bg[2]
             if lum > 160:
                 stroke = bg
+        custom = getattr(group_regions[0], "style_color", None) if group_regions else None
+        if custom and len(custom) == 3:
+            fill = tuple(max(0, min(255, int(value))) for value in custom)
         return fill, stroke
 
     @staticmethod
@@ -754,10 +912,18 @@ class PILRenderer(BaseRenderer):
         if avail_w <= 1 or avail_h <= 1:
             return
         max_font = min(MAX_RENDER_FONT_SIZE, max(1, int(bh * MAX_FONT_RATIO)))
-        local_min_font = min(max_font, max(1, min_font_size))
+        requested = self._active_style.get("font_size") if hasattr(self, "_active_style") else None
+        if requested:
+            font_size = min(MAX_RENDER_FONT_SIZE, max(1, int(requested)))
+            local_min_font = font_size
+            max_font = font_size
+        else:
+            local_min_font = min(max_font, max(1, min_font_size))
         group_index = getattr(self, "_active_group_context", (-1, None, ""))[0]
         logger.info("[render] 横排字号选择开始：group_index=%s，字号范围=%s-%s", group_index, local_min_font, max_font)
-        font_size = self._select_horizontal_font(draw, text, avail_w, avail_h, max_font, local_min_font)
+        if not requested:
+            font_size = self._select_horizontal_font(draw, text, avail_w, avail_h, max_font, local_min_font)
+        self._last_render_font_size = font_size
         logger.info("[render] 横排字号选择结束：group_index=%s，字号=%s", group_index, font_size)
 
         font = self._get_font(font_size)
@@ -775,6 +941,21 @@ class PILRenderer(BaseRenderer):
         cy = by0 + bh / 2
         tx = cx - tw / 2 + sw
         ty = cy - th / 2 + sw
+        try:
+            ascent, descent = font.getmetrics()
+            line_height = max(1, ascent + descent)
+        except (AttributeError, OSError, ValueError):
+            line_height = max(1, int(font_size * 1.4))
+        self._active_layout_plan = {
+            "direction": "h",
+            "font_size": font_size,
+            "lines": wrapped,
+            "center_x": cx,
+            "top": ty,
+            "line_height": line_height,
+            "spacing": spacing,
+            "stroke_width": sw,
+        }
 
         logger.info("[render] 横排 PIL 绘制开始：group_index=%s", group_index)
         draw.multiline_text(
@@ -872,8 +1053,17 @@ class PILRenderer(BaseRenderer):
             return
         col_gap = avail_w / n
         longest = max(len(t) for t in texts)
-        font_size = int(min(col_gap * VERTICAL_COL_USE_RATIO, avail_h / max(1, longest * VERTICAL_CHAR_RATIO)))
+        auto_font_size = int(min(col_gap * VERTICAL_COL_USE_RATIO, avail_h / max(1, longest * VERTICAL_CHAR_RATIO)))
+        requested = self._active_style.get("font_size") if hasattr(self, "_active_style") else None
+        if requested:
+            requested = max(1, int(requested))
+            if requested > auto_font_size:
+                return
+            font_size = requested
+        else:
+            font_size = auto_font_size
         font_size = max(1, font_size)
+        self._last_render_font_size = font_size
 
         font = self._get_font(font_size)
         sw = max(1, int(font_size * STROKE_RATIO))
@@ -881,6 +1071,20 @@ class PILRenderer(BaseRenderer):
         # 整组对称居中（从右到左依次排布）
         total_w = n * col_gap
         left = bx0 + (bw - total_w) / 2
+        column_positions = []
+        for i, text_value in enumerate(texts):
+            column_positions.append({
+                "text": text_value,
+                "center_x": left + col_gap * (n - i - 0.5),
+                "top": by0 + (bh - len(text_value) * char_h) / 2,
+            })
+        self._active_layout_plan = {
+            "direction": "v",
+            "font_size": font_size,
+            "columns": column_positions,
+            "char_height": char_h,
+            "stroke_width": sw,
+        }
         for i, t in enumerate(texts):
             total_h = len(t) * char_h
             ty = by0 + (bh - total_h) / 2
@@ -920,7 +1124,10 @@ class PILRenderer(BaseRenderer):
 
         font_size, columns, char_h = self._vertical_layout(lines, avail_w, avail_h, min_font_size)
         if font_size <= 0 or not columns:
+            font_size, columns, char_h = self._vertical_layout(lines, avail_w, avail_h, 1)
+        if font_size <= 0 or not columns:
             return
+        self._last_render_font_size = font_size
         font = self._get_font(font_size)
         sw = max(1, int(font_size * STROKE_RATIO))
 
@@ -930,6 +1137,16 @@ class PILRenderer(BaseRenderer):
         left = bx0 + (bw - total_w) / 2
         max_col = max(len(c) for c in columns)
         group_top = by0 + (bh - max_col * char_h) / 2
+        self._active_layout_plan = {
+            "direction": "v",
+            "font_size": font_size,
+            "columns": [
+                {"text": col, "center_x": left + col_gap * (n - col_idx - 0.5), "top": group_top}
+                for col_idx, col in enumerate(columns)
+            ],
+            "char_height": char_h,
+            "stroke_width": sw,
+        }
         for col_idx, col in enumerate(columns):
             # columns 保持源文本的右到左顺序，因此第 0 列位于最右侧。
             cx = left + col_gap * (n - col_idx - 0.5)
@@ -956,7 +1173,12 @@ class PILRenderer(BaseRenderer):
             return 0, [], 0
         total = sum(len(line) for line in lines)
         upper = min(MAX_RENDER_FONT_SIZE, max(1, int(avail_w * VERTICAL_COL_USE_RATIO)))
-        lower = min(upper, max(1, int(min_font_size)))
+        requested = self._active_style.get("font_size") if hasattr(self, "_active_style") else None
+        if requested:
+            upper = min(MAX_RENDER_FONT_SIZE, max(1, int(requested)))
+            lower = upper
+        else:
+            lower = min(upper, max(1, int(min_font_size)))
         step = max(1, math.ceil((upper - lower + 1) / MAX_VERTICAL_FONT_TRIES))
         candidates = list(range(upper, lower - 1, -step))
         if candidates[-1] != lower:
@@ -1009,40 +1231,66 @@ class PILRenderer(BaseRenderer):
 
     @staticmethod
     def _split_semantic_columns(text: str, capacity: int) -> list[str]:
-        """在容量约束内均衡切列，优先标点边界并避免拆开常见中文双字/连接词。"""
+        """在容量约束内按词边界切列，避免把中文词从中间拆开导致读起来错乱。
+
+        用 jieba 分词得到词序列，把词作为不可拆单元装进各列；仅当某个词本身
+        超过单列容量（罕见）才硬切。优先让闭合标点收尾一列。
+        """
         if capacity <= 0 or len(text) <= capacity:
             return [text]
-        no_split = {
-            "祖先", "土地", "所以", "但是", "已经", "这个", "没有", "就是", "属于",
-            "必须", "自己", "别人", "时候", "起来", "理解", "敌人", "文化", "大家",
-            "想法", "白人", "金钱", "保护", "一直", "这么", "地方", "有钱",
-        }
+
+        def _tokens(s: str) -> list[str]:
+            try:
+                import jieba
+
+                words = [w for w in jieba.lcut(s, cut_all=False) if w.strip()]
+                return words or list(s)
+            except Exception:  # noqa: BLE001  jieba 未安装/初始化失败时退回逐字
+                return list(s)
+
         closing = set("，。！？；：、…」』）】》,.!?;:")
-        opening = set("「『（【《")
-        remaining = text
+
+        def split_word(word: str):
+            # 超长词兜底：按 capacity 硬切
+            return [word[i:i + capacity] for i in range(0, len(word), capacity)] if len(word) > capacity else [word]
+
         result: list[str] = []
-        while len(remaining) > capacity:
-            columns_left = max(2, (len(remaining) + capacity - 1) // capacity)
-            target = min(capacity, max(1, (len(remaining) + columns_left - 1) // columns_left))
-            lo = max(1, target - 3)
-            hi = min(capacity, target + 3, len(remaining) - 1)
-            best_cut, best_score = target, float("-inf")
-            for cut in range(lo, hi + 1):
-                left, right = remaining[:cut], remaining[cut:]
-                score = -abs(cut - target)
-                if left[-1] in closing:
-                    score += 8
-                if right[0] in closing or left[-1] in opening:
-                    score -= 12
-                if left[-1] + right[0] in no_split:
-                    score -= 16
-                if score > best_score:
-                    best_cut, best_score = cut, score
-            result.append(remaining[:best_cut])
-            remaining = remaining[best_cut:]
-        if remaining:
-            result.append(remaining)
-        return result
+        cur = ""
+        for token in _tokens(text):
+            # 拆出超长词片段
+            for piece in split_word(token):
+                if len(cur) + len(piece) > capacity:
+                    # 当前列装不下 → 结算当前列，再开新列
+                    if cur:
+                        result.append(cur)
+                        cur = ""
+                cur += piece
+        if cur:
+            result.append(cur)
+
+        if len(result) <= 1:
+            return [text]
+
+        # 闭合标点不置于列首：把以闭合标点开头的列，其标点移到前一列末尾。
+        # 归并允许少量超出容量（容纳尾随的 1~2 个标点），但拒绝一次性塞入整段
+        # 标点（如 "……！"）——那样会制造超长列、把字号崩到难读。
+        punct_slack = 2
+        fixed: list[str] = []
+        for col in result:
+            if fixed and col and col[0] in closing:
+                lead = col[0]
+                while len(lead) < len(col) and col[len(lead)] in closing:
+                    lead += col[len(lead)]
+                if len(fixed[-1]) + len(lead) <= capacity + punct_slack:
+                    fixed[-1] += lead
+                    if len(lead) < len(col):
+                        fixed.append(col[len(lead):])
+                else:
+                    # 归并会造出明显超长列：保留当前列（宁可个别标点顶到列首）
+                    fixed.append(col)
+            else:
+                fixed.append(col)
+        return fixed
 
     @staticmethod
     def _multiline_size(font: ImageFont.FreeTypeFont, lines: list[str], stroke_width: int, spacing: int) -> tuple[float, float]:

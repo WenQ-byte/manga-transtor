@@ -794,6 +794,50 @@ class TestMultilingualOcrRouting(unittest.TestCase):
         )
         self.assertEqual(chosen["lang"], "ja")
 
+    def test_japanese_page_prefers_kana_candidate_even_from_chinese_ocr(self):
+        from app.services.engines.ocr import LanguageRoutingOCREngine
+        from app.services.language import region_language_hint
+
+        candidates = [
+            {"engine": "paddle", "lang": "zh", "text": "“神” か み", "confidence": 0.9515},
+            {"engine": "paddle", "lang": "ja", "text": "神 办 反", "confidence": 0.9996},
+        ]
+        chosen = LanguageRoutingOCREngine._choose_candidate(
+            candidates,
+            region_language_hint("ﾞ神ﾞ", "ja"),
+            "ja",
+        )
+        self.assertEqual(chosen["text"], "“神” か み")
+        self.assertEqual(chosen["lang"], "ja")
+
+    def test_japanese_page_penalizes_short_latin_gibberish(self):
+        from app.services.engines.ocr import LanguageRoutingOCREngine
+
+        candidates = [
+            {"engine": "paddle", "lang": "en", "text": "IV IU 1", "confidence": 0.84},
+            {"engine": "paddle", "lang": "ja", "text": "ふん…", "confidence": 0.31},
+        ]
+        chosen = LanguageRoutingOCREngine._choose_candidate(candidates, None, "ja")
+        self.assertEqual(chosen["text"], "ふん…")
+
+    def test_japanese_page_preserves_suspicious_fallback_gibberish(self):
+        from app.services.pipeline import TextRegion, suspicious_japanese_ocr
+
+        for text in ("IV IU 1", "u ル", '7" π'):
+            region = TextRegion(
+                box=[[0, 0], [20, 0], [20, 60], [0, 60]],
+                text=text,
+                ocr_fallback=True,
+            )
+            self.assertTrue(suspicious_japanese_ocr(region, "ja"), text)
+
+        dialogue = TextRegion(
+            box=[[0, 0], [20, 0], [20, 60], [0, 60]],
+            text="これで終わり",
+            ocr_fallback=True,
+        )
+        self.assertFalse(suspicious_japanese_ocr(dialogue, "ja"))
+
     def test_vertical_context_region_expands_short_column_upstream(self):
         from app.services.engines.ocr import LanguageRoutingOCREngine
         from app.services.pipeline import TextRegion
@@ -1471,6 +1515,8 @@ class TestDeepSeekPrompt(unittest.TestCase):
         prompt = t._context_prompt("ja", "zh", glossary=None, n=5)
         self.assertIn("5段", prompt)
         self.assertIn("<序号>译文</序号>", prompt)
+        self.assertIn("跨气泡对白", prompt)
+        self.assertIn("不得在后一段重复", prompt)
 
     def test_parse_segments(self):
         from app.services.engines.translator import DeepSeekTranslator
@@ -2478,6 +2524,17 @@ class TestRendererSafetyBounds(unittest.TestCase):
         region = self._region(0, (100, 10, 112, 170), "竖排译文" * 300, direction="v")
         self.assertEqual(self._render_size([region]), (240, 180))
 
+    def test_narrow_vertical_bubble_retries_below_page_minimum_font(self):
+        from app.services.engines.renderer import PILRenderer
+
+        renderer = PILRenderer()
+        renderer._active_target_lang = "zh"
+        overlay = Image.new("RGBA", (38, 99), (0, 0, 0, 0))
+        renderer._render_vertical_bubble_block(
+            ImageDraw.Draw(overlay), "RN对战烟火", 0, 0, 38, 99, 12
+        )
+        self.assertGreater(np.count_nonzero(np.array(overlay.getchannel("A"))), 0)
+
     def test_extreme_aspect_bubble_finishes(self):
         region = self._region(0, (5, 80, 235, 88), "横向极端气泡译文" * 100)
         self.assertEqual(self._render_size([region]), (240, 180))
@@ -2500,6 +2557,52 @@ class TestRendererSafetyBounds(unittest.TestCase):
             size = renderer._estimate_multiline_font("什么？！不！等等……", 54, 66, 73, 10)
         self.assertGreaterEqual(size, 10)
         self.assertLessEqual(size, 73)
+
+    def test_manual_horizontal_font_size_is_not_auto_shrunk(self):
+        from app.services.engines.renderer import PILRenderer
+
+        region = self._region(6, (30, 45, 210, 125), "手动字号预览")
+        region.style_font_size = 25
+        renderer = PILRenderer()
+        renderer.render(self.source, [region], target_lang="zh")
+        self.assertEqual(region._last_render_font_size, 25)
+
+    def test_adjacent_two_text_boxes_are_split_after_container_merge(self):
+        from app.services.engines.bubble import _split_spatially_separated_text_groups
+
+        left = self._region(0, (20, 45, 45, 75), "left")
+        right = self._region(1, (100, 50, 125, 80), "right")
+        group = {"regions": [left, right], "bbox": (10, 35, 135, 90), "members": []}
+        split = _split_spatially_separated_text_groups([group], 240, 180)
+        self.assertEqual(len(split), 2)
+        self.assertEqual({item["regions"][0].translated for item in split}, {"left", "right"})
+
+    def test_distant_vertical_text_boxes_are_split_after_container_merge(self):
+        from app.services.engines.bubble import _split_spatially_separated_text_groups
+
+        left = self._region(0, (20, 30, 40, 120), "left", direction="v")
+        right = self._region(1, (140, 35, 160, 125), "right", direction="v")
+        group = {"regions": [left, right], "bbox": (10, 20, 170, 135), "members": []}
+        split = _split_spatially_separated_text_groups([group], 240, 180)
+        self.assertEqual(len(split), 2)
+
+    def test_nearby_vertical_columns_remain_in_one_group(self):
+        from app.services.engines.bubble import _split_spatially_separated_text_groups
+
+        left = self._region(0, (70, 30, 90, 120), "left", direction="v")
+        right = self._region(1, (100, 35, 120, 125), "right", direction="v")
+        group = {"regions": [left, right], "bbox": (60, 20, 130, 135), "members": []}
+        split = _split_spatially_separated_text_groups([group], 240, 180)
+        self.assertEqual(len(split), 1)
+
+    def test_stacked_vertical_bubbles_are_split(self):
+        from app.services.engines.bubble import _split_spatially_separated_text_groups
+
+        upper = self._region(0, (90, 25, 125, 75), "upper", direction="v")
+        lower = self._region(1, (88, 105, 128, 165), "lower", direction="v")
+        group = {"regions": [upper, lower], "bbox": (75, 15, 140, 175), "members": []}
+        split = _split_spatially_separated_text_groups([group], 240, 180)
+        self.assertEqual(len(split), 2)
 
     def test_vertical_layout_has_fixed_search_bound(self):
         from app.services.engines.renderer import MAX_VERTICAL_FONT_TRIES, PILRenderer

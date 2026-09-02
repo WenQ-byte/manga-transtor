@@ -1,0 +1,78 @@
+.border-glow-card {
+  --edge-proximity: 0;
+  --cursor-angle: 0deg;
+  position: relative;
+  isolation: isolate;
+  display: inline-flex;
+  overflow: visible;
+  border: 1px solid transparent;
+  border-radius: var(--border-radius, 12px);
+  background: var(--gradient-base, #171717);
+  color: inherit;
+}
+
+.border-glow-card::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  border-radius: inherit;
+  padding: 1px;
+  background: conic-gradient(from var(--cursor-angle), var(--glow-color-10), var(--glow-color-60), var(--glow-color-30), var(--glow-color-10));
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask-composite: exclude;
+  opacity: calc(0.16 + var(--edge-proximity) * 0.34);
+  transition: opacity 220ms ease;
+}
+
+.border-glow-card::after {
+  content: '';
+  position: absolute;
+  inset: calc(min(var(--glow-padding, 40px), 18px) * -1);
+  z-index: -2;
+  border-radius: calc(var(--border-radius, 12px) + var(--glow-padding, 40px));
+  background: var(--gradient-1), var(--gradient-2), var(--gradient-3), var(--gradient-4), var(--gradient-5), var(--gradient-6), var(--gradient-7);
+  filter: blur(18px);
+  opacity: calc(var(--edge-proximity) * 0.08);
+  pointer-events: none;
+  transition: opacity 180ms ease;
+}
+
+.edge-light {
+  position: absolute;
+  inset: -1px;
+  z-index: 0;
+  border-radius: inherit;
+  pointer-events: none;
+  background: conic-gradient(from var(--cursor-angle), transparent 0deg, var(--glow-color-60) var(--cone-spread), transparent calc(var(--cone-spread) * 2));
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask-composite: exclude;
+  padding: 1px;
+  opacity: calc(var(--edge-proximity) * 0.38);
+}
+
+.border-glow-inner {
+  position: relative;
+  z-index: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  min-width: 0;
+  border-radius: inherit;
+  background: color-mix(in srgb, var(--card-bg, #171717) 88%, transparent);
+}
+
+.border-glow-card--animated::after { animation: border-glow-pulse 2.8s ease-in-out infinite; }
+
+@keyframes border-glow-pulse {
+  0%, 100% { opacity: .12; transform: scale(.98); }
+  50% { opacity: .4; transform: scale(1.01); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .border-glow-card--animated::after { animation: none; }
+  .border-glow-card::before, .border-glow-card::after { transition: none; }
+}

@@ -30,6 +30,8 @@ class TextRegion:
     box: list[list[int]]  # 四个角点 [[x,y],...]
     text: str = ""  # OCR结果
     translated: str = ""  # 翻译结果
+    textbox_id: str = ""
+    source: str = "ocr"  # ocr | manual
     confidence: float = 0.0
     poly: Optional[list[list[float]]] = None  # OCR原始检测多边形点的完整列表（可选）
     mask: Optional[object] = None  # 预计算的笔画掩膜（numpy数组，由 mask.build_full_mask 填写）
@@ -55,6 +57,15 @@ class TextRegion:
     ocr_attempted_models: list[str] = field(default_factory=list)
     ocr_preprocess_variants: list[str] = field(default_factory=list)
     render_font: str = ""
+    render_font_size: Optional[int] = None
+    render_font_weight: Optional[int] = None
+    render_bounds: Optional[tuple[int, int, int, int]] = None
+    style_font_size: Optional[int] = None
+    style_font_family: str = ""
+    style_font_weight: Optional[int] = None
+    style_color: Optional[tuple[int, int, int]] = None
+    layout_bounds_override: bool = False
+    _last_render_font_size: Optional[int] = field(default=None, repr=False, compare=False)
 
     # 内部：MIT 检测器附加的 Quadrilateral、OCR 附加的内部状态
     _quad: Optional[object] = field(default=None, repr=False, compare=False)
@@ -157,6 +168,27 @@ def preserve_decorative_symbols(source: str, translated: str) -> str:
         if missing > 0:
             result += symbol * missing
     return result
+
+
+def suspicious_japanese_ocr(region: TextRegion, page_language: str) -> bool:
+    """日文页中短拉丁/数字乱码通常来自风格化拟声词，保留原图比误擦除更安全。"""
+    if _language_value(page_language) != "ja" or not getattr(region, "ocr_fallback", False):
+        return False
+    text = (region.text or "").strip()
+    if not text:
+        return False
+    han = re.findall(r"[\u3400-\u9fff]", text)
+    kana = re.findall(r"[\u3040-\u30ff]", text)
+    latin_words = re.findall(r"[A-Za-z]+", text)
+    greek = re.findall(r"[\u0370-\u03ff]", text)
+    digits = re.findall(r"\d", text)
+    if han:
+        return False
+    if greek:
+        return True
+    if latin_words and not any(len(word) >= 3 for word in latin_words):
+        return len(kana) <= 1 or bool(digits)
+    return bool(digits and len(kana) <= 1)
 
 
 def assess_translation_quality(
@@ -576,13 +608,17 @@ class TranslationPipeline:
         h0, w0 = bgr0.shape[:2]
         for r in text_regions + erase_only_regions:
             region_source = r.source_lang or actual_source
-            if preserve_latin_label(r, region_source) or classify_non_bubble(
+            if suspicious_japanese_ocr(r, actual_source):
+                r._no_erase = True
+                r.ocr_route_reason = f"{r.ocr_route_reason}；日文页可疑拟声词乱码，保留原图".strip("；")
+            elif preserve_latin_label(r, region_source) or classify_non_bubble(
                 bgr0, r, w0, h0, source_lang=region_source
             ):
                 r._no_erase = True
         text_regions = drop_non_bubble_regions(text_regions)
         erase_only_regions = drop_non_bubble_regions(erase_only_regions)
-        erase_regions = text_regions + erase_only_regions
+        # 没有可靠译文的区域保留原文，避免只擦除不回写而形成空白气泡。
+        erase_regions = text_regions
         if not erase_regions:
             return empty_result(actual_source, detection_confidence, detection_reason)
 
@@ -695,6 +731,8 @@ class TranslationPipeline:
         result_bytes = self.renderer.render(cleaned, text_regions, target_lang=target_lang)
         stage_end("render", "render_ms", phase_started)
         self._report(progress_cb, 4, 100)
+        # 供后续 AI 润色复用清理图和排版区域，不重新执行 OCR。
+        result_cleaned_path = cleaned
 
         duration = int((time.monotonic() - start) * 1000)
         print(
@@ -703,7 +741,7 @@ class TranslationPipeline:
         )
         if page_warnings:
             print("[quality] " + " | ".join(page_warnings))
-        return PipelineResult(
+        result = PipelineResult(
             regions=text_regions,
             duration_ms=duration,
             image_bytes=result_bytes,
@@ -718,6 +756,8 @@ class TranslationPipeline:
             render_font=next((r.render_font for r in text_regions if r.render_font), ""),
             performance=self._performance_snapshot(stage_ms, duration, translation_perf),
         )
+        result._cleaned_image_path = result_cleaned_path
+        return result
 
 
 def create_pipeline() -> TranslationPipeline:

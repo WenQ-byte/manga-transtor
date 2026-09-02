@@ -157,7 +157,7 @@ export default function GlossaryPanel({ onCountChange }) {
         </div>
       </div>
 
-      {loading ? (
+      {loading && items.length === 0 ? (
         <div className="space-y-3">
           {[...Array(4)].map((_, i) => (
             <div key={i} className="card h-[76px] animate-pulse bg-surface-2/40" />
@@ -181,7 +181,8 @@ export default function GlossaryPanel({ onCountChange }) {
         </motion.div>
       ) : (
         <motion.div variants={listMotion} initial="hidden" animate="show" className="space-y-3">
-          <AnimatePresence>
+          {loading && <div className="py-1 text-center font-mono text-xs text-ink-500">加载中…</div>}
+          <AnimatePresence initial={false}>
             {items.map((item) => (
               <motion.div
                 key={item.id}

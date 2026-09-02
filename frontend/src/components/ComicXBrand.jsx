@@ -1,13 +1,16 @@
 export function ComicXMark({ className = '', rounded = 'rounded-lg' }) {
   return (
-    <img src="/comicx-mark-transparent.png" alt="ComicX" draggable={false}
+    <img src="/comicx-app-icon.png" alt="ComicX" draggable={false}
       className={`${rounded} shrink-0 select-none object-contain ${className}`} />
   )
 }
 
-export function ComicXWordmark({ className = '', glow = false }) {
+export function ComicXWordmark({ className = '', shiny = false }) {
   return (
-    <img src="/comicx-wordmark-transparent.png" alt="ComicX" draggable={false}
-      className={`select-none ${glow ? 'comicx-glow mix-blend-screen' : ''} ${className}`} />
+    <span className={`comicx-wordmark ${shiny ? 'comicx-wordmark--shiny' : ''} ${className}`}>
+      <img src="/comicx-wordmark-transparent.png" alt="ComicX" draggable={false}
+        className="comicx-wordmark__base select-none" />
+      {shiny ? <span className="comicx-wordmark__shine" aria-hidden="true" /> : null}
+    </span>
   )
 }

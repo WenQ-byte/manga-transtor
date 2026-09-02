@@ -8,34 +8,29 @@
   padding: 0;
   cursor: pointer;
   background: transparent;
-  border-radius: var(--sb-radius, 18px);
+  border-radius: var(--sb-radius, 12px);
   color: var(--sb-text-color, #f5f5f5);
   font-family: inherit;
   line-height: 1;
+  font-weight: 500;
   -webkit-appearance: none;
   appearance: none;
   -webkit-tap-highlight-color: transparent;
-  transition: transform 0.2s ease, opacity 0.2s ease;
+  transition: transform 0.2s ease, opacity 0.2s ease, background-color 0.2s ease;
 }
 
-.specular-button::before {
-  content: '';
-  position: absolute;
-  inset: 0;
-  border-radius: inherit;
-  background: var(--sb-tint, transparent);
-  opacity: var(--sb-tint-opacity, 0);
-  -webkit-backdrop-filter: blur(var(--sb-blur, 0px));
-  backdrop-filter: blur(var(--sb-blur, 0px));
-  transition: opacity 0.2s ease;
+.specular-button--primary {
+  background: #1a1a1a;
+  color: #ffffff;
+}
+
+.specular-button--secondary {
+  background: #141414;
+  color: #d4d4d4;
 }
 
 .specular-button:not(:disabled):hover {
   transform: translateY(-1px);
-}
-
-.specular-button:not(:disabled):hover::before {
-  opacity: calc(var(--sb-tint-opacity, 0) + 0.08);
 }
 
 .specular-button:not(:disabled):active {
@@ -51,21 +46,14 @@
   opacity: 0.4;
 }
 
-.specular-button__fx {
-  position: absolute;
-  inset: -20px;
-  pointer-events: none;
-}
-
 .specular-button__label {
   position: relative;
-  z-index: 1;
+  z-index: 2;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   gap: 8px;
   white-space: nowrap;
-  font-weight: 500;
   letter-spacing: 0.01em;
 }
 
@@ -82,4 +70,8 @@
 .specular-button--sm .specular-button__label {
   padding: 8px 15px;
   font-size: 13px;
+}
+
+.specular-button--icon .specular-button__label {
+  padding: 0;
 }

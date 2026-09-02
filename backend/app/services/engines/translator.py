@@ -95,7 +95,9 @@ def build_manga_prompt(source, target, *, context_count: int = 0) -> str:
     if context_count:
         prefix += (
             f"下面是同一页漫画中按阅读顺序排列的{context_count}段文字，每段使用<序号>...</序号>包裹。"
-            "必须结合整页上下文保持称呼、语气和专有名词一致。"
+            "必须结合整页上下文保持称呼、语气和专有名词一致。相邻编号可能是同一句跨气泡对白，"
+            "应先按完整句意理解，再让每个编号只承载对应原文片段的译文；各段连读必须自然，"
+            "不得在后一段重复前一段已经表达的主语、谓语或结论。"
         )
     prompt = (
         f"{prefix}把{LANGUAGE_NAMES[source_value]}翻译成{LANGUAGE_NAMES[target_value]}。"
@@ -608,6 +610,45 @@ class DeepSeekTranslator(BaseRemoteTranslator):
             except Exception as exc:  # noqa: BLE001
                 print(f"[deepseek] 翻译失败: {exc}")
         return ""
+
+    def polish_batch(self, texts, source: LangCode, target: LangCode, style: str, custom_prompt: str = "") -> list[str]:
+        """使用现有 DeepSeek 接口润色已完成译文，不重新执行翻译/OCR。"""
+        if not texts:
+            return []
+        style_text = custom_prompt.strip() if style == "custom" else {
+            "natural": "自然：清晰流畅，符合中文漫画对白习惯",
+            "colloquial": "口语化：像角色真实说话，轻松自然",
+            "passionate": "热血：增强战斗感和情绪张力，但不夸大原意",
+            "funny": "搞笑：保留原意，适度体现漫画喜感",
+            "formal": "正式：表达克制、准确、规范，但仍适合漫画对白",
+        }.get(style, "自然：清晰流畅，符合中文漫画对白习惯")
+        if not style_text:
+            raise ValueError("自定义润色提示词不能为空")
+        prompt = (
+            "你是专业的中文漫画对白润色编辑。下面是已经翻译完成的中文译文，按阅读顺序使用<序号>...</序号>包裹。"
+            f"润色风格：{style_text}。保持原意、人物关系、语气和情绪，不添加原文不存在的信息；"
+            "符合漫画对白表达，尽量简洁，避免明显增加文本长度。不要重新翻译，不要解释，不要添加引号、Markdown或提示语。"
+            f"只返回{len(texts)}段润色后的文本，严格使用<序号>润色文本</序号>格式，不得遗漏、合并、拆分或改变编号。"
+        )
+        numbered = "".join(f"<{i + 1}>{text}</{i + 1}>" for i, text in enumerate(texts))
+        base = self.settings.deepseek_base_url or "https://api.deepseek.com"
+        last_error = None
+        for model in self._model_candidates(source, target):
+            try:
+                resp = self._request(
+                    "POST", f"{base}/chat/completions",
+                    headers={"Authorization": f"Bearer {self.settings.deepseek_api_key}"},
+                    json={"model": model, "messages": [{"role": "system", "content": prompt}, {"role": "user", "content": numbered}], "temperature": 0.4},
+                    timeout=90,
+                )
+                resp.raise_for_status()
+                result = self._parse_segments(resp.json()["choices"][0]["message"]["content"], len(texts))
+                if result is None or any(not item.strip() for item in result):
+                    raise ValueError("润色结果段数不一致或包含空文本")
+                return result
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+        raise last_error or RuntimeError("DeepSeek 润色请求失败")
 
 
 class OpenAITranslator(BaseRemoteTranslator):

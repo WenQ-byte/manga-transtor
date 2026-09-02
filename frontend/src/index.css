@@ -1,5 +1,53 @@
 @import "tailwindcss";
 
+@font-face {
+  font-family: "MangaNotoSansSC";
+  src: url("/api/translate/fonts/NotoSansSC-VF.ttf") format("truetype");
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "MangaNotoSerifSC";
+  src: url("/api/translate/fonts/NotoSerifSC-VF.ttf") format("truetype");
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "MangaZCOOLKuaiLe";
+  src: url("/api/translate/fonts/ZCOOLKuaiLe-Regular.ttf") format("truetype");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "MangaZCOOLXiaoWei";
+  src: url("/api/translate/fonts/ZCOOLXiaoWei-Regular.ttf") format("truetype");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "MangaMaShanZheng";
+  src: url("/api/translate/fonts/MaShanZheng-Regular.ttf") format("truetype");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "MangaLongCang";
+  src: url("/api/translate/fonts/LongCang-Regular.ttf") format("truetype");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
 @theme {
   --color-bg: #090909;
   --color-surface: #101010;
@@ -111,6 +159,20 @@
       0 0 0 1px rgba(255, 255, 255, 0.3),
       0 0 24px -6px rgba(255, 255, 255, 0.15);
   }
+
+  .glass-panel {
+    background:
+      radial-gradient(130% 130% at 50% -12%, rgba(255, 255, 255, 0.08), rgba(255, 255, 255, 0) 46%),
+      linear-gradient(180deg, rgba(255, 255, 255, 0.03), rgba(255, 255, 255, 0) 32%),
+      rgba(16, 16, 18, 0.72);
+    -webkit-backdrop-filter: blur(22px) saturate(1.15);
+    backdrop-filter: blur(22px) saturate(1.15);
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.10),
+      inset 0 0 0 1px rgba(255, 255, 255, 0.02),
+      0 24px 60px -24px rgba(0, 0, 0, 0.8);
+  }
 }
 
 @layer utilities {
@@ -144,22 +206,123 @@
   }
 }
 
-.comicx-glow {
-  animation: comicx-pulse 3.4s ease-in-out infinite;
+.comicx-wordmark {
+  position: relative;
+  display: inline-block;
+  aspect-ratio: 3 / 1;
+  flex: 0 0 auto;
 }
 
-@keyframes comicx-pulse {
-  0%, 100% {
-    filter: drop-shadow(0 0 14px rgba(167, 139, 250, 0.35)) drop-shadow(0 0 34px rgba(232, 121, 249, 0.2));
-  }
-  50% {
-    filter: drop-shadow(0 0 26px rgba(167, 139, 250, 0.6)) drop-shadow(0 0 56px rgba(232, 121, 249, 0.35));
-  }
+.comicx-wordmark__base {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
+.comicx-wordmark__shine {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  mix-blend-mode: screen;
+  background: linear-gradient(105deg, transparent 30%, rgba(255, 255, 255, 0.45) 46%, rgba(255, 255, 255, 1) 50%, rgba(255, 255, 255, 0.45) 54%, transparent 70%);
+  background-size: 220% 100%;
+  background-position: 150% center;
+  -webkit-mask: url('/comicx-wordmark-transparent.png') center / contain no-repeat;
+  mask: url('/comicx-wordmark-transparent.png') center / contain no-repeat;
+  animation: comicx-wordmark-shine 2.6s ease-in-out infinite;
+}
+
+@keyframes comicx-wordmark-shine {
+  0%, 10% { background-position: 150% center; }
+  52%, 100% { background-position: -50% center; }
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .comicx-glow {
+  .comicx-wordmark__shine {
     animation: none;
-    filter: drop-shadow(0 0 18px rgba(167, 139, 250, 0.45));
+    opacity: 1;
+    background: linear-gradient(105deg, transparent 40%, rgba(255, 255, 255, 0.85) 50%, rgba(255, 255, 255, 0.25) 60%, transparent 72%);
+    background-size: 100% 100%;
+  }
+}
+
+.edit-panel textarea {
+  flex: 1 1 auto;
+  min-height: 0;
+  max-height: none;
+  resize: none;
+}
+
+.edit-panel > div.flex.min-h-0 {
+  padding-top: 1.5rem;
+}
+
+.edit-panel > .border-b {
+  display: none;
+  pointer-events: none;
+}
+
+.edit-panel > .border-b span {
+  display: none;
+}
+
+button:not(.border-glow-card) {
+  position: relative;
+  isolation: isolate;
+  overflow: hidden;
+  transition: border-color 220ms ease, color 220ms ease, background-color 220ms ease, transform 180ms ease;
+}
+
+button:not(.border-glow-card)::before {
+  content: '';
+  position: absolute;
+  inset: -40% -60%;
+  z-index: 1;
+  pointer-events: none;
+  background: linear-gradient(105deg, transparent 32%, rgba(255, 255, 255, 0.12) 45%, rgba(255, 255, 255, 0.58) 50%, rgba(255, 255, 255, 0.16) 56%, transparent 70%);
+  transform: translateX(-140%) skewX(-8deg);
+  transition: transform 0.55s ease-out;
+}
+
+button:not(.border-glow-card)::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  border-radius: inherit;
+  padding: 1px;
+  background: conic-gradient(from 150deg,
+    rgba(255, 255, 255, 0.08) 0deg,
+    rgba(255, 255, 255, 0.50) 60deg,
+    rgba(255, 255, 255, 0.12) 120deg,
+    rgba(255, 255, 255, 0.38) 200deg,
+    rgba(255, 255, 255, 0.08) 270deg,
+    rgba(255, 255, 255, 0.34) 330deg,
+    rgba(255, 255, 255, 0.08) 360deg);
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask-composite: exclude;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 220ms ease;
+}
+
+button:not(.border-glow-card):not(:disabled):hover::after,
+button:not(.border-glow-card):focus-visible::after {
+  opacity: 0.85;
+}
+
+button:not(.border-glow-card):not(:disabled):hover::before {
+  transform: translateX(140%) skewX(-8deg);
+}
+
+button:not(.border-glow-card):not(:disabled):active {
+  transform: translateY(0);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  button:not(.border-glow-card)::before {
+    transition: none;
   }
 }

@@ -270,6 +270,7 @@ def group_regions_by_bubble(
 
     groups = _merge_overlap_groups(groups, overlap, boundary_gray=boundary_gray)
     groups = _split_side_by_side_text_groups(groups, img_w, img_h)
+    groups = _split_spatially_separated_text_groups(groups, img_w, img_h)
 
     out = []
     for g in groups:
@@ -333,6 +334,9 @@ def _container_merge_score(
     if mask_reliable and group_mask_reliable:
         mask_ov = _mask_overlap_ratio(mask, group_mask)
         if mask_ov < 0.55:
+            return 0.0
+        # 即使泛洪掩膜重叠，合并后包围盒若过大也说明是两个独立气泡被白色泄漏桥接
+        if not _balloon_ok(bb, group["bbox"]):
             return 0.0
         return 2.0 + mask_ov
 
@@ -618,7 +622,15 @@ def _merge_overlap_groups(groups, overlap=0.15, boundary_gray=None):
                 ma, mb = groups[i].get("mask"), groups[j].get("mask")
                 ra = bool(groups[i].get("mask_reliable")) and ma is not None
                 rb = bool(groups[j].get("mask_reliable")) and mb is not None
-                same_mask = ra and rb and _mask_overlap_ratio(ma, mb) >= 0.55
+                same_mask = (
+                    ra and rb
+                    and _mask_overlap_ratio(ma, mb) >= 0.55
+                    and _balloon_ok(a, b)
+                    and _compact_group_ok(
+                        groups[i].get("members") or [(a, ma, ra, None)],
+                        (b, mb, rb, None),
+                    )
+                )
                 separated = boundary_gray is not None and _groups_separated_by_boundary(
                     groups[i].get("regions", []), groups[j].get("regions", []), boundary_gray
                 )
@@ -702,6 +714,88 @@ def _split_side_by_side_text_groups(groups, img_w, img_h):
             _text_stack_group(right, img_w, img_h),
             *pending,
         ]
+    return output
+
+
+def _split_spatially_separated_text_groups(groups, img_w, img_h):
+    """拆开仅含少量文本框、但被连通白色背景错误合并的相邻对白。
+
+    即便两个气泡之间没有明显黑色分割线，只要文字框之间存在可观测间隙
+    （gutter>0）且拆分后的两侧各自紧凑，仍应拆分为两个独立对话框。
+    """
+
+    def _stack_compact_ok(stack):
+        boxes = [r.bounds for r in stack if hasattr(r, "bounds")]
+        if len(boxes) <= 1:
+            return True
+        union = boxes[0]
+        for box in boxes[1:]:
+            union = _union(union, box)
+        union_area = max(1, (union[2] - union[0]) * (union[3] - union[1]))
+        member_area = sum(max(1, (b[2] - b[0]) * (b[3] - b[1])) for b in boxes)
+        return union_area <= 2.2 * member_area
+
+    output = []
+    for group in groups:
+        regions = [r for r in group.get("regions", []) if hasattr(r, "bounds")]
+        if len(regions) < 2:
+            output.append(group)
+            continue
+        directions = {getattr(r, "direction", None) for r in regions}
+        vertical = directions <= {None, "v"} and "v" in directions
+        horizontal = directions <= {None, "h"}
+        if not vertical and not horizontal:
+            output.append(group)
+            continue
+        ordered = sorted(regions, key=lambda r: (r.bounds[0] + r.bounds[2]) / 2)
+        heights = [max(1, r.bounds[3] - r.bounds[1]) for r in ordered]
+        widths = [max(1, r.bounds[2] - r.bounds[0]) for r in ordered]
+        median_h = float(np.median(heights))
+        median_w = float(np.median(widths))
+        best = None
+        for cut in range(1, len(ordered)):
+            left, right = ordered[:cut], ordered[cut:]
+            left_x1 = max(r.bounds[2] for r in left)
+            right_x0 = min(r.bounds[0] for r in right)
+            gutter = right_x0 - left_x1
+            # 允许贴近甚至没有分割线的相邻气泡拆分，只要两侧各自紧凑
+            min_gutter = max(2, 0.6 * median_w) if vertical else max(2, 0.4 * median_h)
+            if gutter < min_gutter:
+                continue
+            if not (_stack_compact_ok(left) and _stack_compact_ok(right)):
+                continue
+            left_y0, left_y1 = min(r.bounds[1] for r in left), max(r.bounds[3] for r in left)
+            right_y0, right_y1 = min(r.bounds[1] for r in right), max(r.bounds[3] for r in right)
+            if _axis_overlap(left_y0, left_y1, right_y0, right_y1) < 0.25:
+                continue
+            score = gutter + _axis_overlap(left_y0, left_y1, right_y0, right_y1) * median_h
+            if best is None or score > best[0]:
+                best = (score, left, right)
+        if best is None and vertical:
+            stacked = sorted(regions, key=lambda r: (r.bounds[1] + r.bounds[3]) / 2)
+            for cut in range(1, len(stacked)):
+                upper, lower = stacked[:cut], stacked[cut:]
+                upper_y1 = max(r.bounds[3] for r in upper)
+                lower_y0 = min(r.bounds[1] for r in lower)
+                gutter = lower_y0 - upper_y1
+                upper_x0, upper_x1 = min(r.bounds[0] for r in upper), max(r.bounds[2] for r in upper)
+                lower_x0, lower_x1 = min(r.bounds[0] for r in lower), max(r.bounds[2] for r in lower)
+                x_overlap = _axis_overlap(upper_x0, upper_x1, lower_x0, lower_x1)
+                if gutter < max(2, 0.2 * median_w) or x_overlap < 0.25:
+                    continue
+                if not (_stack_compact_ok(upper) and _stack_compact_ok(lower)):
+                    continue
+                score = gutter + x_overlap * median_w
+                if best is None or score > best[0]:
+                    best = (score, upper, lower)
+        if best is None:
+            output.append(group)
+            continue
+        _, left, right = best
+        output.extend([
+            _text_stack_group(left, img_w, img_h),
+            _text_stack_group(right, img_w, img_h),
+        ])
     return output
 
 

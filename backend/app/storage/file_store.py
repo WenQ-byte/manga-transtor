@@ -39,6 +39,18 @@ class FileStore:
         abs_path.write_bytes(content)
         return rel, str(abs_path)
 
+    def save_state(self, content: bytes) -> tuple[str, str]:
+        """保存任务内部状态，路径位于上传目录且不直接暴露给下载接口。"""
+        rel = f".state-{uuid.uuid4().hex}.bin"
+        path = self.settings.upload_path / rel
+        path.write_bytes(content)
+        return rel, str(path)
+
+    def resolve_state(self, rel: str) -> Optional[Path]:
+        path = (self.settings.upload_path / Path(rel).name).resolve()
+        root = self.settings.upload_path.resolve()
+        return path if path.is_file() and root in path.parents and path.name.startswith(".state-") else None
+
     def resolve(self, rel: str) -> Optional[Path]:
         """根据相对路径解析磁盘路径，防止路径穿越"""
         p = (self.settings.result_path / rel).resolve()

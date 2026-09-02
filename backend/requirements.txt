@@ -6,3 +6,4 @@ pydantic==2.10.4
 pydantic-settings==2.7.1
 httpx==0.28.1
 opencv-python-headless==4.10.0.84
+jieba==0.42.1
