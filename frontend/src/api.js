@@ -19,19 +19,94 @@ async function request(path, options = {}) {
   return res
 }
 
-export function createTranslateTask(file, sourceLang, targetLang) {
+export function createTranslateTask(file, sourceLang, targetLang, polishStyle = '', customPrompt = '') {
   const form = new FormData()
   form.append('file', file)
   const query = new URLSearchParams({ source_lang: sourceLang, target_lang: targetLang })
+  if (polishStyle) query.set('polish_style', polishStyle)
+  if (customPrompt) query.set('custom_prompt', customPrompt)
   return request(`/translate?${query}`, { method: 'POST', body: form })
 }
 
-export function createBatchTranslateTask(files, sourceLang, targetLang) {
+export function createBatchTranslateTask(files, sourceLang, targetLang, polishStyle = '', customPrompt = '') {
   const form = new FormData()
   files.forEach((file) => form.append('files[]', file))
   form.append('source_lang', sourceLang)
   form.append('target_lang', targetLang)
+  if (polishStyle) form.append('polish_style', polishStyle)
+  if (customPrompt) form.append('custom_prompt', customPrompt)
   return request('/translate/batch', { method: 'POST', body: form })
+}
+
+export function polishTranslateTask(taskId, style, customPrompt = '') {
+  const form = new FormData()
+  form.append('style', style)
+  form.append('custom_prompt', customPrompt)
+  return request(`/translate/${taskId}/polish`, { method: 'POST', body: form })
+}
+
+export function getTaskRegions(taskId) {
+  return request(`/translate/${taskId}/regions`)
+}
+
+export function getTaskCleanedUrl(taskId) {
+  return `${BASE}/translate/${taskId}/cleaned`
+}
+
+export function createTaskTextBox(taskId, box, styles = {}) {
+  const form = new FormData()
+  form.append('x', String(Math.round(box.x)))
+  form.append('y', String(Math.round(box.y)))
+  form.append('width', String(Math.round(box.width)))
+  form.append('height', String(Math.round(box.height)))
+  form.append('font_size', String(styles.fontSize ?? 24))
+  form.append('font_family', styles.fontFamily || '')
+  form.append('font_weight', String(styles.fontWeight ?? 400))
+  form.append('color', styles.color || '')
+  form.append('direction', styles.direction || 'h')
+  return request(`/translate/${taskId}/text-box`, { method: 'POST', body: form })
+}
+
+export function deleteTaskTextBox(taskId, regionIndex) {
+  return request(`/translate/${taskId}/text-box/${regionIndex}`, { method: 'DELETE' })
+}
+
+export function restoreTaskTextRegion(taskId, regionIndex) {
+  return request(`/translate/${taskId}/text-box/${regionIndex}/restore-original`, { method: 'POST' })
+}
+
+export function previewTaskRegionFont(taskId, regionIndex, fontFamily = '', fontWeight = 400, signal) {
+  const form = new FormData()
+  form.append('region_index', String(regionIndex))
+  form.append('font_family', fontFamily)
+  form.append('font_weight', String(fontWeight))
+  return request(`/translate/${taskId}/font-preview`, { method: 'POST', body: form, signal })
+}
+
+export function editTaskRegion(taskId, regionIndex, translated, styles = {}) {
+  const form = new FormData()
+  form.append('region_index', String(regionIndex))
+  form.append('translated', translated)
+  if (styles.moveOnly) form.append('move_only', 'true')
+  if (styles.fontSize != null) form.append('font_size', String(styles.fontSize))
+  form.append('font_family', styles.fontFamily || '')
+  form.append('color', styles.color || '')
+  if (styles.fontWeight != null) form.append('font_weight', String(styles.fontWeight))
+  if (styles.x != null) form.append('x', String(Math.round(styles.x)))
+  if (styles.y != null) form.append('y', String(Math.round(styles.y)))
+  if (styles.width != null) form.append('width', String(Math.round(styles.width)))
+  if (styles.height != null) form.append('height', String(Math.round(styles.height)))
+  return request(`/translate/${taskId}/edit`, { method: 'POST', body: form })
+}
+
+export function eraseTask(taskId, maskBlob) {
+  const form = new FormData()
+  form.append('mask', maskBlob, 'erase-mask.png')
+  return request(`/translate/${taskId}/erase`, { method: 'POST', body: form })
+}
+
+export function undoEraseTask(taskId) {
+  return request(`/translate/${taskId}/erase/undo`, { method: 'POST' })
 }
 
 export function getBatchTaskStatus(taskIds) {

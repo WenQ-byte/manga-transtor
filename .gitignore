@@ -7,7 +7,9 @@ venv/
 .pytest_cache/
 
 # 数据
-backend/data/
+backend/data/*
+!backend/data/fonts/
+!backend/data/fonts/**
 *.db
 *.db-wal
 *.db-shm

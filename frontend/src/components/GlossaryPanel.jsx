@@ -20,15 +20,17 @@ const listMotion = {
 }
 
 const itemMotion = {
-  hidden: { opacity: 0, y: 12 },
-  show: { opacity: 1, y: 0, transition: { type: 'spring', stiffness: 260, damping: 26 } },
+  hidden: { opacity: 0, y: 8 },
+  show: { opacity: 1, y: 0, transition: { duration: 0.28, ease: 'easeOut' } },
 }
+
+let glossaryCache = null
 
 export default function GlossaryPanel({ onCountChange }) {
   const notify = useToast()
-  const [items, setItems] = useState([])
-  const [total, setTotal] = useState(0)
-  const [loading, setLoading] = useState(false)
+  const [items, setItems] = useState(() => glossaryCache?.items ?? [])
+  const [total, setTotal] = useState(() => glossaryCache?.total ?? 0)
+  const [loading, setLoading] = useState(() => glossaryCache == null)
   const [search, setSearch] = useState('')
   const [showEditor, setShowEditor] = useState(false)
   const [editing, setEditing] = useState(null)
@@ -37,13 +39,16 @@ export default function GlossaryPanel({ onCountChange }) {
   const searchTimer = useRef(null)
 
   useEffect(() => {
-    loadList()
+    if (!glossaryCache) loadList()
+    onCountChange?.(glossaryCache?.total ?? 0)
   }, [])
 
   async function loadList(term) {
-    setLoading(true)
+    const isRefresh = glossaryCache != null
+    if (!isRefresh) setLoading(true)
     try {
       const data = await listGlossary({ search: term === undefined ? search : term })
+      if (!term) glossaryCache = { items: data.items, total: data.total }
       setItems(data.items)
       setTotal(data.total)
       onCountChange?.(data.total)
@@ -157,7 +162,7 @@ export default function GlossaryPanel({ onCountChange }) {
         </div>
       </div>
 
-      {loading ? (
+      {loading && items.length === 0 ? (
         <div className="space-y-3">
           {[...Array(4)].map((_, i) => (
             <div key={i} className="card h-[76px] animate-pulse bg-surface-2/40" />
@@ -181,12 +186,12 @@ export default function GlossaryPanel({ onCountChange }) {
         </motion.div>
       ) : (
         <motion.div variants={listMotion} initial="hidden" animate="show" className="space-y-3">
-          <AnimatePresence>
+          {loading && <div className="py-1 text-center font-mono text-xs text-ink-500">加载中…</div>}
+          <AnimatePresence initial={false}>
             {items.map((item) => (
               <motion.div
                 key={item.id}
                 variants={itemMotion}
-                layout
                 className="card group flex items-center justify-between gap-4 p-5 transition-colors hover:border-accent/25"
               >
                 <div className="min-w-0">

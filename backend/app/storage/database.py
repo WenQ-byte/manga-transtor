@@ -48,6 +48,8 @@ class Database:
                 lang TEXT NOT NULL DEFAULT 'ja',
                 target_lang TEXT NOT NULL DEFAULT 'zh',
                 note TEXT NOT NULL DEFAULT '',
+                builtin INTEGER NOT NULL DEFAULT 0,
+                disabled INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
                 updated_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
@@ -72,31 +74,73 @@ class Database:
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(glossary)").fetchall()}
         if "target_lang" not in columns:
             conn.execute("ALTER TABLE glossary ADD COLUMN target_lang TEXT NOT NULL DEFAULT 'zh'")
+        if "builtin" not in columns:
+            conn.execute("ALTER TABLE glossary ADD COLUMN builtin INTEGER NOT NULL DEFAULT 0")
+        if "disabled" not in columns:
+            conn.execute("ALTER TABLE glossary ADD COLUMN disabled INTEGER NOT NULL DEFAULT 0")
         conn.execute("DROP INDEX IF EXISTS idx_glossary_unique")
         conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_glossary_unique "
             "ON glossary (source, target, lang, target_lang)"
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS glossary_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL DEFAULT ''
+            );
+            """
+        )
         conn.commit()
 
     # ---- Glossary ----
     def glossary_create(
-        self, source: str, target: str, lang: str, note: str, target_lang: str = "zh"
+        self, source: str, target: str, lang: str, note: str, target_lang: str = "zh", builtin: bool = False
     ) -> int:
         conn = self._connect()
         try:
+            # 若用户此前删除过完全相同的词条（disabled=1），则恢复为启用状态。
+            existing = conn.execute(
+                "SELECT id FROM glossary WHERE source=? AND target=? AND lang=? AND target_lang=? AND disabled=1",
+                (source, target, lang, target_lang),
+            ).fetchone()
+            if existing:
+                conn.execute(
+                    "UPDATE glossary SET disabled=0, builtin=?, note=?, updated_at=datetime('now') WHERE id=?",
+                    (1 if builtin else 0, note, existing["id"]),
+                )
+                conn.commit()
+                return existing["id"]
             cur = conn.execute(
-                "INSERT INTO glossary (source, target, lang, note, target_lang) VALUES (?,?,?,?,?)",
-                (source, target, lang, note, target_lang),
+                "INSERT INTO glossary (source, target, lang, note, target_lang, builtin) VALUES (?,?,?,?,?,?)",
+                (source, target, lang, note, target_lang, 1 if builtin else 0),
             )
             conn.commit()
             return cur.lastrowid
         except sqlite3.IntegrityError:
             return -1
 
+    def glossary_migrate_builtin_to_user(self) -> None:
+        """将未被禁用的内置词条全部转为普通用户词条，使删除功能对它们生效。"""
+        conn = self._connect()
+        conn.execute("UPDATE glossary SET builtin=0 WHERE builtin=1 AND disabled=0")
+        conn.commit()
+
+    def glossary_get_meta(self, key: str) -> Optional[str]:
+        conn = self._connect()
+        row = conn.execute("SELECT value FROM glossary_meta WHERE key=?", (key,)).fetchone()
+        return row["value"] if row else None
+
+    def glossary_set_meta(self, key: str, value: str) -> None:
+        conn = self._connect()
+        conn.execute(
+            "INSERT OR REPLACE INTO glossary_meta (key, value) VALUES (?, ?)", (key, value)
+        )
+        conn.commit()
+
     def glossary_list(self, lang: Optional[str] = None, search: str = "") -> list[dict[str, Any]]:
         conn = self._connect()
-        sql = "SELECT * FROM glossary WHERE 1=1"
+        sql = "SELECT * FROM glossary WHERE disabled=0"
         params: list = []
         if lang:
             sql += " AND lang=?"
@@ -113,8 +157,9 @@ class Database:
     ) -> bool:
         conn = self._connect()
         try:
+            # 用户编辑过的内置词条视为普通用户词条，避免被内置同步再次覆盖。
             cur = conn.execute(
-                "UPDATE glossary SET source=?, target=?, lang=?, note=?, target_lang=?, updated_at=datetime('now') WHERE id=?",
+                "UPDATE glossary SET source=?, target=?, lang=?, note=?, target_lang=?, builtin=0, updated_at=datetime('now') WHERE id=?",
                 (source, target, lang, note, target_lang, item_id),
             )
             conn.commit()
@@ -132,7 +177,7 @@ class Database:
         """返回 {source: target} 映射，用于翻译时替换专有名词"""
         conn = self._connect()
         rows = conn.execute(
-            "SELECT source, target FROM glossary WHERE lang=? AND target_lang=?",
+            "SELECT source, target FROM glossary WHERE lang=? AND target_lang=? AND disabled=0",
             (lang, target_lang),
         ).fetchall()
         return {r["source"]: r["target"] for r in rows}

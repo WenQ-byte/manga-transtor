@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -16,6 +17,22 @@ from app.services.pipeline import TextRegion
 
 
 _PADDLE_DLL_HANDLES = []
+
+
+def _has_japanese_script(text: str) -> bool:
+    return any("\u3040" <= ch <= "\u30ff" or "\u3400" <= ch <= "\u9fff" for ch in (text or ""))
+
+
+def _looks_like_japanese_ocr_garbage(text: str, confidence: float, page_hint: str) -> bool:
+    """日文页面中，MIT48 输出非日文字符时判定为疑似误识别，交给 manga-ocr 复核。"""
+    value = (text or "").strip()
+    if page_hint != "ja" or not value or _has_japanese_script(value):
+        return False
+    letters = re.findall(r"[A-Za-z]+", value)
+    # 清晰、较长的英文单词可能是漫画中的英文标签，不要误送日文模型。
+    if any(len(word) >= 4 for word in letters) and confidence >= 0.70:
+        return False
+    return confidence < 0.70 or not letters or all(len(word) <= 3 for word in letters)
 
 
 def _register_paddle_gpu_dll_directories() -> None:
@@ -1362,13 +1379,28 @@ class LanguageRoutingOCREngine(BaseOCR):
             region.ocr_route_reason = route_reason
 
             # 只对已经从 Paddle 候选确认的日文空结果启用 manga-ocr。
-            if region.source_lang == "ja" and not region.text.strip() and mit_text == "":
+            needs_manga_review = (
+                region.source_lang == "ja"
+                and _looks_like_japanese_ocr_garbage(region.text, float(region.confidence or 0.0), page_hint)
+            )
+            if region.source_lang == "ja" and ((not region.text.strip() and mit_text == "") or needs_manga_review):
                 manga = self._get_manga()
                 if manga is not None:
+                    previous_state = {
+                        name: getattr(region, name, None)
+                        for name in ("box", "poly", "direction", "text", "confidence", "source_lang", "ocr_engine")
+                    }
                     manga.recognize(image_path, [region], "ja")
-                    region.ocr_fallback = True
-                    region.ocr_engine = "mangaocr"
-                    region.ocr_fallback_reason = "MIT48 空结果，manga-ocr 救空"
+                    if needs_manga_review and region.text.strip() and not _has_japanese_script(region.text):
+                        for name, old_value in previous_state.items():
+                            setattr(region, name, old_value)
+                    else:
+                        region.ocr_fallback = True
+                        region.ocr_engine = "mangaocr"
+                        region.ocr_fallback_reason = (
+                            "MIT48 疑似字符集误识别，manga-ocr 复核"
+                            if needs_manga_review else "MIT48 空结果，manga-ocr 救空"
+                        )
 
     @staticmethod
     def _vertical_context_region(region):
@@ -1383,7 +1415,7 @@ class LanguageRoutingOCREngine(BaseOCR):
 
     @staticmethod
     def _choose_candidate(candidates, hint, page_hint=""):
-        usable = [c for c in candidates if (c.get("text") or "").strip() and c.get("lang")]
+        usable = [c for c in candidates if (c.get("text") or "").strip()]
         if not usable:
             return None
         ranked = []
@@ -1399,19 +1431,29 @@ class LanguageRoutingOCREngine(BaseOCR):
                 for ch in meaningful
             )
             page_resolves_han = cjk_only and page_hint in {"zh", "ja"}
-            if detection.language == candidate["lang"] and not (
-                page_resolves_han and candidate["lang"] != page_hint
-            ):
+            resolved = dict(candidate)
+            resolved_lang = candidate.get("lang") or page_hint
+            if detection.confidence >= 0.55 and detection.language == page_hint:
+                resolved_lang = detection.language
+            elif page_resolves_han:
+                resolved_lang = page_hint
+            resolved["lang"] = resolved_lang
+
+            if detection.language == resolved_lang:
                 score += 0.22 * detection.confidence
-            elif detection.confidence >= 0.55 and not (
-                page_resolves_han and candidate["lang"] == page_hint
-            ):
+            elif detection.confidence >= 0.55:
                 score -= 0.16
-            if hint and hint.language == candidate["lang"] and not page_resolves_han:
+            if hint and hint.language == resolved_lang and not page_resolves_han:
                 score += 0.08
-            if page_resolves_han and candidate["lang"] == page_hint:
-                score += 0.18
-            ranked.append((score, candidate))
+            if page_resolves_han and resolved_lang == page_hint:
+                score += 0.06
+            if page_hint == "ja" and detection.language == "ja" and detection.confidence >= 0.55:
+                score += 0.22
+            if page_hint == "ja" and detection.language == "en":
+                latin_words = re.findall(r"[A-Za-z]+", candidate["text"])
+                if latin_words and not any(len(word) >= 3 for word in latin_words):
+                    score -= 0.55
+            ranked.append((score, resolved))
         ranked.sort(key=lambda item: (item[0], len(item[1].get("text", ""))), reverse=True)
         return ranked[0][1]
 
